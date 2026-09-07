@@ -15596,7 +15596,11 @@ static esp_err_t api_all_handler(httpd_req_t *req)
     // dropped it entirely, so it never appeared in the web UI. Chunking
     // means zone count/size can no longer truncate the JSON. A small
     // scratch buffer is reused per snprintf; nothing here exceeds it.
-    char buf[512]; int n;
+    // b523: 768, and clamp n before sending. b522's fault_hold_min field
+    // pushed the head past 512; snprintf returned the would-be length and
+    // send_chunk(buf, n) streamed past the buffer (garbage device_name, NUL
+    // bytes, HA REST sensors unparseable on all three units for 25 min).
+    char buf[768]; int n;
     uint32_t bat_mv = (uint32_t)(adc_mv(ADC_CH_VBATT) * VBATT_DIVIDER_RATIO);
     // mDNS / WiFi-station hostname (ESPHome owns this in component mode;
     // standalone sets it in wifi_init). Distinct from the user-editable
@@ -15641,6 +15645,8 @@ static esp_err_t api_all_handler(httpd_req_t *req)
         (IRRIGOTO_UART_LOG_BAUD != 0) ? "true" : "false",
         (fault_hold_load_once(), (unsigned)s_fault_hold_min),
         s_device_name);
+    if (n < 0) n = 0;
+    if (n >= (int)sizeof(buf)) n = (int)sizeof(buf) - 1;   // b523: never send past buf
     httpd_resp_send_chunk(req, buf, n);
 
     // b486: heap headroom. The b448-b461 crash saga was heap exhaustion
