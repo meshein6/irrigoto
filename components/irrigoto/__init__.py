@@ -11,6 +11,7 @@ import esphome.config_validation as cv
 from esphome.const import CONF_ID
 from esphome.components.esp32 import add_idf_component, include_builtin_idf_component
 from esphome.components.deep_sleep import DeepSleepComponent
+from esphome.components.logger import request_log_listener   # b512
 
 CONF_DEEP_SLEEP_ID = "deep_sleep_id"
 
@@ -66,6 +67,9 @@ async def to_code(config):
     # Tell irrigoto.c it is being compiled as an ESPHome component.
     # Activates irrigoto_init() and deactivates app_main() / wifi_init().
     cg.add_build_flag("-DESPHOME_COMPONENT=1")
+    # b512: irrigoto owns a deferred, non-blocking UART console (ESPHome's
+    # own UART logger stays off). Reserve a logger callback slot for it.
+    request_log_listener()
     # Silence legacy I2C deprecation warnings (we use it intentionally).
     cg.add_build_flag("-Wno-deprecated-declarations")
     # NOTE: no -I flags here — see the *_html.h placement note at the

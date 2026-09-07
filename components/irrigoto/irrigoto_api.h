@@ -48,6 +48,13 @@ bool irrigoto_is_watering(void);
  *  arc/depth to deliver. 0 when not watering. */
 int irrigoto_get_water_minutes_remaining(void);
 
+/** b503: live volume progress for the active run (liters). dispensed =
+ *  credited so far by the per-ring depth accumulators; expected = plan-time
+ *  target (depth x planned ring areas). Both 0 between runs and for modes
+ *  without a volume model (chase, demo). */
+float irrigoto_get_water_vol_dispensed_l(void);
+float irrigoto_get_water_vol_expected_l(void);
+
 // b287: Watering Quiet mode -- true while a smooth/gentle run is in flight
 // (and for a brief settle period after the final LFS write). Returning true
 // asks the ESPHome loop() to throttle high-rate sensor publishes, keeping
@@ -67,6 +74,8 @@ int irrigoto_get_mode(void);
  * buf must be at least 64 bytes.
  */
 void irrigoto_get_status(char *buf, size_t len);
+// b512: deferred, non-blocking UART console (see irrigoto.c uart_console_*).
+void irrigoto_uart_console_write(const char *msg, size_t len);
 
 /**
  * Name of the currently selected zone (from NVS config), e.g. "Front lawn".

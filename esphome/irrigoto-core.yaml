@@ -30,6 +30,20 @@ substitutions:
   # size"). Flashing the 8 MB layout onto a 4 MB chip fails at first
   # boot: the littlefs partition lies beyond the end of flash.
   flash_size: 8MB
+  # b508: UART console logging is OFF by default. Decoded crash (b62944,
+  # 2026-09-05, ESPHome crash handler over the API): the loop task wedged in
+  # esp-idf uart_tx_all <- Logger::write_msg_ writing INFO lines to a UART
+  # nobody is attached to, until the 15 s task WDT panicked -- and it did so
+  # ~35 s after every OTA boot (config-dump burst), inside the 30 s safe_mode
+  # window, so every new image rolled back. Logs still reach the API
+  # (esphome logs / HA). For a UART-tethered unit, build with
+  #   python -m esphome -s logger_baud 115200 run esphome/irrigoto.yaml ...
+  # b510 tested UART ON + CONFIG_UART_ISR_IN_IRAM=y: STILL wedged 37 s after
+  # the OTA boot and rolled back (3 of 3 UART-on OTA boots died at +34..37 s;
+  # 2 of 2 UART-off boots survived). The IRAM ISR is not sufficient, so the
+  # production default stays OFF (b511). A tethered debug build (-s
+  # logger_baud 115200) may still roll back at its first OTA boot.
+  logger_baud: "0"
   partitions_csv: irrigoto-partitions.csv
   # IANA timezone — used by ESPHome's own time formatting (display,
   # automation triggers). Pre-parsed to a POSIX struct at codegen.
@@ -58,6 +72,12 @@ esphome:
   # distinguishable. e.g. "irrigoto" -> "irrigoto-a3f201".
   # The fallback AP SSID picks up the same suffix automatically.
   name_add_mac_suffix: true
+  # b509: tell the firmware whether the UART console is compiled in, so
+  # /api/all "uart_log" and the web UI can say so BEFORE you plug a cable
+  # in expecting output (default is OFF since b508 -- see logger_baud).
+  platformio_options:
+    build_flags:
+      - -DIRRIGOTO_UART_LOG_BAUD=${logger_baud}
   on_boot:
     # Set libc's TZ env var so standard localtime_r() / mktime() in
     # the C schedule executor honor the user's timezone. ESPHome's
@@ -144,6 +164,13 @@ esp32:
                                       #   cache to stay enabled during writes
                                       #   (only works on XMC and a few others;
                                       #   ignored otherwise, no harm to try)
+      # b510: the decoded 2026-09-05 TaskWDT was the loop task spinning in
+      # esp-idf uart_tx_all waiting for the UART TX interrupt to drain the
+      # ring buffer. The UART ISR was NOT in IRAM, so every flash-cache-
+      # disable window (LittleFS/NVS writes, post-OTA otadata) masked it
+      # and the spin ran the 15 s watchdog out. With the ISR in IRAM it
+      # keeps draining through those windows. Costs a few KB of IRAM.
+      CONFIG_UART_ISR_IN_IRAM: y
       # b459: lwip headroom for the proven cold-wake crash. The decoded WDT
       # stack is stuck in tcpip_send_msg_wait_sem -- ESPHome posts the
       # ListEntities descriptor send to the lwip TCPIP thread and BLOCKS waiting
@@ -165,6 +192,7 @@ esp32:
 # Enable logging (comment out in production to save RAM)
 logger:
   level: INFO
+  baud_rate: ${logger_baud}   # b508: 0 = no UART driver (see substitutions)
 
 # b295: mDNS re-enabled. b290 disabled it as a flash-race workaround, but
 # the actual fix turned out to be b294 (pin water_task to PRO_CPU so all

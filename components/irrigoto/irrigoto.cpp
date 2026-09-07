@@ -3,6 +3,7 @@
 #include "esphome/core/log.h"
 #include "esphome/core/application.h"
 #include "esphome/components/wifi/wifi_component.h"   // b293
+#include "esphome/components/logger/logger.h"          // b512: UART console hook
 #include <cstring>
 #include <cstdio>
 #include <ctime>
@@ -23,6 +24,14 @@ void IrrigotoComponent::setup() {
     // irrigoto_init() skips wifi_init() and nvs_flash_init() because ESPHome
     // already called those before components are set up.
     irrigoto_init();
+    // b512: every formatted log line -> irrigoto's deferred, non-blocking
+    // UART console (off unless enabled via POST /api/uart_log?on=1).
+    if (esphome::logger::global_logger != nullptr) {
+        esphome::logger::global_logger->add_log_callback(
+            this, [](void *, uint8_t, const char *, const char *msg, size_t len) {
+                irrigoto_uart_console_write(msg, len);
+            });
+    }
     ESP_LOGI(TAG, "Irrigoto ready");
 }
 

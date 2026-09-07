@@ -235,3 +235,68 @@ image on an 8 MB chip would leave stale data above 0x400000.
   of the SSID listed there.
 - The fallback AP comes up after ~1 minute of failing to join the
   primary network.
+
+## UART console output is OFF by default (since build 508)
+
+Do not expect ESPHome or irrigoto log lines on the J2 UART when you plug a
+cable into a unit running a default build. Build 508 set the ESPHome logger's
+`baud_rate` to 0 (substitution `logger_baud` in `esphome/irrigoto-core.yaml`)
+after a decoded crash: the loop task wedged inside ESP-IDF's `uart_tx_all`
+writing INFO lines to a UART nobody was listening to, and the task watchdog
+rebooted the unit -- reliably ~35 s after every OTA boot, which rolled every
+new image back.
+
+What you still see on the UART: the ROM/second-stage bootloader banner and
+the ESP-IDF panic/backtrace dump (those bypass the ESPHome logger). What you
+do not see: `[I][irrigoto]` lines, ESPHome component logs, config dumps.
+
+To get them back for a tethered unit, build with the substitution overridden:
+
+```
+python -m esphome -s logger_baud 115200 run esphome/irrigoto.yaml --device <slug-or-ip>
+```
+
+Or read logs over the API instead, which works without a cable and is also
+where the crash handler delivers the previous boot's backtrace:
+
+```
+python -m esphome logs esphome/irrigoto.yaml --device <slug-or-ip>
+```
+
+### Turning the console on at runtime (build 512+)
+
+You no longer need a rebuild to get log lines on the UART. irrigoto owns a
+deferred, non-blocking console: it pushes every log line into the UART0
+hardware FIFO only when it has room (dropping the rest), starts 60 s after
+boot so the post-OTA burst never touches it, and is off until you ask:
+
+```
+curl -X POST "http://<ip>/api/uart_log?on=1"            # this wake only
+curl -X POST "http://<ip>/api/uart_log?on=1&persist=1"  # survives reboots
+curl        "http://<ip>/api/uart_log"                  # read state (GET never toggles)
+```
+
+`/api/all` reports `uart_log` (lines are going out right now),
+`uart_log_want` (the switch) and `uart_log_compiled` (ESPHome's own UART
+logger, normally false). The web UI shows "UART log on/off" beside the
+build number. Plug the cable in, POST on=1, wait for the 60 s mark.
+
+## Post-fault awake hold (opt-in, build 522+)
+
+After a nozzle dwell fault the unit normally closes the valve, finishes the
+run's bookkeeping and goes back to sleep on its usual inactivity timer. The
+full run log is written to flash at closeout (build 520+), so
+`GET /zone/last_log` on the next wake returns it even after deep sleep.
+
+If you are actively debugging a unit and want it to stay reachable after a
+fault instead, enable the hold:
+
+```
+POST /api/fault_hold?min=20     # hold awake 20 min after a fault (0..120)
+GET  /api/fault_hold            # read the setting
+POST /api/fault_hold?min=0      # back to the default: no hold
+```
+
+The setting is persisted in NVS and reported in `/api/all` as
+`fault_hold_min`. Default is 0 (no hold) because the hold costs battery on
+every fault.

@@ -487,7 +487,8 @@ async function refresh(){
     const d=await fetch('/api/all').then(r=>r.json());
     dot(true);
     document.getElementById('cal-incomplete').style.display=d.cal_incomplete?'block':'none';
-    document.getElementById('d-fw').textContent='build '+d.fw_build;
+    document.getElementById('d-fw').textContent='build '+d.fw_build+
+      (d.uart_log===undefined?'':(d.uart_log?' · UART log on':' · UART log off'));
     document.getElementById('d-wifi').innerHTML=
       (d.wifi_ip?'<span style="color:var(--text-mid);font-size:11px">'+d.wifi_ip+'</span> ':'')+rssiLabel(d.wifi_rssi);
     if(d.bat_mv){

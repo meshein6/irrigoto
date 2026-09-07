@@ -59,14 +59,26 @@ views:
                   - entity: binary_sensor.<<DEV_USC>>_irrigoto_watering
                     state: 'on'
                 card:
-                  type: tile
-                  entity: sensor.<<DEV_USC>>_irrigoto_water_minutes_remaining
-                  name: Time remaining
-                  icon: mdi:timer-sand
-                  color: blue
-                  show_entity_picture: false
-                  tap_action:
-                    action: more-info
+                  type: vertical-stack
+                  cards:
+                    - type: tile
+                      entity: sensor.<<DEV_USC>>_irrigoto_water_minutes_remaining
+                      name: Time remaining
+                      icon: mdi:timer-sand
+                      color: blue
+                      show_entity_picture: false
+                      tap_action:
+                        action: more-info
+                    # b503: "dispensed of expected" volume progress. Fed by the
+                    # 30s /api/all REST poll, so it advances in ~30s steps.
+                    - type: tile
+                      entity: sensor.<<DEV_USC>>_irrigoto_water_volume_progress
+                      name: Volume dispensed
+                      icon: mdi:cup-water
+                      color: blue
+                      show_entity_picture: false
+                      tap_action:
+                        action: more-info
               - type: horizontal-stack
                 cards:
                   - type: tile
@@ -185,14 +197,68 @@ views:
         stat_types:
           - change
         entities:
-          - sensor.<<DEV_USC>>_zone_1_cumulative_depth
-          - sensor.<<DEV_USC>>_zone_2_cumulative_depth
-          - sensor.<<DEV_USC>>_zone_3_cumulative_depth
-          - sensor.<<DEV_USC>>_zone_4_cumulative_depth
-          - sensor.<<DEV_USC>>_zone_5_cumulative_depth
-          - sensor.<<DEV_USC>>_zone_6_cumulative_depth
-          - sensor.<<DEV_USC>>_zone_7_cumulative_depth
-          - sensor.<<DEV_USC>>_zone_8_cumulative_depth
+          - entity: sensor.<<DEV_USC>>_zone_1_cumulative_depth
+            name: '#0'
+          - entity: sensor.<<DEV_USC>>_zone_2_cumulative_depth
+            name: '#1'
+          - entity: sensor.<<DEV_USC>>_zone_3_cumulative_depth
+            name: '#2'
+          - entity: sensor.<<DEV_USC>>_zone_4_cumulative_depth
+            name: '#3'
+          - entity: sensor.<<DEV_USC>>_zone_5_cumulative_depth
+            name: '#4'
+          - entity: sensor.<<DEV_USC>>_zone_6_cumulative_depth
+            name: '#5'
+          - entity: sensor.<<DEV_USC>>_zone_7_cumulative_depth
+            name: '#6'
+          - entity: sensor.<<DEV_USC>>_zone_8_cumulative_depth
+            name: '#7'
+      # Live zone legend. The trend charts below label their series by the
+      # device's stable 0-based zone #id, because a statistics-graph legend
+      # renders each entity's friendly name and friendly names are STATIC yaml
+      # -- baking zone names in would go stale the moment a zone is added or
+      # renamed, and would need a ha-regen re-run to fix. This card reads the
+      # device's live zone list instead, so it tracks zone changes on its own.
+      #
+      # NOTE the +/-1: the watering_complete EVENT numbers zones 1-based, so
+      # entity zone_2_* is device zone #1. The card titles and this legend both
+      # speak #id (the b421 convention); only the entity_ids carry the event
+      # numbering, and they are never shown.
+      - type: markdown
+        title: Zones (live)
+        content: >-
+          {% set zs = state_attr('sensor.<<DEV_USC>>_all_rest','zones') %}
+          {% if zs %}{% for z in zs %}**#{{ z.id }}** — {{ z.name }}{% if not
+          loop.last %} · {% endif %}{% endfor %}{% else %}_zone list
+          unavailable (device asleep) — labels below are zone #ids_{% endif %}
+      # Run duration per zone. stat_types: max (NOT mean) on purpose -- these
+      # are trigger-based sensors that hold their last value between runs, so a
+      # daily mean is dominated by the hold, not the run. max on a day with one
+      # run IS that run's duration.
+      - type: statistics-graph
+        title: Watering duration by zone (per run) — last 30 days
+        chart_type: bar
+        period: day
+        days_to_show: 30
+        stat_types:
+          - max
+        entities:
+          - entity: sensor.<<DEV_USC>>_zone_1_last_duration
+            name: '#0'
+          - entity: sensor.<<DEV_USC>>_zone_2_last_duration
+            name: '#1'
+          - entity: sensor.<<DEV_USC>>_zone_3_last_duration
+            name: '#2'
+          - entity: sensor.<<DEV_USC>>_zone_4_last_duration
+            name: '#3'
+          - entity: sensor.<<DEV_USC>>_zone_5_last_duration
+            name: '#4'
+          - entity: sensor.<<DEV_USC>>_zone_6_last_duration
+            name: '#5'
+          - entity: sensor.<<DEV_USC>>_zone_7_last_duration
+            name: '#6'
+          - entity: sensor.<<DEV_USC>>_zone_8_last_duration
+            name: '#7'
       - type: statistics-graph
         title: Watering score by zone (daily mean) — last 30 days
         chart_type: bar
@@ -201,14 +267,22 @@ views:
         stat_types:
           - mean
         entities:
-          - sensor.<<DEV_USC>>_zone_1_last_score
-          - sensor.<<DEV_USC>>_zone_2_last_score
-          - sensor.<<DEV_USC>>_zone_3_last_score
-          - sensor.<<DEV_USC>>_zone_4_last_score
-          - sensor.<<DEV_USC>>_zone_5_last_score
-          - sensor.<<DEV_USC>>_zone_6_last_score
-          - sensor.<<DEV_USC>>_zone_7_last_score
-          - sensor.<<DEV_USC>>_zone_8_last_score
+          - entity: sensor.<<DEV_USC>>_zone_1_last_score
+            name: '#0'
+          - entity: sensor.<<DEV_USC>>_zone_2_last_score
+            name: '#1'
+          - entity: sensor.<<DEV_USC>>_zone_3_last_score
+            name: '#2'
+          - entity: sensor.<<DEV_USC>>_zone_4_last_score
+            name: '#3'
+          - entity: sensor.<<DEV_USC>>_zone_5_last_score
+            name: '#4'
+          - entity: sensor.<<DEV_USC>>_zone_6_last_score
+            name: '#5'
+          - entity: sensor.<<DEV_USC>>_zone_7_last_score
+            name: '#6'
+          - entity: sensor.<<DEV_USC>>_zone_8_last_score
+            name: '#7'
       - type: grid
         columns: 2
         square: false

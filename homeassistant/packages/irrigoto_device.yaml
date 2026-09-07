@@ -1848,6 +1848,42 @@ template:
         icon: mdi:sleep
         state: "{{ state_attr('sensor.<<DEV_USC>>_all_rest','last_sleep_reason') }}"
 
+  # b503/b504.1: live "volume dispensed of volume expected" line for the
+  # dashboard's watering-status stack. The firmware serves both numbers in
+  # /api/all only while a run is active (0 between runs / for modes with no
+  # volume model), so the idle state is the em-dash.
+  #
+  # OWN trigger block, NOT the shared b467 one above: that block's
+  # `not_to:` filter restricts its trigger to STATE-value changes, and
+  # all_rest's state is the fw_build -- constant for the whole run. The
+  # b467 sensors still update because sleep/wake produces unavailable->504
+  # transitions, but a continuous watering run produces none, so this
+  # sensor sat frozen at its startup value. Attribute triggers fire on
+  # every 30s poll that moves the numbers. No retention guard needed --
+  # "—" while the device sleeps is correct for a live-run readout.
+  - trigger:
+      - trigger: state
+        entity_id: sensor.<<DEV_USC>>_all_rest
+        attribute: water_vol_l
+      - trigger: state
+        entity_id: sensor.<<DEV_USC>>_all_rest
+        attribute: water_vol_est_l
+      - trigger: homeassistant
+        event: start
+    sensor:
+      - name: "<<DEV_DASH>> Water Volume Progress"
+        unique_id: <<DEV_USC>>_irrigoto_water_volume_progress
+        default_entity_id: sensor.<<DEV_USC>>_irrigoto_water_volume_progress
+        icon: mdi:cup-water
+        state: >-
+          {%- set v = state_attr('sensor.<<DEV_USC>>_all_rest','water_vol_l') | float(0) -%}
+          {%- set e = state_attr('sensor.<<DEV_USC>>_all_rest','water_vol_est_l') | float(0) -%}
+          {%- if e > 0.05 -%}
+            {{ v | round(1) }} of {{ e | round(1) }} L ({{ (100.0 * v / e) | round(0) | int }}%)
+          {%- else -%}
+            —
+          {%- endif -%}
+
   - trigger:
       - trigger: state
         entity_id: sensor.<<DEV_USC>>_cal_rest
@@ -1964,6 +2000,8 @@ sensor:
       - valve_open
       - water_zone_id
       - last_sleep_reason
+      - water_vol_l       # b503: live run volume dispensed (L)
+      - water_vol_est_l   # b503: expected run volume (L)
       - zones
   - platform: rest
     name: <<DEV_USC>>_cal_rest

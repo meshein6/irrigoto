@@ -21,6 +21,14 @@
 #include "esp_random.h"   // chase mode state-machine PRNG
 #include "esp_sleep.h"
 #include "esp_timer.h"    // b467: esp_timer_get_time() for /api/all uptime_s
+#include "hal/uart_ll.h"  // b512: raw UART0 TX FIFO writes for the console
+#include "soc/uart_struct.h"
+// b509: set from the ${logger_baud} substitution via platformio build_flags
+// (esphome/irrigoto-core.yaml). 0 = no UART console in this build.
+#ifndef IRRIGOTO_UART_LOG_BAUD
+#define IRRIGOTO_UART_LOG_BAUD 0
+#endif
+
 #include "esp_system.h"   // esp_reset_reason() for boot_diag
 #include "esp_heap_caps.h" // b486: largest-free-block for /api/all heap diag
 #include "driver/uart.h"
@@ -375,6 +383,14 @@ static int           s_water_est_min  = 0;    // estimated minutes, shown in web
 // has computed a real estimate).
 static float         s_eta_anchor_secs = 0.0f;
 static TickType_t    s_eta_anchor_tick = 0;
+// b503: live run-progress volume for HA's watering status ("12.4 of 30.1 L").
+// disp = splash-true depth credited so far x per-ring annulus area, recomputed
+// at every depth-accumulation point (smooth/gentle/serpentine); exp = target
+// depth x planned ring areas, set once the ring plan exists. Both 0 between
+// runs (reset at phase_water_zone_mode entry, zeroed again at run teardown).
+static float         s_water_vol_disp_l = 0.0f;
+static float         s_water_vol_exp_l  = 0.0f;
+static TickType_t    s_water_vol_t0     = 0;     // b506: run start tick for the volume-rate ETA
 static FILE         *s_water_csv_f    = NULL; // watering CSV log (/lfs/water/water_000.csv)
 static uint8_t       s_csv_pass_type  = 1;    // 1=initial pass, 2+=cleanup pass
 static bool          s_water_detail_log = false; // when true: write per-pass rows (disables smooth aggregate)
@@ -429,6 +445,54 @@ static int dual_vprintf(const char *fmt, va_list ap)
 #define INFO(fmt, ...) ESP_LOGI(TAG, "  " fmt, ##__VA_ARGS__)
 #define WARN(fmt, ...) ESP_LOGW(TAG, "  " fmt, ##__VA_ARGS__)
 #define TOUCH_ACTIVITY()   do { s_last_activity = xTaskGetTickCount(); } while(0)
+// b517: after a nozzle fault hold the unit awake so /zone/last_log (RAM,
+// lost at deep sleep) can be pulled. Both 2026-09-06 faults happened on
+// scheduled runs and the logs were gone before anyone looked.
+// b522: opt-in. The hold costs battery on every fault and the run log is
+// persisted to flash at closeout since b520, so a published build defaults
+// to NO hold. POST /api/fault_hold?min=N (0..120, NVS "diag"/"fault_hold")
+// enables it on a unit under test; /api/all reports fault_hold_min.
+static TickType_t s_hold_awake_until = 0;
+static uint8_t    s_fault_hold_min    = 0;
+static bool       s_fault_hold_loaded = false;
+static void fault_hold_load_once(void)
+{
+    if (s_fault_hold_loaded) return;
+    s_fault_hold_loaded = true;
+    nvs_handle_t h;
+    if (nvs_open("diag", NVS_READONLY, &h) == ESP_OK) {
+        uint8_t v = 0;
+        if (nvs_get_u8(h, "fault_hold", &v) == ESP_OK) s_fault_hold_min = v;
+        nvs_close(h);
+    }
+}
+static void fault_hold_set(uint8_t minutes)
+{
+    fault_hold_load_once();
+    if (minutes > 120) minutes = 120;
+    s_fault_hold_min = minutes;
+    nvs_handle_t h;
+    if (nvs_open("diag", NVS_READWRITE, &h) == ESP_OK) {
+        nvs_set_u8(h, "fault_hold", minutes);
+        nvs_commit(h);
+        nvs_close(h);
+    }
+    ESP_LOGI(TAG, "post-fault awake hold set to %u min%s [persisted]",
+             (unsigned)minutes, minutes ? "" : " (disabled)");
+}
+// Called from the dwell-fault handlers. Arms the hold only when enabled.
+static void fault_hold_arm(void)
+{
+    fault_hold_load_once();
+    if (s_fault_hold_min == 0) {
+        ESP_LOGW(TAG, "dwell fault: run log persisted -- GET /zone/last_log after the next wake "
+                             "(POST /api/fault_hold?min=N to hold the unit awake instead)");
+        return;
+    }
+    s_hold_awake_until = xTaskGetTickCount() + pdMS_TO_TICKS((uint32_t)s_fault_hold_min * 60000u);
+    ESP_LOGW(TAG, "dwell fault: holding awake %u min -- pull GET /zone/last_log",
+             (unsigned)s_fault_hold_min);
+}
 // WEB_TOUCH: called from every zone web handler.
 // Updates both inactivity timer AND web-client-presence timestamp.
 // Sleep is suppressed for 30 seconds after the last WEB_TOUCH call,
@@ -479,6 +543,18 @@ static float g_valve_cal_start_frame = 263.0f;
 // verified dry-at-closed). Persisted in "vframe"/"suspect" so a reboot can't
 // silently re-enable the schedule on a unit that can't close its valve.
 static bool g_frame_suspect = false;
+// b507: WHY the frame is suspect (persisted "vframe"/"susp_cause"). A leak-
+// raised flag is evidence-clearable (see valve_verify_closed_dry); cal- and
+// push-raised flags still need a real frame cal.
+#define FRAME_SUSPECT_LEAK   1
+#define FRAME_SUSPECT_CAL    2
+#define FRAME_SUSPECT_PUSHED 3
+static uint8_t g_frame_suspect_cause = 0;
+// b507: this wake has measured real supply pressure at the nozzle (a run's
+// supply estimate >= 1 PSI). Only then does a dry read at closed prove the
+// seal rather than a disconnected hose.
+static bool  s_supply_seen_this_wake = false;
+static float s_supply_seen_psi       = 0.0f;
 // b480: true once a frame offset has EVER been stored on this unit ("off" key
 // present in NVS, any value incl. 0). A unit with no stored frame is running
 // the reference frame on hardware whose magnet mounts at a random rotation --
@@ -494,6 +570,7 @@ static bool g_cal_incomplete = false;
 // b480/b481: pressure-verified closure ("off is always off"); defined with the
 // fault-forensics helpers, called from cal teardowns + sleep paths above it.
 static bool valve_verify_closed_dry(const char *ctx, bool allow_motor);
+static void valve_frame_suspect_raise(uint8_t cause);   // b507
 // b418: per-unit valve motor polarity. +1 = reference wiring (driving the
 // physical VFWD pin DECREASES encoder angle / closes), -1 = motor leads
 // swapped. Probed open-loop at the start of POST /cal/valve (before any
@@ -1927,6 +2004,21 @@ static void valve_frame_suspect_set(bool on)
         INFO("Valve frame suspect flag cleared (frame verified)");
 }
 
+// b507: raise the suspect flag with a persisted cause so a later verified-dry
+// close can tell a stale leak flag (b62944 carried one from 2026-08-27 for
+// nine days, refusing every scheduled run) from a cal/push problem.
+static void valve_frame_suspect_raise(uint8_t cause)
+{
+    g_frame_suspect_cause = cause;
+    nvs_handle_t h;
+    if (nvs_open("vframe", NVS_READWRITE, &h) == ESP_OK) {
+        nvs_set_u8(h, "susp_cause", cause);
+        nvs_commit(h);
+        nvs_close(h);
+    }
+    valve_frame_suspect_set(true);
+}
+
 // b474: per-unit flow-onset (FRAME deg). Same namespace as the offset so it
 // loads at the same early boot point. Absent key => g_valve_cal_start_frame
 // keeps its 263 default (reference frame; unchanged units unaffected).
@@ -1970,8 +2062,15 @@ static void valve_offset_nvs_load(void)
     uint8_t susp = 0;
     if (nvs_get_u8(h, "suspect", &susp) == ESP_OK && susp) {
         g_frame_suspect = true;
-        ESP_LOGW(TAG, "Valve frame SUSPECT flag loaded from NVS -- scheduled "
-                      "watering refused until recalibrated");
+        // b507: cause absent (pre-507 flag) => treat as leak-raised, the only
+        // path that fires unattended in the field.
+        uint8_t cause = FRAME_SUSPECT_LEAK;
+        nvs_get_u8(h, "susp_cause", &cause);
+        g_frame_suspect_cause = cause;
+        ESP_LOGW(TAG, "Valve frame SUSPECT flag loaded from NVS (cause %u) -- scheduled "
+                      "watering refused until %s", cause,
+                 cause == FRAME_SUSPECT_LEAK ? "a verified-dry close after live supply"
+                                             : "recalibrated");
     }
     // b490: incomplete-cal marker (inherited throw anchors) also survives.
     uint8_t inc = 0;
@@ -2357,7 +2456,7 @@ static int cal_do_pressure_scan(pressure_map_t *map, bool is_web)
         // 1-point-scan-with-water-running failure).
         if (di == 0 && disc_psi[0] >= LEAK_CLOSED_PSI) {
             INFO("*** Flow at CLOSED (%.2f PSI) -- valve frame suspect. ***", disc_psi[0]);
-            valve_frame_suspect_set(true);
+            valve_frame_suspect_raise(FRAME_SUSPECT_CAL);
             return -2;
         }
     }
@@ -2615,7 +2714,7 @@ static int cal_do_pressure_scan(pressure_map_t *map, bool is_web)
     // returned -1 above). Don't proceed to throw measurement on garbage.
     if (n < 3) {
         INFO("*** Scan collapsed (%d pts) -- valve frame suspect. ***", n);
-        valve_frame_suspect_set(true);
+        valve_frame_suspect_raise(FRAME_SUSPECT_CAL);
         return -2;
     }
 
@@ -6366,7 +6465,19 @@ static bool valve_verify_closed_dry(const char *ctx, bool allow_motor)
 {
     float psi = cal_pressure_settled_median(3);
     if (psi < 0.0f) return true;                 // sensor unreadable -- can't judge
-    if (psi < LEAK_CLOSED_PSI) return true;      // dry: off is off
+    if (psi < LEAK_CLOSED_PSI) {                 // dry: off is off
+        // b507: a leak-raised suspect flag is exactly the claim "closed is not
+        // sealed". A dry read at closed, in a wake that measured live supply
+        // through this same valve, disproves it -- so clear it here instead
+        // of demanding a frame cal. Cal/push-raised flags are untouched.
+        if (g_frame_suspect && g_frame_suspect_cause == FRAME_SUSPECT_LEAK &&
+            s_supply_seen_this_wake) {
+            INFO("Frame suspect (leak) CLEARED: closed reads %.2f PSI at %s after "
+                 "%.1f PSI live supply this wake", psi, ctx, s_supply_seen_psi);
+            valve_frame_suspect_set(false);
+        }
+        return true;
+    }
     ESP_LOGW(TAG, "LEAK at believed-closed (%s): %.2f PSI", ctx, psi);
     bool dry = false;
     float fpsi = psi;
@@ -6385,7 +6496,7 @@ static bool valve_verify_closed_dry(const char *ctx, bool allow_motor)
     }
     fault_diag_record(FAULT_CAUSE_LEAK_CLOSED, 0, 0, dry ? 1 : 0,
                       0, (uint32_t)(fpsi * 1000.0f), -1.0f, -1.0f);
-    valve_frame_suspect_set(true);
+    valve_frame_suspect_raise(FRAME_SUSPECT_LEAK);
     return dry;
 }
 
@@ -6691,6 +6802,11 @@ static void check_inactivity(void)
         TickType_t web_idle = xTaskGetTickCount() - s_last_web_req_tick;
         if (web_idle < pdMS_TO_TICKS(WEB_CLIENT_TIMEOUT_MS)) return;
     }
+    // b517: forensic hold after a fault (b522: opt-in, see fault_hold_arm).
+    if (s_hold_awake_until != 0) {
+        if ((int32_t)(xTaskGetTickCount() - s_hold_awake_until) < 0) return;
+        s_hold_awake_until = 0;
+    }
     TickType_t idle = xTaskGetTickCount() - s_last_activity;
     if (idle >= pdMS_TO_TICKS(s_inactivity_ms)) {
         // Schedule-aware deferral: if a scheduled run is imminent, don't
@@ -6776,6 +6892,55 @@ static inline float smooth_display_depth_mm(float geo_depth,
     float a_splash = ro * ro - ri * ri;
     if (a_geo <= 1.0f || a_splash <= 1.0f) return geo_depth;
     return geo_depth * (a_geo / a_splash);
+}
+
+// b503: recompute the live dispensed-volume estimate from the per-ring
+// cumulative depth array (smooth, gentle, and serpentine all maintain one).
+// Ring arcs come from the live s_last_water_run ring records; rings this run
+// hasn't visited yet have cum_depth 0, so their stale record data can't leak
+// in. Splash-true depth mirrors the end-of-run volume_l computation. The
+// inner-edge convention (next ring's throw, last ring x0.92) matches the
+// depth accumulators, so dispensed/expected converges toward ~100%.
+static void water_progress_update_dispensed(const float *cum_depth,
+                                            const float *ring_throws,
+                                            int num_rings)
+{
+    float sum_L = 0.0f;
+    int nr = num_rings > WATER_RUN_MAX_RINGS ? WATER_RUN_MAX_RINGS : num_rings;
+    for (int i = 0; i < nr; i++) {
+        if (cum_depth[i] <= 0.005f) continue;
+        float ro = ring_throws[i];
+        float ri = (i == num_rings - 1) ? ro * 0.92f : ring_throws[i + 1];
+        float arc_deg = s_last_water_run.rings[i].active_deg;
+        if (arc_deg <= 0.0f || ro <= 1.0f || ri >= ro) continue;
+        float area_m2 = (float)M_PI * (ro * ro - ri * ri) / 1.0e6f
+                        * (arc_deg / 360.0f);
+        sum_L += smooth_display_depth_mm(cum_depth[i], ro, ri) * area_m2;
+    }
+    s_water_vol_disp_l = sum_L;
+
+    // b506: volume-rate ETA (Rob: "volume dispensed is good nowadays, time
+    // remaining should be as good"). The dispensed/expected pair is the most
+    // trustworthy progress signal we have (b503/b504), and the AVERAGE
+    // delivery rate since run start already folds in every overhead --
+    // transits, turns, dwells, PID settles -- so remaining = deficit / rate
+    // needs no per-mode overhead model. Arms once 5% of the expected volume
+    // (or 3 min) is in; goes quiet when the deficit is gone so the mode's
+    // own pass-based estimate carries any over-delivery tail. Mode-
+    // independent: every coverage mode calls this at each depth credit.
+    if (s_water_vol_exp_l > 0.5f && s_water_vol_t0 != 0) {
+        float elapsed_s   = (float)(xTaskGetTickCount() - s_water_vol_t0)
+                            / (float)configTICK_RATE_HZ;
+        float remaining_L = s_water_vol_exp_l - sum_L;
+        bool  armed = (sum_L >= 0.05f * s_water_vol_exp_l) || (elapsed_s >= 180.0f);
+        if (armed && elapsed_s > 30.0f && sum_L > 0.05f && remaining_L > 0.0f) {
+            float rate_Lps = sum_L / elapsed_s;
+            float secs     = remaining_L / rate_Lps + 30.0f;   // + cleanup tail
+            s_water_est_min   = (int)(secs / 60.0f) + 1;
+            s_eta_anchor_secs = secs;
+            s_eta_anchor_tick = xTaskGetTickCount();
+        }
+    }
 }
 
 // Read actual max and min throw from the calibration table.
@@ -7907,6 +8072,7 @@ static bool nozzle_sweep_encoder_gentle(
                                   "with valve open — slamming valve closed",
                              (unsigned)dwell_ms, cur_deg);
                     water_set_status(WATER_STATUS_NOZZLE_FAULT);
+                    fault_hold_arm();   // b517 hold, b522 opt-in
                     // NCUR only means something while the drive is still on.
                     float fault_ma = CURRENT_MA(adc_mv(ADC_CH_NCUR));
                     // Stop nozzle drive immediately and close the valve from
@@ -8536,6 +8702,8 @@ typedef struct {
     int8_t   dir;          // +1 CW, -1 CCW (sweep/transit); 0 = shortest path
     uint8_t  kind;         // serpentine_leg_kind_t
     float    ring_throw;   // mm, CSV target columns (SWEEP legs)
+    float    arc_span;     // b519: planned sweep span (deg); 0 = n/a
+    float    leg_throw;    // b520: this leg's own radius (mm); hug waypoints < ring_throw
 } serpentine_leg_t;
 
 // 36 rings x (turn + sweep) + boundary-hug waypoint (b426) and multi-arc
@@ -8780,7 +8948,7 @@ static int serpentine_build_pass_plan(
         s_serpentine_legs[n++] = (serpentine_leg_t){ .b1_deg=(_b), .v1_deg=(_v),        \
             .duty=(_duty), .dps=(_dps), .ring=(int8_t)(_ring),                \
             .dir=(int8_t)(_dir), .kind=(uint8_t)(_kind),                      \
-            .ring_throw=(_throw) };                                           \
+            .ring_throw=(_throw), .leg_throw=(_throw) };                      \
     } while (0)
 
     for (int ri = 0; ri < num_rings && ri < WATER_RUN_MAX_RINGS; ri++) {
@@ -8871,6 +9039,7 @@ static int serpentine_build_pass_plan(
                                                    pressure_scale, psi_min, psi_max);
                         SERPENTINE_EMIT(last ? entry : wpb[wi], wv, duty, dps_ring,
                                    ring, 0, SERPENTINE_LEG_TURN, ring_throw);
+                        if (!last) s_serpentine_legs[n - 1].leg_throw = wpr[wi];   // b520
                     }
                     if (nw > 2)
                         INFO("Serpentine plan r%d: boundary-hug turn %.1f -> %.1f "
@@ -8890,6 +9059,7 @@ static int serpentine_build_pass_plan(
             }
             SERPENTINE_EMIT(exitb, valve, duty, dps_ring, ring, cw ? +1 : -1,
                        SERPENTINE_LEG_SWEEP, ring_throw);
+            s_serpentine_legs[n - 1].arc_span = fmodf(hi[ai] - lo[ai] + 360.0f, 360.0f);  // b519
             prev_exit_b = exitb;                                   // b425
             prev_throw  = ring_throw;   // b426: per ARC (lobe-gap connectors)
             float span = fmodf(hi[ai] - lo[ai] + 360.0f, 360.0f);
@@ -8901,6 +9071,301 @@ static int serpentine_build_pass_plan(
     }
 #undef SERPENTINE_EMIT
     return n;
+}
+
+// b513: supply feed-forward for serpentine valve targets.
+//
+// The planner computes every ring's valve angle up front from the cal table
+// (cal-day supply) times a per-ring corr learned from earlier passes. On a
+// well/tank supply that sags ~20% over a ~6 min cycle, the corr is learned
+// in one phase and fired in another: LF-South 2026-09-05 put rings 9-14
+// (6.1-7.7 m targets) all at 8.9-9.4 m (ratio 1.2-1.5) -> water banded at
+// 3/5/9 m with dry gaps between. Rob's rules: no pressure hunting, keep the
+// continuous flow. So the valve still moves ONLY in the turn legs, to a
+// precomputed target -- this just recomputes that target at the moment the
+// ring is entered, from the supply measured on the ring that just finished:
+//   supply   = tail_psi / f(tail_valve)        (b281/b284 model, cached table)
+//   cal_psi  = target_psi * anchor / supply    (what the cal table must read)
+//   valve    = table^-1(cal_psi)               (+ linear extrapolation above)
+// With supply == anchor this reproduces the planner's angle exactly. Pressure
+// readings only ever inform the NEXT target; nothing moves mid-sweep.
+static pressure_map_t s_serp_pmap;
+static bool  s_serp_pmap_ok        = false;
+static float s_serp_pmap_anchor    = 0.0f;   // cal-time supply anchor (max psi in table)
+static float s_serp_ff_tail_psi    = 0.0f;   // last wet-sweep sample of the previous ring
+static float s_serp_ff_tail_valve  = 0.0f;   // valve angle at that sample
+// b514: the sample before that, from the ring before it. rho = P_today /
+// P_cal at the same opening is NOT constant across openings (b513 log: 0.82
+// at 244 deg -> 1.24 at 225 deg within one pass, the b428 "back-computed
+// supply rises as the valve closes" artifact baked into the cal curve), so
+// using the adjacent ring's rho unmodified biases every ring in the
+// direction of travel: out->in over-throws, in->out under-throws, and the
+// per-ring corr sees an alternating error it can never converge on. Two
+// samples give a local d(rho)/d(valve); extrapolating one ring step in
+// opening space removes the bias at its source.
+static float s_serp_ff_prev_psi    = 0.0f;
+static float s_serp_ff_prev_valve  = 0.0f;
+
+static void serp_ff_reset(void)
+{
+    s_serp_ff_tail_psi = 0.0f; s_serp_ff_tail_valve = 0.0f;
+    s_serp_ff_prev_psi = 0.0f; s_serp_ff_prev_valve = 0.0f;
+    s_serp_pmap_ok = (cal_load_primary(&s_serp_pmap) == ESP_OK && s_serp_pmap.num_points >= 2);
+    s_serp_pmap_anchor = 0.0f;
+    if (s_serp_pmap_ok)
+        for (int i = 0; i < s_serp_pmap.num_points; i++)
+            if (s_serp_pmap.pressure_psi[i] > s_serp_pmap_anchor)
+                s_serp_pmap_anchor = s_serp_pmap.pressure_psi[i];
+    if (s_serp_pmap_anchor < 0.5f) s_serp_pmap_ok = false;
+}
+
+// Nozzle pressure the cal table recorded at valve angle v (linear interp).
+static float serp_pmap_psi_at_valve(float v)
+{
+    const pressure_map_t *c = &s_serp_pmap; int n = c->num_points;
+    if (v <= c->valve_deg[0])     return c->pressure_psi[0];
+    if (v >= c->valve_deg[n - 1]) return c->pressure_psi[n - 1];
+    for (int i = 0; i < n - 1; i++) {
+        float lo = c->valve_deg[i], hi = c->valve_deg[i + 1];
+        if (v >= lo && v <= hi && hi > lo) {
+            float t = (v - lo) / (hi - lo);
+            return c->pressure_psi[i] + t * (c->pressure_psi[i + 1] - c->pressure_psi[i]);
+        }
+    }
+    return c->pressure_psi[n - 1];
+}
+
+// Valve angle at which the cal table reads psi; linear extrapolation past
+// the top two points (supply-limited rings), clamped to the valve range.
+static float serp_pmap_valve_at_psi(float psi)
+{
+    const pressure_map_t *c = &s_serp_pmap; int n = c->num_points;
+    for (int i = 0; i < n - 1; i++) {
+        float p0 = c->pressure_psi[i], p1 = c->pressure_psi[i + 1];
+        if ((psi >= p0 && psi <= p1) || (psi <= p0 && psi >= p1)) {
+            float t = (p1 != p0) ? (psi - p0) / (p1 - p0) : 0.0f;
+            float v = c->valve_deg[i] + t * (c->valve_deg[i + 1] - c->valve_deg[i]);
+            return fmaxf(VALVE_CAL_START_DEG, fminf(VALVE_OPEN_DEG, v));
+        }
+    }
+    // Above the table top: NEVER extrapolate. The cal maximum IS the valve's
+    // pressure peak (VALVE_OPEN_DEG sits at "peak 306.7" in the frame); past
+    // it a ball valve's flow falls off again. b513-b515 extrapolated along
+    // the last segment and on backyard Combined (outer rings pinned at the
+    // cal ceiling, supply sagging) drove rings 1-3 to 380-388 deg in that
+    // unit's frame: 1.1-1.7 psi, 1.4-2.2 m throw, nozzle fault
+    // (2026-09-06). A ring that needs more than the table top is simply
+    // supply-limited: hold the max-pressure angle and let the depth
+    // tracker / corr / re-fire logic handle it as before.
+    int imax = 0;
+    for (int i = 1; i < n; i++) if (c->pressure_psi[i] > c->pressure_psi[imax]) imax = i;
+    if (psi > c->pressure_psi[imax])
+        return fmaxf(VALVE_CAL_START_DEG, fminf(VALVE_OPEN_DEG, c->valve_deg[imax]));
+    // b514: below the table bottom -> extrapolate along the lowest segment
+    // (clamping to flow onset starved rings 27-29 on 2026-09-05: 0.74 psi,
+    // ratio 0.39-0.75). Floor at VALVE_CAL_START_DEG.
+    int imin = 0;
+    for (int i = 1; i < n; i++) if (c->pressure_psi[i] < c->pressure_psi[imin]) imin = i;
+    int j = (imin + 1 < n) ? imin + 1 : imin - 1;
+    if (j >= 0 && j < n && c->pressure_psi[j] != c->pressure_psi[imin]) {
+        float slope = (c->valve_deg[j] - c->valve_deg[imin])
+                    / (c->pressure_psi[j] - c->pressure_psi[imin]);
+        float v = c->valve_deg[imin] + slope * (psi - c->pressure_psi[imin]);
+        return fmaxf(VALVE_CAL_START_DEG, fminf(VALVE_OPEN_DEG, v));
+    }
+    return VALVE_CAL_START_DEG;
+}
+
+// Cal-day nozzle pressure that produced throw_mm (cached-table cal_throw_to_psi).
+static float serp_pmap_psi_at_throw(float throw_mm)
+{
+    const pressure_map_t *c = &s_serp_pmap;
+    for (int i = 0; i < c->num_points - 1; i++) {
+        float t0 = c->throw_mm[i], t1 = c->throw_mm[i + 1];
+        if (t0 <= 0 || t1 <= 0) continue;
+        float lo = fminf(t0, t1), hi = fmaxf(t0, t1);
+        if (throw_mm >= lo && throw_mm <= hi) {
+            float frac = (hi > lo) ? (throw_mm - t0) / (t1 - t0) : 0.0f;
+            return c->pressure_psi[i] + frac * (c->pressure_psi[i + 1] - c->pressure_psi[i]);
+        }
+    }
+    return throw_mm / 1359.0f;
+}
+
+// Feed-forward valve target for a ring, or the planner's angle when no
+// usable supply sample exists yet (first ring of the run) or the ring is a
+// sub-cal direct ring.
+static float serp_ff_valve(int ring, float ring_throw, bool direct, float corr,
+                           bool have_throw_cal, float act_max_throw, float planned,
+                           bool verbose)
+{
+    if (!s_serp_pmap_ok || direct || !have_throw_cal || s_serp_ff_tail_psi < 0.1f)
+        return planned;
+    float f_tail = serp_pmap_psi_at_valve(s_serp_ff_tail_valve) / s_serp_pmap_anchor;
+    if (f_tail < 0.05f) return planned;
+    float supply = s_serp_ff_tail_psi / f_tail;
+    if (supply < 0.3f * s_serp_pmap_anchor || supply > 2.0f * s_serp_pmap_anchor)
+        return planned;                                   // implausible sample
+    float rho = supply / s_serp_pmap_anchor;              // today / cal-day at the tail opening
+    // b514: extrapolate rho to THIS ring's opening using the local slope from
+    // the two most recent samples (adjacent rings, ~30 s apart). Only when
+    // the samples are at distinct openings and the step is a normal ring
+    // step; bounded so a noisy pair cannot swing it more than +/-30%.
+    float rho_used = rho;
+    if (s_serp_ff_prev_psi > 0.1f) {
+        float dv = s_serp_ff_tail_valve - s_serp_ff_prev_valve;
+        float step = planned - s_serp_ff_tail_valve;
+        if (fabsf(dv) >= 0.5f && fabsf(step) <= 15.0f) {
+            float f_prev = serp_pmap_psi_at_valve(s_serp_ff_prev_valve) / s_serp_pmap_anchor;
+            if (f_prev >= 0.05f) {
+                float rho_prev = (s_serp_ff_prev_psi / f_prev) / s_serp_pmap_anchor;
+                float slope = (rho - rho_prev) / dv;
+                rho_used = rho + slope * step;
+                rho_used = fmaxf(0.7f * rho, fminf(1.3f * rho, rho_used));
+            }
+        }
+    }
+    float lookup = fminf(ring_throw * corr, act_max_throw * 1.5f);
+    float target = serp_pmap_psi_at_throw(lookup);
+    if (target < 0.05f) return planned;
+    float cal_psi = target / rho_used;
+    float v = serp_pmap_valve_at_psi(cal_psi);
+    // b514: the correction is a modest trim (supply +/-20% is a few degrees);
+    // never let a model breakdown move the valve far from the cal angle.
+    const float FF_BAND_DEG = 8.0f;
+    v = fmaxf(planned - FF_BAND_DEG, fminf(planned + FF_BAND_DEG, v));
+    {   // b516: and never past the cal table's max-pressure angle (the peak)
+        int imax = 0;
+        for (int i = 1; i < s_serp_pmap.num_points; i++)
+            if (s_serp_pmap.pressure_psi[i] > s_serp_pmap.pressure_psi[imax]) imax = i;
+        if (v > s_serp_pmap.valve_deg[imax]) v = s_serp_pmap.valve_deg[imax];
+    }
+    if (verbose)
+        INFO("Serpentine ff r%d: rho %.2f (tail %.2f @%.1f), target %.2f psi -> valve %.1f (plan %.1f)",
+             ring + 1, rho_used, rho, s_serp_ff_tail_valve, target, v, planned);
+    return v;
+}
+
+// b515: consistent valve approach for serpentine turn legs.
+//
+// b514 validation (both LowerFront halves): outer rings 0.90-1.08, but inner
+// rings still +10-25% over-pressure at the COMMANDED angle (meas/Pcal(v)
+// 1.05-1.27 on rings 13-34). The 2026-06-06 lash experiment (b412/b416)
+// measured exactly this: approaching a valve target from ABOVE (closing)
+// leaves a per-unit short-stop of a few degrees (the ball sits more open
+// than commanded); from BELOW is accurate after the COAST_S fix. Smooth's
+// trim sidesteps it by always approaching from below. Serpentine's turn legs
+// arrive from whichever side the boustrophedon dictates, so every out->in
+// ring lands long and every in->out ring short -- an alternating error the
+// per-ring corr can never converge on, and one the supply feed-forward
+// cannot see (it reads the encoder, which is on the output shaft, not the
+// ball). Fix: after any leg whose valve target is below its start, dip
+// SERP_V_APPROACH_OVS below the target and come back up to it from below.
+// Nozzle is stationary at the turn point; ~0.5 s per closing turn; no
+// pressure feedback involved (Rob: no hunting, keep the flow continuous).
+#define SERP_V_APPROACH_OVS   3.0f
+#define SERP_V_APPROACH_MS    1500u
+static void serp_valve_settle_from_below(chase_motor_t *vm, float v1, int *v_dir_io)
+{
+    const int      OPEN_DIR  = -1;      // matches VALVE_OPEN_DIR in glide_legs
+    const uint16_t DUTY_HI   = 220, DUTY_LO = 70;
+    const float    TOL       = 0.8f, DECEL = 4.0f;
+    float v_pre = fmaxf(v1 - SERP_V_APPROACH_OVS, VALVE_CAL_START_DEG + 0.5f);
+    if (v_pre >= v1 - 0.3f) return;     // no room below: nothing to gain
+    uint16_t raw = 0; float cur = v1;
+    // Phase A: make sure we are BELOW the target (closing direction).
+    chase_motor_apply(vm, 0, 0); vTaskDelay(pdMS_TO_TICKS(50));
+    TickType_t t0 = xTaskGetTickCount();
+    while ((uint32_t)pdTICKS_TO_MS(xTaskGetTickCount() - t0) < SERP_V_APPROACH_MS) {
+        if (!as5600_read(ADDR_AS5600L, &raw, NULL, NULL)) break;
+        cur = cal_unwrap_deg_near(raw * (360.0f / 4096.0f), VALVE_CLOSED_DEG + 40.0f);  // b517
+        if (cur <= v_pre + TOL) break;
+        float d = cur - v_pre; uint16_t duty = DUTY_HI;
+        if (d < DECEL) duty = (uint16_t)(DUTY_LO + (DUTY_HI - DUTY_LO) * (d / DECEL));
+        chase_motor_apply(vm, -OPEN_DIR, duty);
+        vTaskDelay(pdMS_TO_TICKS(30));
+    }
+    chase_motor_apply(vm, 0, 0); vTaskDelay(pdMS_TO_TICKS(60));
+    // Phase B: approach the target from below (opening direction).
+    t0 = xTaskGetTickCount();
+    while ((uint32_t)pdTICKS_TO_MS(xTaskGetTickCount() - t0) < SERP_V_APPROACH_MS) {
+        if (!as5600_read(ADDR_AS5600L, &raw, NULL, NULL)) break;
+        cur = cal_unwrap_deg_near(raw * (360.0f / 4096.0f), VALVE_CLOSED_DEG + 40.0f);  // b517
+        if (cur >= v1 - TOL) break;
+        float d = v1 - cur; uint16_t duty = DUTY_HI;
+        if (d < DECEL) duty = (uint16_t)(DUTY_LO + (DUTY_HI - DUTY_LO) * (d / DECEL));
+        chase_motor_apply(vm, OPEN_DIR, duty);
+        vTaskDelay(pdMS_TO_TICKS(30));
+    }
+    chase_motor_apply(vm, 0, 0);
+    if (v_dir_io) *v_dir_io = 0;
+    s_valve_last_dir = OPEN_DIR;
+}
+
+// b520: runtime dry hop for a sweep whose nozzle is not at the arc entry.
+// Close the valve in place, rotate the shortest way to the entry with the
+// stream off, reopen to the ring target from below (b515 direction), and
+// let the caller re-derive the leg from the actual position. Overshoots of
+// SERP_SKIP_PAST_DEG or less past the exit are treated as already covered.
+#define SERP_SKIP_PAST_DEG 25.0f
+static void serp_valve_drive(chase_motor_t *vm, float target, uint32_t timeout_ms)
+{
+    const int      OPEN_DIR = -1;       // matches VALVE_OPEN_DIR in glide_legs
+    const uint16_t DUTY_HI  = 220, DUTY_LO = 70;
+    const float    TOL      = 0.8f, DECEL = 4.0f;
+    uint16_t raw = 0; float cur = target;
+    TickType_t t0 = xTaskGetTickCount();
+    while ((uint32_t)pdTICKS_TO_MS(xTaskGetTickCount() - t0) < timeout_ms) {
+        if (!as5600_read(ADDR_AS5600L, &raw, NULL, NULL)) break;
+        cur = cal_unwrap_deg_near(raw * (360.0f / 4096.0f), VALVE_CLOSED_DEG + 40.0f);
+        float d = target - cur;
+        if (fabsf(d) <= TOL) break;
+        uint16_t duty = DUTY_HI;
+        if (fabsf(d) < DECEL)
+            duty = (uint16_t)(DUTY_LO + (DUTY_HI - DUTY_LO) * (fabsf(d) / DECEL));
+        chase_motor_apply(vm, (d >= 0.0f) ? OPEN_DIR : -OPEN_DIR, duty);
+        vTaskDelay(pdMS_TO_TICKS(30));
+    }
+    chase_motor_apply(vm, 0, 0);
+    s_valve_deg_cached = cur;
+}
+
+static void serp_dry_hop_to(chase_motor_t *nm, chase_motor_t *vm, int *v_dir_io,
+                            float target_b, float v_reopen, bool dry)
+{
+    const uint16_t ALIGN = 380, MIN_D = 70;
+    const float    TOL   = 1.5f, DECEL = 15.0f;
+    chase_motor_apply(nm, 0, 0);
+    if (v_dir_io) *v_dir_io = 0;
+    if (!dry) {
+        chase_motor_apply(vm, 0, 0);
+        serp_valve_drive(vm, VALVE_CAL_START_DEG + 0.5f, 15000u);   // close in place
+        vTaskDelay(pdMS_TO_TICKS(300));                             // let the stream die
+    }
+    uint16_t raw = 0; float cur = target_b;
+    TickType_t t0 = xTaskGetTickCount();
+    while ((uint32_t)pdTICKS_TO_MS(xTaskGetTickCount() - t0) < 40000u) {
+        if (!as5600_read(ADDR_AS5600, &raw, NULL, NULL)) break;
+        cur = raw * (360.0f / 4096.0f);
+        float d = target_b - cur;
+        while (d >  180.0f) d -= 360.0f;
+        while (d < -180.0f) d += 360.0f;
+        if (fabsf(d) <= TOL) break;
+        int want = (d >= 0.0f) ? +1 : -1;
+        uint16_t duty = ALIGN;
+        if (fabsf(d) < DECEL)
+            duty = (uint16_t)(MIN_D + (ALIGN - MIN_D) * (fabsf(d) / DECEL));
+        if (nm->dir != 0 && nm->dir != want) chase_motor_reverse_fast(nm, duty);
+        else                                 chase_motor_apply(nm, want, duty);
+        vTaskDelay(pdMS_TO_TICKS(30));
+        TOUCH_ACTIVITY();
+    }
+    chase_motor_apply(nm, 0, 0);
+    vTaskDelay(pdMS_TO_TICKS(150));
+    if (!dry) {
+        serp_valve_drive(vm, v_reopen, 20000u);                     // reopen, from below
+        s_valve_last_dir = -1;
+    }
 }
 
 // b423: the glide executor -- generalized from zone_trace_run's leg loop
@@ -8917,6 +9382,9 @@ static int serpentine_build_pass_plan(
 // shared closeout owns teardown.
 static bool serpentine_glide_legs(const serpentine_leg_t *legs, int n,
                              const float *ring_throws, int num_rings,
+                             const bool *ring_direct, const float *valve_corr,   // b513
+                             bool have_throw_cal, float act_max_throw,           // b513
+                             const zone_perimeter_t *zone, bool have_zone,       // b518
                              float *cumulative_depth,
                              float *run_psi_sum, int *run_psi_n,
                              int *ring_sweeps_out,
@@ -8954,6 +9422,9 @@ static bool serpentine_glide_legs(const serpentine_leg_t *legs, int n,
     float flow_psi_sum   = 0.0f;
     int   flow_psi_n     = 0;
     int  last_trace_ring = -1;
+    int   ff_ring = -1;            // b513: ring whose feed-forward target is cached
+    float ff_v    = -1.0f;
+    int   ff_sample_ring = -1;     // b514: ring currently contributing tail samples
     TickType_t t_run = xTaskGetTickCount();
 
     for (int leg = 0; leg < n && ok; leg++) {
@@ -8962,7 +9433,17 @@ static bool serpentine_glide_legs(const serpentine_leg_t *legs, int n,
         as5600_read(ADDR_AS5600,  &n_raw, NULL, NULL);
         as5600_read(ADDR_AS5600L, &v_raw, NULL, NULL);
         float cur_b = n_raw * (360.0f / 4096.0f);
-        float v0    = v_raw * (360.0f / 4096.0f);
+        // b517: the valve frame is per unit (VALVE_CLOSED_DEG = 231 + offset)
+        // and on backyard ba1f88 it runs 323..400 deg -- past the encoder's
+        // 360 wrap. Ring targets are unwrapped frame angles; the raw reading
+        // is 0..360. Compare like with like (cal_unwrap_deg_near, the same
+        // guard the pressure scan uses). Before this, backyard's serpentine
+        // chase saw target 387 vs raw 27 and drove the ball round and round
+        // (1-2 psi, 2 m throw, nozzle throttled to min duty, dwell fault
+        // 2026-09-06 08:00). Lower frontyard (192..269) and frontyard
+        // (178..256) never wrap, which is why it only showed on backyard.
+        float v0    = cal_unwrap_deg_near(v_raw * (360.0f / 4096.0f),
+                                          VALVE_CLOSED_DEG + 40.0f);
 
         // Leg geometry from the ACTUAL current position (positioning error
         // never accumulates -- b417). Sweeps/transits carry an explicit
@@ -8981,9 +9462,89 @@ static bool serpentine_glide_legs(const serpentine_leg_t *legs, int n,
             dirn = (d >= 0.0f) ? +1 : -1;
         }
         if (span > 355.0f) span = 0.0f;   // explicit-dir wrap noise: already there
+        // b519: a SWEEP can never be longer than its planned arc. The span is
+        // derived from the ACTUAL bearing; if the nozzle arrives already past
+        // the arc's exit (backyard Combined 2026-09-06: 5-12 deg sliver arcs at
+        // the north spike, entered by a carry-through dry hop at align speed),
+        // the CW/CCW span wraps to ~350 deg -- under the 355 guard -- and the
+        // nozzle circles the whole zone at that ring's radius, through the
+        // notch and the empty gap. Rings 4-7 did exactly that (ring 5 sampled
+        // in all 36 sectors). Skip the sweep instead; the depth tracker will
+        // re-fire the ring if it is still short.
+        bool need_hop = false;   // b520
+        if (L->kind == SERPENTINE_LEG_SWEEP && L->arc_span > 0.0f &&
+            span > L->arc_span + 10.0f) {
+            // b520: only a SMALL overshoot past the exit means "already
+            // covered". Anything else means the nozzle is somewhere off the
+            // arc (b519's connector trim froze the boundary hug at the north
+            // spike, then this guard skipped rings 4-8's 220-267 deg arcs
+            // outright -- backyard Combined 2026-09-07 08:00). Hop DRY to the
+            // arc's entry and sweep the whole arc instead of abandoning it.
+            float past = 360.0f - span;
+            if (past <= SERP_SKIP_PAST_DEG) {
+                INFO("serpentine: leg %d ring %d is %.1f deg past its %.1f-deg arc "
+                     "-- skipping sweep", leg, L->ring + 1, past, L->arc_span);
+                span = 0.0f;
+            } else {
+                need_hop = true;
+            }
+        }
         bool  radial  = (span < MIN_SWEEP_DEG);
         bool  dry_leg = (L->v1_deg < 0.0f) || dry;
         float v1      = dry_leg ? v0 : L->v1_deg;
+        // b513: supply feed-forward -- recompute this ring's valve target once,
+        // on entry, from the previous ring's tail sample. Applies to every
+        // wet leg of the ring (turn, sweep, hug waypoints) so they agree.
+        if (!dry_leg && L->ring >= 0 && L->ring < num_rings) {
+            if (L->ring != ff_ring) {
+                ff_ring = L->ring;
+                // b520: anchor the ring's feed-forward on the ring's OWN planned
+                // valve (its sweep leg), not on whichever leg enters the ring.
+                // Since b513 a ring entered through a boundary-hug connector was
+                // anchored on the first waypoint's REDUCED valve, and the +/-8
+                // deg band then pinned every leg of the ring near it.
+                float planned_ring_v = L->v1_deg;
+                for (int j = leg; j < n && j < leg + 96; j++) {
+                    if (legs[j].ring == L->ring && legs[j].kind == SERPENTINE_LEG_SWEEP &&
+                        legs[j].v1_deg >= 0.0f) { planned_ring_v = legs[j].v1_deg; break; }
+                }
+                ff_v = serp_ff_valve(L->ring, ring_throws[L->ring],
+                                     ring_direct ? ring_direct[L->ring] : false,
+                                     valve_corr ? valve_corr[L->ring] : 1.0f,
+                                     have_throw_cal, act_max_throw, planned_ring_v, true);
+            }
+            if (ff_v >= 0.0f) {
+                v1 = ff_v;
+                // b520: boundary-hug waypoints (b426) ride at a REDUCED radius
+                // just inside the polygon. b513 overrode their valve with the
+                // ring's target, so every connector since then sprayed at full
+                // ring throw across the boundary it was meant to hug (backyard
+                // Combined 2026-09-07: two wet crossings of the NW gap). Feed
+                // the waypoint's own radius through the same supply model.
+                if (L->kind == SERPENTINE_LEG_TURN && L->leg_throw > 0.0f &&
+                    L->leg_throw < ring_throws[L->ring] - 1.0f)
+                    v1 = serp_ff_valve(L->ring, L->leg_throw,
+                                       ring_direct ? ring_direct[L->ring] : false,
+                                       valve_corr ? valve_corr[L->ring] : 1.0f,
+                                       have_throw_cal, act_max_throw, L->v1_deg, false);
+            }
+        }
+        if (need_hop) {
+            float entry = fmodf(L->b1_deg - (float)dirn * L->arc_span + 720.0f, 360.0f);
+            INFO("serpentine: leg %d ring %d at %.1f is off its %.1f-deg arc (entry %.1f, "
+                 "exit %.1f) -- dry hop to the entry", leg, L->ring + 1, cur_b,
+                 L->arc_span, entry, L->b1_deg);
+            serp_dry_hop_to(&nm, &vm, &v_dir, entry, v1, dry_leg);
+            as5600_read(ADDR_AS5600,  &n_raw, NULL, NULL);
+            as5600_read(ADDR_AS5600L, &v_raw, NULL, NULL);
+            cur_b = n_raw * (360.0f / 4096.0f);
+            v0    = cal_unwrap_deg_near(v_raw * (360.0f / 4096.0f), VALVE_CLOSED_DEG + 40.0f);
+            span  = (dirn > 0) ? fmodf(L->b1_deg - cur_b + 360.0f, 360.0f)
+                               : fmodf(cur_b - L->b1_deg + 360.0f, 360.0f);
+            if (span > 355.0f) span = 0.0f;
+            radial = (span < MIN_SWEEP_DEG);
+            INFO("serpentine: leg %d hop done at %.1f -- sweeping %.1f deg", leg, cur_b, span);
+        }
         bool  sweep   = (L->kind == SERPENTINE_LEG_SWEEP);
         uint16_t leg_duty =
             (L->kind == SERPENTINE_LEG_REPOS || L->kind == SERPENTINE_LEG_TRANSIT)
@@ -9003,7 +9564,10 @@ static bool serpentine_glide_legs(const serpentine_leg_t *legs, int n,
             while (dn >  180.0f) dn -= 360.0f;
             while (dn < -180.0f) dn += 360.0f;
             int ndir = (NL->dir != 0) ? NL->dir : ((dn >= 0.0f) ? +1 : -1);
-            brake_end = (fabsf(dn) < MIN_SWEEP_DEG) || (ndir != dirn);
+            brake_end = (fabsf(dn) < MIN_SWEEP_DEG) || (ndir != dirn)
+                        // b519: never carry through into a short sweep arc
+                        || (NL->kind == SERPENTINE_LEG_SWEEP &&
+                            NL->arc_span > 0.0f && NL->arc_span < 20.0f);
         }
 
         float eff_dps = (L->dps > 0.5f) ? L->dps : (float)leg_duty / 15.0f;
@@ -9014,7 +9578,7 @@ static bool serpentine_glide_legs(const serpentine_leg_t *legs, int n,
 
         // b283: tag trace samples with the ring about to be swept.
         if (sweep && !dry_leg && L->ring >= 0 && L->ring != last_trace_ring) {
-            water_trace_mark_ring(L->ring, L->v1_deg);
+            water_trace_mark_ring(L->ring, v1);
             last_trace_ring = L->ring;
         }
 
@@ -9062,7 +9626,10 @@ static bool serpentine_glide_legs(const serpentine_leg_t *legs, int n,
             as5600_read(ADDR_AS5600,  &n_raw, NULL, NULL);
             as5600_read(ADDR_AS5600L, &v_raw, NULL, NULL);
             cur_b = n_raw * (360.0f / 4096.0f);
-            float cur_v = v_raw * (360.0f / 4096.0f);
+            float cur_v = cal_unwrap_deg_near(v_raw * (360.0f / 4096.0f),
+                                              VALVE_CLOSED_DEG + 40.0f);   // b517
+            s_valve_deg_cached = cur_v;   // b517: fault records / HA read a live angle,
+                                          // not the pre-run valve_goto value
 
             float db = cur_b - prev_b;
             while (db >  180.0f) db -= 360.0f;
@@ -9116,6 +9683,7 @@ static bool serpentine_glide_legs(const serpentine_leg_t *legs, int n,
                     ESP_LOGW(TAG, "serpentine: dwell watchdog at ~%.1f deg with valve "
                                   "open -- slamming valve closed", cur_b);
                     water_set_status(WATER_STATUS_NOZZLE_FAULT);
+                    fault_hold_arm();   // b517 hold, b522 opt-in
                     // NCUR only means something while the drive is still on.
                     float fault_ma = CURRENT_MA(adc_mv(ADC_CH_NCUR));
                     chase_motor_apply(&nm, 0, 0);
@@ -9150,6 +9718,16 @@ static bool serpentine_glide_legs(const serpentine_leg_t *legs, int n,
                         + ease * (float)(leg_duty - N_MIN_DUTY));
             }
             if (v_abs > V_LAG_DEG) nd = N_MIN_DUTY;   // let the valve catch up
+            // b521: never sit at a duty this unit has just proven it cannot
+            // move at. Frontyard f9e994 stalls at duty 70 around 273-283 deg
+            // (serp_dwell 2026-09-06 r8, 1 kick; 2026-09-07 r14, all 6 kicks
+            // spent at duty 70 -- each kick freed it, the hold re-stalled it).
+            // Every kick raises the floor the hold/brake may drop to.
+            if (kicks_used > 0) {
+                uint16_t floor_d = (uint16_t)(N_MIN_DUTY + 30u * (unsigned)kicks_used);
+                if (floor_d > 300u) floor_d = 300u;
+                if (nd < floor_d) nd = floor_d;
+            }
             chase_motor_apply(&nm, dirn, nd);
             s_nozzle_last_dir = dirn;
 
@@ -9159,18 +9737,22 @@ static bool serpentine_glide_legs(const serpentine_leg_t *legs, int n,
             {
                 float md = fabsf(cur_b - last_motion_b);
                 if (md > 180.0f) md = 360.0f - md;
-                if (md > 0.1f) {
+                // b521: 0.1 deg was inside AS5600 jitter (0.09 deg/LSB), so a
+                // stalled nozzle could look "moving" and never get a second
+                // kick (2026-09-06 r8: 1 kick, then 30 s to the dwell fault).
+                if (md > 0.4f) {
                     last_motion_tick = xTaskGetTickCount();
                     last_motion_b    = cur_b;
                 } else if ((uint32_t)pdTICKS_TO_MS(xTaskGetTickCount() - last_motion_tick)
                                > 800u
-                           && to_go > decel_band && kicks_used < 6) {
-                    uint16_t kick = (uint16_t)(leg_duty + 100u);
+                           && to_go > N_TOL_DEG && kicks_used < 10) {  // b521: was 6
+                    // b521: escalate -- each kick is harder and longer than the last
+                    uint16_t kick = (uint16_t)(leg_duty + 100u + 50u * (unsigned)kicks_used);
                     if (kick > 480u) kick = 480u;
-                    INFO("serpentine: leg %d slow at %.1f deg -- recovery kick %d/6",
-                         leg, cur_b, kicks_used + 1);
+                    INFO("serpentine: leg %d slow at %.1f deg -- recovery kick %d/10 (duty %u)",
+                         leg, cur_b, kicks_used + 1, (unsigned)kick);
                     chase_motor_apply(&nm, dirn, kick);
-                    vTaskDelay(pdMS_TO_TICKS(150));
+                    vTaskDelay(pdMS_TO_TICKS(150u + 25u * (unsigned)kicks_used));
                     chase_motor_apply(&nm, dirn, nd);
                     kicks_used++;
                     last_motion_tick = xTaskGetTickCount();
@@ -9188,10 +9770,49 @@ static bool serpentine_glide_legs(const serpentine_leg_t *legs, int n,
                 if (csv_psi > 0.1f) {
                     leg_psi_sum += csv_psi; leg_psi_n++;
                     if (run_psi_sum) { *run_psi_sum += csv_psi; (*run_psi_n)++; }
+                    // b513/b514: freshest supply evidence; when a new ring
+                    // starts sampling, the previous ring's last sample
+                    // becomes the "prev" point for the rho slope.
+                    if (ff_sample_ring != L->ring) {
+                        s_serp_ff_prev_psi   = s_serp_ff_tail_psi;
+                        s_serp_ff_prev_valve = s_serp_ff_tail_valve;
+                        ff_sample_ring = L->ring;
+                    }
+                    s_serp_ff_tail_psi   = csv_psi;
+                    s_serp_ff_tail_valve = cur_v;
                 }
                 water_trace_sample(csv_psi);
                 float _at2 = cal_pressure_to_throw_mm(csv_psi);
                 float _tp  = cal_throw_to_psi(L->ring_throw);
+                // b518: measured-throw sweep trim. The arc was clipped to the
+                // polygon at the PLANNED throw; if the water is actually landing
+                // longer (backyard Combined 2026-09-06 ring 8: 5.9 m planned,
+                // 7.6 m measured after a pump cut-out mid-run) the same arc
+                // spills outside wherever the polygon is narrower. Look ahead
+                // along the remaining sweep at the MEASURED throw and end the
+                // leg at the first bearing that is outside. Nozzle-only, only
+                // ever shortens, no valve involvement (Rob: no hunting).
+                if (have_zone && zone && csv_psi > 0.1f && _at2 > 100.0f) {
+                    float remain = span - progress;
+                    int   k_last_in = 0;   // b520: last remaining bearing still inside
+                    for (int k = 1; k <= (int)remain; k++) {
+                        float bk = fmodf(cur_b + (float)dirn * (float)k + 720.0f, 360.0f);
+                        if (zone_contains_point(zone, bk, _at2)) k_last_in = k;
+                    }
+                    // b520: trim only the tail that is outside all the way to
+                    // the exit; a corner the polygon re-enters is left alone.
+                    int k_out = ((float)k_last_in < remain - 1.0f) ? k_last_in + 1 : -1;
+                    if (k_out >= 0) {
+                        float new_span = progress + (float)(k_out - 1);
+                        if (new_span < span - 0.5f) {
+                            INFO("serpentine: leg %d ring %d lands at %.0f mm (plan %.0f) -- "
+                                 "polygon ends %.0f deg ahead, trimming sweep %.0f -> %.0f deg",
+                                 leg, L->ring + 1, _at2, L->ring_throw, (float)k_out,
+                                 span, new_span);
+                            span = new_span;
+                        }
+                    }
+                }
                 float _tr  = cur_b * (float)M_PI / 180.0f;
                 int   _sn  = ((int)(cur_b / WATER_SECTOR_DEG) + WATER_SECTORS)
                              % WATER_SECTORS;
@@ -9200,9 +9821,17 @@ static bool serpentine_glide_legs(const serpentine_leg_t *legs, int n,
                     v1, cur_v,
                     L->ring_throw, _at2, _tp, csv_psi, _tr, s_csv_pass_type);
             }
+
         }   // tick loop
 
         if (!ok) break;
+
+        // b515: closing leg -> re-approach the ring's valve target from below
+        // so the ball lands where the encoder says (see helper above).
+        if (!dry_leg && (v1 < v0 - 0.5f)) {
+            serp_valve_settle_from_below(&vm, v1, &v_dir);
+            TOUCH_ACTIVITY();
+        }
 
         // b427: PSI settle after a flow-starting valve open (run start, or
         // reopen after a dry hop). The valve chase reaches the ring target
@@ -9274,6 +9903,8 @@ static bool serpentine_glide_legs(const serpentine_leg_t *legs, int n,
                 .valve_deg       = L->v1_deg,
             };
             if (ring_sweeps_out) (*ring_sweeps_out)++;
+            water_progress_update_dispensed(cumulative_depth, ring_throws,
+                                            num_rings);   // b503
             INFO("serpentine: r%d sweep: %.1f deg in %u ms (%.2f dps) %.2f PSI "
                  "cum %.2fmm", ring + 1, meas_deg, (unsigned)leg_ms,
                  meas_dps, avg_psi, cumulative_depth[ring]);
@@ -9347,6 +9978,12 @@ static void water_serpentine_passes(
     // re-fire loops; over-throw is not re-fired (beyond +25% it's artifact,
     // within it the water still landed inside the splash band).
     uint8_t throw_retries[WATER_RUN_MAX_RINGS] = {0};
+    // b505: previous pass's credited depth, for the per-pass gain that
+    // sizes the remaining-pass estimate at each pass end.
+    static float s_serp_prev_cum[WATER_RUN_MAX_RINGS];
+    memset(s_serp_prev_cum, 0, sizeof(s_serp_prev_cum));
+    serp_ff_reset();   // b513: cache the cal table, forget stale supply samples
+
     for (int pass = 0; pass < passes; pass++) {
         bool skip[WATER_RUN_MAX_RINGS];
         int  todo = 0;
@@ -9398,6 +10035,8 @@ static void water_serpentine_passes(
                  dry ? " [DRY]" : "");
         s_csv_pass_type = (uint8_t)(pass + 1);
         if (!serpentine_glide_legs(s_serpentine_legs, n, ring_throws, num_rings,
+                              ring_direct, corr, have_throw_cal, act_max_throw,   // b513
+                              zone, have_zone,                                    // b518
                               cumulative_depth, run_psi_sum, run_psi_n,
                               ring_sweeps_out, t_start, dry)) {
             return;   // aborted/faulted -- shared closeout tears down
@@ -9451,6 +10090,65 @@ static void water_serpentine_passes(
             }
             INFO("Serpentine pass %d ring depths [%d-%d]:%s",
                  pass + 1, i0 + 1, _hi, _depbuf);
+        }
+
+        // b505: refresh the web/HA time estimate at every pass end.
+        // Serpentine never updated s_water_est_min after the preamble, so
+        // HA showed the initial number for the whole run. Same physics as
+        // smooth's pass-end update: remaining deficit volume over the
+        // measured flow, plus the measured per-pass overhead times the
+        // passes the slowest-gaining ring still needs, plus the cleanup
+        // tail. Ring areas mirror the b503 expected-volume rule (sector
+        // activity at the ring radius) so multi-lobe rings are not charged
+        // the full zone arc.
+        if (!dry) {
+            float _rem_vol_L = 0.0f, _done_vol_L = 0.0f;
+            int   _worst_left = 0;
+            for (int i = 0; i < num_rings && i < WATER_RUN_MAX_RINGS; i++) {
+                float _ro = ring_throws[i];
+                if (_ro < 1.0f || ring_unwaterable[i]) continue;
+                float _ri = (i == num_rings - 1) ? _ro * 0.92f : ring_throws[i + 1];
+                if (_ri >= _ro) continue;
+                float _tol = WATER_RING_SPACING * (_ro / act_max_throw) * 0.5f;
+                int _ac = 0;
+                for (int s = 0; s < WATER_SECTORS; s++)
+                    if (_ro <= sector_throw[s] + _tol) _ac++;
+                if (_ac == 0) continue;
+                float _area = (float)M_PI * (_ro*_ro - _ri*_ri) / 1.0e6f
+                              * ((float)_ac / (float)WATER_SECTORS);
+                float _def = depth_mm - cumulative_depth[i];
+                if (_def > 0.0f) {
+                    _rem_vol_L += _def * _area;
+                    float _gain = cumulative_depth[i] - s_serp_prev_cum[i];
+                    int _left = (_gain > 0.02f) ? (int)ceilf(_def / _gain)
+                                                : (passes - pass - 1);
+                    if (_left > _worst_left) _worst_left = _left;
+                }
+                _done_vol_L += fminf(cumulative_depth[i], depth_mm) * _area;
+                s_serp_prev_cum[i] = cumulative_depth[i];
+            }
+            int _passes_left = passes - pass - 1;
+            if (_worst_left < _passes_left) _passes_left = _worst_left;
+            float _avg_psi  = (*run_psi_n > 0) ? (*run_psi_sum / (float)*run_psi_n) : 3.0f;
+            float _flow_lpm = NOZZLE_FLOW_K * powf(_avg_psi, NOZZLE_FLOW_N) / 1000.0f;
+            if (_flow_lpm < 0.05f) _flow_lpm = 1.0f;
+            float _elapsed_s   = (float)pdTICKS_TO_MS(xTaskGetTickCount() - t_start) / 1000.0f;
+            float _pump_done_s = _done_vol_L / _flow_lpm * 60.0f;
+            float _ovh_s       = _elapsed_s - _pump_done_s;
+            if (_ovh_s < 0.0f) _ovh_s = 0.0f;
+            float _ovh_per_pass = _ovh_s / (float)(pass + 1);
+            if (_ovh_per_pass < 5.0f) _ovh_per_pass = 5.0f;
+            const float _TAIL_S = 30.0f;
+            float _secs = _rem_vol_L / _flow_lpm * 60.0f
+                        + _ovh_per_pass * (float)_passes_left + _TAIL_S;
+            s_water_est_min   = (int)(_secs / 60.0f) + 1;
+            s_eta_anchor_secs = _secs;
+            s_eta_anchor_tick = xTaskGetTickCount();
+            INFO("Serpentine pass %d done: vol %.1f/%.1fL @ %.2f psi (%.1f L/min), "
+                 "rem pump %.0fs + ovh %.0fs/pass x %d + tail %.0fs = %d min",
+                 pass + 1, _done_vol_L, _done_vol_L + _rem_vol_L, _avg_psi, _flow_lpm,
+                 _rem_vol_L / _flow_lpm * 60.0f, _ovh_per_pass, _passes_left,
+                 _TAIL_S, s_water_est_min);
         }
     }
 }
@@ -10091,6 +10789,7 @@ abort:
 // gap. USB serial console (if attached) still gets logs in real time.
 
 #define WATER_LOG_BUFFER_SIZE  24576   // 24 KB, ~500-700 log lines typical
+#define WATER_LAST_LOG_PATH    "/lfs/water/last_log.txt"   // b520: persisted copy
 
 static char     s_watering_log_buf[WATER_LOG_BUFFER_SIZE];
 static volatile uint16_t s_watering_log_pos = 0;
@@ -10153,6 +10852,25 @@ static void watering_log_capture_stop(void)
          s_watering_log_wrapped ? WATER_LOG_BUFFER_SIZE
                                 : (unsigned)s_watering_log_pos,
          s_watering_log_wrapped ? 1 : 0);
+    // b520: persist the buffer so /zone/last_log survives deep sleep. All
+    // three 2026-09-06/07 scheduled-run forensics (two nozzle faults, the
+    // backyard skipped arcs) were lost because the unit slept before anyone
+    // could pull the RAM copy. One ~24 KB LittleFS write at run closeout,
+    // in the same settle window as the run's .wbin -- no mid-run file I/O.
+    FILE *f = fopen(WATER_LAST_LOG_PATH, "w");
+    if (f) {
+        if (s_watering_log_wrapped) {
+            uint16_t pos = s_watering_log_pos;
+            if (pos < WATER_LOG_BUFFER_SIZE)
+                fwrite(&s_watering_log_buf[pos], 1, WATER_LOG_BUFFER_SIZE - pos, f);
+            if (pos > 0) fwrite(s_watering_log_buf, 1, pos, f);
+        } else {
+            fwrite(s_watering_log_buf, 1, s_watering_log_pos, f);
+        }
+        fclose(f);
+    } else {
+        ESP_LOGW(TAG, "last_log persist failed (%s)", WATER_LAST_LOG_PATH);
+    }
 }
 
 // b293: Stop WiFi for the duration of a watering run via ESPHome's
@@ -11025,7 +11743,7 @@ static void phase_water_zone(void)
         // today's supply.
         float smooth_est_dp_sum = 0.0f; int smooth_est_dp_n = 0;
         for (int r = 0; r < num_rings; r++) {
-            if (smooth_mode || gentle_mode) {
+            if (smooth_mode || gentle_mode || serpentine_mode) {   // b505
                 // Estimator dps matches the actual run's flow-model formula
                 // (see nozzle_dps calc ~line 6722). Smooth's per_pass_depth=depth_mm
                 // makes the unclamped dps tiny, so it pins to min_continuous_dps
@@ -11033,8 +11751,8 @@ static void phase_water_zone(void)
                 // so its dps lands ~5× higher — and the old hardcoded 13 was wrong
                 // by that factor for both sweep time AND per-pass depth.
                 // Inter-ring overhead ~1.5s (no pressure-settle wait).
-                float per_pass_depth_est = smooth_mode ? depth_mm
-                                                       : GENTLE_PER_PASS_DEPTH_MM;
+                float per_pass_depth_est = (smooth_mode || serpentine_mode)
+                                           ? depth_mm : GENTLE_PER_PASS_DEPTH_MM;
                 float min_dps_est = have_spd ? spd.min_continuous_dps : 10.9f;
                 float _rt  = ring_throws[r];
                 float _ri  = (r == num_rings-1) ? _rt * 0.92f : ring_throws[r+1];
@@ -11082,7 +11800,12 @@ static void phase_water_zone(void)
         // After pass 0 finishes the volume+measured-overhead update below
         // takes over with empirical flow rate.
         float est_s;
-        if (smooth_mode || gentle_mode) {
+        // b505: serpentine used to fall into the pulse formula below, which
+        // multiplies the FULL-depth sweep time by the pass count -- and
+        // serpentine's pass count is an adaptive cap of 30, so LF-North
+        // started at "2712 min". It is a coverage mode like smooth: volume
+        // over flow plus per-pass overhead.
+        if (smooth_mode || gentle_mode || serpentine_mode) {
             float avg_dp = smooth_est_dp_n > 0
                          ? smooth_est_dp_sum / smooth_est_dp_n : 0.0f;
             float est_passes_f = (avg_dp > 0.001f)
@@ -11090,10 +11813,13 @@ static void phase_water_zone(void)
             // Clamp: outer rings typically need more passes than the average predicts
             // (they see higher PSI when inner rings drop out); add a 25% margin and
             // cap between 5 and the adaptive ceiling (smooth: 25, gentle: GENTLE_MAX_PASSES).
-            float pass_ceiling = smooth_mode ? 25.0f : (float)GENTLE_MAX_PASSES;
+            float pass_ceiling = smooth_mode     ? 25.0f
+                               : serpentine_mode ? 30.0f
+                                                 : (float)GENTLE_MAX_PASSES;
             est_passes_f = fmaxf(5.0f, fminf(pass_ceiling, est_passes_f * 1.25f));
             INFO("%s est: %.2fmm/pass avg -> %.0f passes",
-                 smooth_mode ? "Smooth" : "Gentle", avg_dp, est_passes_f);
+                 smooth_mode ? "Smooth" : serpentine_mode ? "Serpentine" : "Gentle",
+                 avg_dp, est_passes_f);
 
             // Volume + per-ring flow rate
             float _arc_frac = zone_arc_deg / 360.0f;
@@ -11144,6 +11870,35 @@ static void phase_water_zone(void)
         s_eta_anchor_tick = xTaskGetTickCount();
     }
     INFO("Estimated watering time: %d min", s_water_est_min);
+
+    // b503/b504: expected run volume for HA's "dispensed of expected"
+    // progress line -- target depth over each planned ring annulus, same
+    // inner-edge convention as water_progress_update_dispensed. Per-ring
+    // arcs mirror the pass loop's sector-activity rule (sector_throw
+    // reaches the ring radius, same tol) instead of assuming the full zone
+    // arc for every ring: on Combined's irregular polygon the flat-arc
+    // version predicted 937 L against ~600 L of real coverage. Demo runs
+    // deliver no real water; leaving 0 makes HA hide the volume line.
+    s_water_vol_disp_l = 0.0f;
+    s_water_vol_exp_l  = 0.0f;
+    s_water_vol_t0     = xTaskGetTickCount();   // b506
+    if (!demo_mode) {
+        for (int r = 0; r < num_rings; r++) {
+            float _ro = ring_throws[r];
+            if (_ro < 1.0f) continue;
+            float _ri = (r == num_rings - 1) ? _ro * 0.92f : ring_throws[r + 1];
+            if (_ri >= _ro) continue;
+            float _tol = WATER_RING_SPACING * (_ro / act_max_throw) * 0.5f;
+            int _ac = 0;
+            for (int s = 0; s < WATER_SECTORS; s++)
+                if (_ro <= sector_throw[s] + _tol) _ac++;
+            if (_ac == 0) continue;
+            s_water_vol_exp_l += (float)M_PI * (_ro*_ro - _ri*_ri) / 1.0e6f
+                                 * ((float)_ac / (float)WATER_SECTORS)
+                                 * depth_mm;
+        }
+        INFO("Expected volume: %.1f L", s_water_vol_exp_l);
+    }
 
     // Open watering CSV log on LittleFS.
     // b288: in smooth-aggregate mode the fopen is DEFERRED to run-end. Holding the
@@ -12195,6 +12950,27 @@ static void phase_water_zone(void)
                     .tail_psi        = ring_tail_psi,
                     .valve_deg       = valve_target_deg,  // b281: for supply back-calc
                 };
+                // b504: provisional pass-0 dispensed credit (smooth only --
+                // gentle/serpentine accumulate from their first sweep). The
+                // real accumulator starts at the pass-0 seed, which left the
+                // HA volume line at 0 for the entire first pass (5-8 min).
+                // Credit each pass-0 ring as it completes; the seed's gated
+                // recompute replaces (and may lower) this figure once
+                // throw-correction data exists.
+                if (smooth_mode && pass == 0) {
+                    float _ri0 = (ring == num_rings - 1)
+                               ? ring_throw * 0.92f : ring_throws[ring + 1];
+                    if (_ri0 < ring_throw) {
+                        float _d0 = nozzle_precip_depth_mm(ring_throw, _ri0,
+                                                           nozzle_dps, _avg);
+                        float _a0 = (float)M_PI
+                                  * (ring_throw*ring_throw - _ri0*_ri0) / 1.0e6f
+                                  * (active_count * (float)WATER_SECTOR_DEG
+                                     / 360.0f);
+                        s_water_vol_disp_l +=
+                            smooth_display_depth_mm(_d0, ring_throw, _ri0) * _a0;
+                    }
+                }
                 // b296: feed the scheduler's rolling supply estimate. Updated
                 // every ring (not just per-pass) so the scheduler reacts to
                 // pump cycles within a pass rather than lagging by a full
@@ -12244,6 +13020,8 @@ static void phase_water_zone(void)
                                                  : ring_throws[ring + 1];
             smooth_cumulative_depth[ring] +=
                 nozzle_precip_depth_mm(_ro, _ri, _r->dps, _r->avg_psi);
+            water_progress_update_dispensed(smooth_cumulative_depth,
+                                            ring_throws, num_rings);  // b503
         }
         // b502: a pump-trigger fire's one job is to trip the switch. If the
         // trend is still flat after the fire, it failed at that too -- charge
@@ -12343,6 +13121,8 @@ static void phase_water_zone(void)
                                  i+1, smooth_valve_corr[i]);
                         }
                     }
+                    water_progress_update_dispensed(smooth_cumulative_depth,
+                                                    ring_throws, num_rings);  // b503
                 }
             }
 
@@ -12640,6 +13420,10 @@ abort:
             s_last_water_run.supply_psi_min = sup_min;
             s_last_water_run.supply_psi_max = sup_max;
             s_last_water_run.supply_psi_avg = sup_sum / sup_n;
+            if (sup_sum / sup_n >= 1.0f) {          // b507: live supply proven
+                s_supply_seen_this_wake = true;
+                s_supply_seen_psi       = sup_sum / sup_n;
+            }
             INFO("Supply pressure (back-computed from f(valve_deg)): "
                  "min=%.2f max=%.2f avg=%.2f PSI across %d active rings",
                  sup_min, sup_max, sup_sum / sup_n, sup_n);
@@ -12782,6 +13566,8 @@ abort:
     s_web_water_mode = 0;
     s_water_est_min  = 0;
     s_eta_anchor_tick = 0;   // b362: stop ticking once the run is done
+    s_water_vol_disp_l = 0.0f;   // b503: progress line is live-run only
+    s_water_vol_exp_l  = 0.0f;
 }
 
 // -----------------------------------------------------------------------
@@ -12927,6 +13713,10 @@ static void water_cleanup_pass(
 // Web-triggered watering: mode 1-4 matches menu, 99 = demo
 static void phase_water_zone_mode(int mode)
 {
+    // b503: fresh volume-progress state for every run; chase/demo/metered
+    // paths that never compute an expectation stay at 0 (HA hides the line).
+    s_water_vol_disp_l = 0.0f;
+    s_water_vol_exp_l  = 0.0f;
     if (mode == WATER_MODE_CHASE) {
         // b311: chase mode bypasses the depth/ring/pass machinery entirely.
         phase_chase_water_zone();
@@ -14119,6 +14909,8 @@ static void water_task(void *arg) {
     s_water_est_min      = 0;
     s_water_cleanup_pass = 0;
     s_eta_anchor_tick    = 0;   // b362
+    s_water_vol_disp_l   = 0.0f;   // b503
+    s_water_vol_exp_l    = 0.0f;
     vTaskDelete(NULL);
 }
 static esp_err_t zone_water_cancel_handler(httpd_req_t *req)
@@ -14715,6 +15507,73 @@ static void wcal_nozzle_task(void *arg)
     vTaskDelete(NULL);
 }
 
+// b512: irrigoto-owned UART console. ESPHome's own UART logger is compiled
+// out (logger_baud 0) because its blocking esp-idf write path wedged the
+// loop task ~35 s after every OTA boot (b506/b507/b510 all rolled back).
+// This replaces it with something that CANNOT block: every formatted log
+// line ESPHome produces is handed to irrigoto_uart_console_write() via the
+// logger callback (same hook the HA API uses), and we push it straight into
+// the UART0 hardware TX FIFO with the HAL -- only as many bytes as fit, the
+// rest is dropped. No driver, no ISR, no ring buffer, no mutex. It is also
+// DEFERRED: nothing is written until UART_CONSOLE_DEFER_S of uptime, so the
+// post-OTA boot burst never touches it, and it is OFF unless enabled at
+// runtime (POST /api/uart_log?on=1[&persist=1], NVS "console"/"uart_log").
+// UART0 is left exactly as the ROM/bootloader configured it (115200 8N1 on
+// the console pins), which is why the bootloader banner still prints.
+#define UART_CONSOLE_DEFER_S   60
+static bool s_uart_log_want   = false;   // runtime switch (NVS-persistable)
+static bool s_uart_log_loaded = false;
+
+static void uart_console_load_once(void)
+{
+    if (s_uart_log_loaded) return;
+    s_uart_log_loaded = true;
+    nvs_handle_t h;
+    if (nvs_open("console", NVS_READONLY, &h) == ESP_OK) {
+        uint8_t v = 0;
+        if (nvs_get_u8(h, "uart_log", &v) == ESP_OK) s_uart_log_want = (v != 0);
+        nvs_close(h);
+    }
+}
+
+static bool uart_console_active(void)
+{
+    uart_console_load_once();
+    return s_uart_log_want &&
+           (esp_timer_get_time() / 1000000ULL) >= UART_CONSOLE_DEFER_S;
+}
+
+static void uart_console_set(bool on, bool persist)
+{
+    uart_console_load_once();
+    s_uart_log_want = on;
+    if (persist) {
+        nvs_handle_t h;
+        if (nvs_open("console", NVS_READWRITE, &h) == ESP_OK) {
+            nvs_set_u8(h, "uart_log", on ? 1 : 0);
+            nvs_commit(h);
+            nvs_close(h);
+        }
+    }
+    INFO("UART console %s%s (active after %d s uptime, non-blocking FIFO writes)",
+         on ? "ENABLED" : "disabled", persist ? " [persisted]" : "", UART_CONSOLE_DEFER_S);
+}
+
+// Called from the ESPHome loop task for every log line. Must never block.
+void irrigoto_uart_console_write(const char *msg, size_t len)
+{
+    if (!msg || len == 0 || !uart_console_active()) return;
+    uart_dev_t *hw = &UART0;
+    uint32_t room = uart_ll_get_txfifo_len(hw);
+    if (room < 4) return;                       // FIFO busy: drop the line
+    uint32_t n = (uint32_t)len;
+    bool has_nl = (msg[len - 1] == '\n');
+    uint32_t need_nl = has_nl ? 0 : 2;
+    if (n + need_nl > room) n = room - need_nl;  // truncate, keep the newline
+    uart_ll_write_txfifo(hw, (const uint8_t *)msg, n);
+    if (need_nl) uart_ll_write_txfifo(hw, (const uint8_t *)"\r\n", 2);
+}
+
 static esp_err_t api_all_handler(httpd_req_t *req)
 {
     HTTP_CONN_CLOSE(req);
@@ -14761,6 +15620,8 @@ static esp_err_t api_all_handler(httpd_req_t *req)
         "\"sleep_dur_s\":%lu,\"inact_s\":%lu,"   // b472: expose cadence params
         "\"frame_suspect\":%s,\"frame_calibrated\":%s,"   // b480: closure-verify state
         "\"cal_incomplete\":%s,"                          // b490: inherited throw anchors
+        "\"uart_log\":%s,\"uart_log_want\":%s,\"uart_log_compiled\":%s,"  // b512: console active / switch / ESPHome-UART
+        "\"fault_hold_min\":%u,"                                          // b522: post-fault awake hold (0 = off)
         "\"device_name\":\"%s\"",
         FW_BUILD, wifi_get_rssi(), s_wifi_ip,
         hostname ? hostname : "",
@@ -14775,6 +15636,10 @@ static esp_err_t api_all_handler(httpd_req_t *req)
         (unsigned long)s_sleep_dur_s, (unsigned long)(s_inactivity_ms/1000u),
         g_frame_suspect?"true":"false", g_valve_frame_calibrated?"true":"false",
         g_cal_incomplete?"true":"false",
+        uart_console_active() ? "true" : "false",
+        (uart_console_load_once(), s_uart_log_want) ? "true" : "false",
+        (IRRIGOTO_UART_LOG_BAUD != 0) ? "true" : "false",
+        (fault_hold_load_once(), (unsigned)s_fault_hold_min),
         s_device_name);
     httpd_resp_send_chunk(req, buf, n);
 
@@ -14794,7 +15659,9 @@ static esp_err_t api_all_handler(httpd_req_t *req)
     // but that segment is static data only -- these counters measure the
     // separate ~150KB heap pool, which is what actually ran out.
     n = snprintf(buf, sizeof(buf),
-        ",\"heap_free\":%lu,\"heap_min_free\":%lu,\"heap_largest\":%lu,\"zones\":[",
+        ",\"water_vol_l\":%.1f,\"water_vol_est_l\":%.1f,"   // b503: live run progress
+        "\"heap_free\":%lu,\"heap_min_free\":%lu,\"heap_largest\":%lu,\"zones\":[",
+        s_water_vol_disp_l, s_water_vol_exp_l,
         (unsigned long)esp_get_free_heap_size(),
         (unsigned long)esp_get_minimum_free_heap_size(),
         (unsigned long)heap_caps_get_largest_free_block(MALLOC_CAP_8BIT));
@@ -15029,6 +15896,59 @@ static esp_err_t api_fault_log_handler(httpd_req_t *req)
 
 // Toggle or set s_water_detail_log.  GET /api/detail_log         → toggle.
 // GET /api/detail_log?on=1  → enable.  GET /api/detail_log?on=0 → disable.
+// b512: GET /api/uart_log (read-only) / POST /api/uart_log?on=0|1[&persist=0|1]
+static esp_err_t api_uart_log_handler(httpd_req_t *req)
+{
+    if (req->method == HTTP_POST) {
+        char qs[48]={0}; httpd_req_get_url_query_str(req, qs, sizeof(qs));
+        char val[4]={0}, per[4]={0};
+        bool have_on = (httpd_query_key_value(qs, "on", val, sizeof(val)) == ESP_OK && val[0]);
+        bool persist = (httpd_query_key_value(qs, "persist", per, sizeof(per)) == ESP_OK && per[0]=='1');
+        if (!have_on) {
+            httpd_resp_set_status(req, "400 Bad Request");
+            httpd_resp_sendstr(req, "{\"ok\":false,\"error\":\"need on=0|1\"}");
+            return ESP_OK;
+        }
+        uart_console_set(val[0]=='1', persist);
+    }
+    uart_console_load_once();
+    char resp[160];
+    snprintf(resp, sizeof(resp),
+             "{\"uart_log\":%s,\"uart_log_want\":%s,\"uart_log_compiled\":%s,"
+             "\"defer_s\":%d,\"uptime_s\":%lu}",
+             uart_console_active()?"true":"false", s_uart_log_want?"true":"false",
+             (IRRIGOTO_UART_LOG_BAUD != 0)?"true":"false", UART_CONSOLE_DEFER_S,
+             (unsigned long)(esp_timer_get_time()/1000000ULL));
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_sendstr(req, resp);
+    return ESP_OK;
+}
+
+// b522: post-fault awake hold knob. GET reads, POST min=N sets (persisted).
+static esp_err_t api_fault_hold_handler(httpd_req_t *req)
+{
+    if (req->method == HTTP_POST) {
+        char qs[48]={0}; httpd_req_get_url_query_str(req, qs, sizeof(qs));
+        char val[8]={0};
+        if (httpd_query_key_value(qs, "min", val, sizeof(val)) != ESP_OK || !val[0]) {
+            httpd_resp_set_status(req, "400 Bad Request");
+            httpd_resp_sendstr(req, "{\"ok\":false,\"error\":\"need min=0..120\"}");
+            return ESP_OK;
+        }
+        int m = atoi(val);
+        if (m < 0) m = 0;
+        if (m > 120) m = 120;
+        fault_hold_set((uint8_t)m);
+    }
+    fault_hold_load_once();
+    char resp[96];
+    snprintf(resp, sizeof(resp), "{\"ok\":true,\"fault_hold_min\":%u,\"holding\":%s}",
+             (unsigned)s_fault_hold_min, (s_hold_awake_until != 0) ? "true" : "false");
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_sendstr(req, resp);
+    return ESP_OK;
+}
+
 static esp_err_t api_detail_log_handler(httpd_req_t *req)
 {
     char qs[32]={0}; httpd_req_get_url_query_str(req, qs, sizeof(qs));
@@ -16243,7 +17163,7 @@ static esp_err_t cal_valve_set_handler(httpd_req_t *req)
     // it suspect instead means the next pressure cal measures the frame first --
     // which is exactly the self-correction we want armed after an unverified
     // push. Scheduled runs are refused meanwhile; manual + cal still work.
-    valve_frame_suspect_set(true);
+    valve_frame_suspect_raise(FRAME_SUSPECT_PUSHED);
     char buf[220];
     int n = snprintf(buf, sizeof(buf),
         "{\"ok\":true,\"offset\":%.2f,\"closed_deg\":%.2f,\"open_deg\":%.2f,\"peak_deg\":%.2f,"
@@ -17307,8 +18227,25 @@ static esp_err_t zone_water_trace_handler(httpd_req_t *req)
 static esp_err_t zone_last_log_handler(httpd_req_t *req)
 {
     if (s_watering_log_pos == 0 && !s_watering_log_wrapped) {
-        httpd_resp_send_err(req, HTTPD_404_NOT_FOUND,
-            "No watering log captured yet (b292 captures during smooth/gentle runs only)");
+        // b520: nothing in RAM (fresh boot after deep sleep) -- serve the
+        // copy persisted at the last run's closeout, if there is one.
+        FILE *f = fopen(WATER_LAST_LOG_PATH, "r");
+        if (!f) {
+            httpd_resp_send_err(req, HTTPD_404_NOT_FOUND,
+                "No watering log captured yet (b292 captures during smooth/gentle runs only)");
+            return ESP_OK;
+        }
+        httpd_resp_set_type(req, "text/plain");
+        httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
+        HTTP_CONN_CLOSE(req);
+        httpd_resp_sendstr_chunk(req,
+            "# b520: persisted copy of the previous run's log (RAM buffer empty after sleep)\n");
+        static char chunk[512];
+        size_t rd;
+        while ((rd = fread(chunk, 1, sizeof(chunk), f)) > 0)
+            if (httpd_resp_send_chunk(req, chunk, rd) != ESP_OK) break;
+        fclose(f);
+        httpd_resp_sendstr_chunk(req, NULL);
         return ESP_OK;
     }
     httpd_resp_set_type(req, "text/plain");
@@ -17411,7 +18348,7 @@ static void zone_web_start(void)
     httpd_config_t cfg   = HTTPD_DEFAULT_CONFIG();
     cfg.server_port      = ZONE_WEB_PORT;
     cfg.ctrl_port        = ZONE_WEB_CTRL_PORT;
-    cfg.max_uri_handlers  = 70;  // b489: 68 -> 70, keeping the 2-slot margin over
+    cfg.max_uri_handlers  = 74;  // b522: 72 -> 74 (/api/fault_hold GET+POST); b512: 70 -> 72 (/api/uart_log GET+POST); b489: 68 -> 70, keeping the 2-slot margin over
                                  // the _Static_assert below.
                                  // MUST be set before httpd_start (cfg is copied there);
                                  // headroom over uris[] count -- _Static_assert below guards it.
@@ -17444,6 +18381,10 @@ static void zone_web_start(void)
         {.uri="/api/auto_sleep",  .method=HTTP_GET,  .handler=api_auto_sleep_handler},  // b447
         {.uri="/api/auto_sleep",  .method=HTTP_POST, .handler=api_auto_sleep_handler},  // b447
         {.uri="/api/detail_log",  .method=HTTP_GET,  .handler=api_detail_log_handler},
+        {.uri="/api/uart_log",    .method=HTTP_GET,  .handler=api_uart_log_handler},   // b512
+        {.uri="/api/uart_log",    .method=HTTP_POST, .handler=api_uart_log_handler},   // b512
+        {.uri="/api/fault_hold",  .method=HTTP_GET,  .handler=api_fault_hold_handler}, // b522
+        {.uri="/api/fault_hold",  .method=HTTP_POST, .handler=api_fault_hold_handler}, // b522
         {.uri="/api/cal",         .method=HTTP_GET,  .handler=api_cal_handler},
         {.uri="/api/cal/clear",   .method=HTTP_POST, .handler=api_cal_clear_handler},
         {.uri="/api/status",      .method=HTTP_GET,  .handler=api_status_handler},
@@ -17500,7 +18441,7 @@ static void zone_web_start(void)
         {.uri="/fs/upload",             .method=HTTP_POST, .handler=fs_upload_handler},
         {.uri="/fs/delete",             .method=HTTP_POST, .handler=fs_delete_handler},
     };
-    _Static_assert(sizeof(uris)/sizeof(uris[0]) <= 68,   // b489: 66 -> 68 (GET /cal/valve)
+    _Static_assert(sizeof(uris)/sizeof(uris[0]) <= 72,   // b522: 70 -> 72 (/api/fault_hold GET+POST); b512: 68 -> 70 (/api/uart_log GET+POST); b489: 66 -> 68
                    "uris[] exceeds cfg.max_uri_handlers -- raise it before httpd_start");
     for (size_t i = 0; i < sizeof(uris)/sizeof(uris[0]); i++)
         httpd_register_uri_handler(s_zone_server, &uris[i]);
@@ -17824,6 +18765,13 @@ int irrigoto_get_water_minutes_remaining(void)
     if (remaining_s < 60.0f) remaining_s = 60.0f;
     return (int)(remaining_s / 60.0f) + 1;
 }
+
+// b503: live volume progress for the active run. dispensed = liters credited
+// so far by the depth accumulators; expected = the plan-time target. Both 0
+// between runs and for modes with no volume model (chase, demo). Served via
+// /api/all so HA's REST poll can render "X of Y L" during watering.
+float irrigoto_get_water_vol_dispensed_l(void) { return s_water_vol_disp_l; }
+float irrigoto_get_water_vol_expected_l(void)  { return s_water_vol_exp_l; }
 
 // b287: Watering Quiet mode -- true while a smooth/gentle run is in
 // progress AND for ~3 sec after the post-run LFS writes complete. The
