@@ -255,6 +255,18 @@ rest_command:
     url: "http://{{ ip }}/water/arc?throw={{ throw_mm }}&start={{ start }}&end={{ end }}&speed={{ speed }}{% if dir is defined %}&dir={{ dir }}{% endif %}"
     method: GET
     timeout: 12
+  # b524: push HA's desired rain delay to a device, last-writer-wins.
+  # until = absolute epoch (0 = clear), lm = HA's change stamp. Firmware b524+
+  # applies it only if lm is newer than the device's own stamp and answers
+  # {ok, applied, delay_until, delay_lm} either way, so the caller can adopt
+  # the device's values when it lost. Used by the per-device
+  # sync_rain_delay automation; caller passes base_url (the device URL).
+  irrigoto_sync_delay:
+    url: "{{ base_url }}/api/schedule/delay"
+    method: POST
+    content_type: "application/x-www-form-urlencoded"
+    payload: "until={{ until }}&lm={{ lm }}"
+    timeout: 10
 
 # ── Trace a zone's perimeter ─────────────────────────────────────────
 # Drives the stream around the selected zone's stored perimeter points

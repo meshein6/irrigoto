@@ -17896,8 +17896,9 @@ static esp_err_t api_schedule_handler(httpd_req_t *req)
     // matches the schedule_changed event's delay_until field. 0 means
     // no delay active.
     n += snprintf(buf+n, sizeof(buf)-n,
-        "\"delay_until\":%ld,",
-        (long)irrigoto_schedule_get_delay_until());
+        "\"delay_until\":%ld,\"delay_lm\":%ld,",
+        (long)irrigoto_schedule_get_delay_until(),
+        (long)irrigoto_schedule_get_delay_lm());
     // b437: armed run diagnostic — the clock-independent intent the next
     // timer wake will fire. armed_epoch 0 = nothing armed.
     {
@@ -18088,37 +18089,54 @@ static esp_err_t api_schedule_clear_handler(httpd_req_t *req)
     return ESP_OK;
 }
 
-// POST /api/schedule/delay  body: hours=N
-//   N == 0  -> cancel any active delay (resume schedule immediately)
-//   N >  0  -> suspend firing for N hours from now
-// Same code path as the HA delay_schedule_hours service so the two
-// surfaces stay in lockstep. Returns {ok, delay_until} so the page
-// can update without a follow-up GET.
+// POST /api/schedule/delay
+//   body: hours=N          (web UI / manual)
+//     N == 0  -> cancel any active delay (resume schedule immediately)
+//     N >  0  -> suspend firing for N hours from now
+//     Same code path as the HA delay_schedule_hours service so the two
+//     surfaces stay in lockstep. Stamped with the device clock.
+//   body: until=E&lm=L     (b524: HA reconcile)
+//     E = absolute delay-until epoch (0 / past = clear), L = HA's
+//     last-modified stamp. Applied only if L is newer than the device's
+//     own stamp (device wins a tie) -- see irrigoto_schedule_sync_delay.
+// Returns {ok, applied, delay_until, delay_lm}: the device's state AFTER
+// the call, so a rejected sync hands HA the values to adopt.
 static esp_err_t api_schedule_delay_handler(httpd_req_t *req)
 {
-    char body[64] = {0};
+    char body[96] = {0};
     int len = httpd_req_recv(req, body, sizeof(body) - 1);
     if (len <= 0) {
         httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "empty body");
         return ESP_OK;
     }
-    char hours_s[16] = {0};
-    if (httpd_query_key_value(body, "hours", hours_s, sizeof(hours_s)) != ESP_OK) {
-        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "hours required");
-        return ESP_OK;
-    }
-    int hours = atoi(hours_s);
-    if (hours <= 0) {
-        irrigoto_schedule_clear_delay();
+    bool applied = true;
+    char hours_s[16] = {0}, until_s[20] = {0}, lm_s[20] = {0};
+    if (httpd_query_key_value(body, "until", until_s, sizeof(until_s)) == ESP_OK) {
+        if (httpd_query_key_value(body, "lm", lm_s, sizeof(lm_s)) != ESP_OK) {
+            httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "lm required with until");
+            return ESP_OK;
+        }
+        applied = irrigoto_schedule_sync_delay((time_t)strtoll(until_s, NULL, 10),
+                                               (time_t)strtoll(lm_s, NULL, 10));
+    } else if (httpd_query_key_value(body, "hours", hours_s, sizeof(hours_s)) == ESP_OK) {
+        int hours = atoi(hours_s);
+        if (hours <= 0) {
+            irrigoto_schedule_clear_delay();
+        } else {
+            irrigoto_schedule_set_delay_hours((uint32_t)hours);
+        }
     } else {
-        irrigoto_schedule_set_delay_hours((uint32_t)hours);
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "hours or until+lm required");
+        return ESP_OK;
     }
     HTTP_CONN_CLOSE(req);
     httpd_resp_set_type(req, "application/json");
-    char resp[64];
+    char resp[96];
     int n = snprintf(resp, sizeof(resp),
-                     "{\"ok\":true,\"delay_until\":%ld}",
-                     (long)irrigoto_schedule_get_delay_until());
+                     "{\"ok\":true,\"applied\":%s,\"delay_until\":%ld,\"delay_lm\":%ld}",
+                     applied ? "true" : "false",
+                     (long)irrigoto_schedule_get_delay_until(),
+                     (long)irrigoto_schedule_get_delay_lm());
     httpd_resp_send(req, resp, n);
     return ESP_OK;
 }
@@ -19587,6 +19605,13 @@ static uint32_t s_schedule_id_next = 1;
 // to NVS so it survives reboot / deep-sleep wake (otherwise a wake
 // during a delay window would happily fire the entry we asked to skip).
 static time_t s_sched_delay_until = 0;
+// b524: epoch of the last delay set/clear on THIS device (0 = never). HA
+// keeps its own desired delay + stamp per device and reconciles the two
+// on wake with last-writer-wins (device wins a tie), exactly like the
+// per-entry last_modified on schedule entries. Without the stamp a
+// delay set in HA while the unit slept could not be told apart from one
+// the web UI set afterwards. NVS-persisted next to the delay itself.
+static time_t s_sched_delay_lm = 0;
 
 static void schedule_delay_load_nvs(void)
 {
@@ -19596,6 +19621,10 @@ static void schedule_delay_load_nvs(void)
     if (nvs_get_i64(h, "sched_dly", &v) == ESP_OK) {
         s_sched_delay_until = (time_t)v;
     }
+    v = 0;
+    if (nvs_get_i64(h, "sched_dly_lm", &v) == ESP_OK) {
+        s_sched_delay_lm = (time_t)v;
+    }
     nvs_close(h);
 }
 
@@ -19604,8 +19633,18 @@ static void schedule_delay_save_nvs(void)
     nvs_handle_t h;
     if (nvs_open(CAL_NVS_NAMESPACE, NVS_READWRITE, &h) != ESP_OK) return;
     nvs_set_i64(h, "sched_dly", (int64_t)s_sched_delay_until);
+    nvs_set_i64(h, "sched_dly_lm", (int64_t)s_sched_delay_lm);
     nvs_commit(h);
     nvs_close(h);
+}
+
+// Stamp a local (web UI / HA service / REST hours=) delay change with the
+// device clock. An unsynced clock stamps 0 so a real stamp from HA always
+// wins the next reconcile.
+static void schedule_delay_stamp_local(void)
+{
+    time_t now = time(NULL);
+    s_sched_delay_lm = (now > 1700000000) ? now : 0;
 }
 
 void irrigoto_schedule_set_delay_until(time_t t)
@@ -19616,6 +19655,7 @@ void irrigoto_schedule_set_delay_until(time_t t)
         if (s_sched_delay_until != 0) {
             INFO("Schedule delay cleared");
             s_sched_delay_until = 0;
+            schedule_delay_stamp_local();
             schedule_delay_save_nvs();
             snprintf(s_sched_last_status, sizeof(s_sched_last_status),
                      "delay cleared");
@@ -19623,6 +19663,7 @@ void irrigoto_schedule_set_delay_until(time_t t)
         return;
     }
     s_sched_delay_until = t;
+    schedule_delay_stamp_local();
     schedule_delay_save_nvs();
     // Log + status using local time so the user sees what they set.
     struct tm lt; localtime_r(&t, &lt);
@@ -19673,6 +19714,43 @@ time_t irrigoto_schedule_get_delay_until(void)
         }
     }
     return s_sched_delay_until;
+}
+
+time_t irrigoto_schedule_get_delay_lm(void)
+{
+    return s_sched_delay_lm;
+}
+
+// b524: reconcile a delay pushed by HA (until + HA's stamp). Applied only
+// when HA's stamp is strictly newer than the device's own -- the device
+// wins a tie, matching the schedule-entry LWW rule. A rejected sync is
+// not an error: HA reads back the device's values and adopts them.
+bool irrigoto_schedule_sync_delay(time_t until, time_t lm)
+{
+    if (lm <= s_sched_delay_lm) {
+        INFO("Schedule delay sync ignored: HA stamp %ld <= device stamp %ld",
+             (long)lm, (long)s_sched_delay_lm);
+        return false;
+    }
+    time_t now = time(NULL);
+    if (until <= now) until = 0;
+    s_sched_delay_until = until;
+    s_sched_delay_lm    = lm;
+    schedule_delay_save_nvs();
+    if (until == 0) {
+        INFO("Schedule delay cleared (sync from HA)");
+        snprintf(s_sched_last_status, sizeof(s_sched_last_status),
+                 "delay cleared (HA)");
+    } else {
+        struct tm lt; localtime_r(&until, &lt);
+        INFO("Schedule delay set (sync from HA): suspended until %04d-%02d-%02d %02d:%02d",
+             lt.tm_year+1900, lt.tm_mon+1, lt.tm_mday, lt.tm_hour, lt.tm_min);
+        snprintf(s_sched_last_status, sizeof(s_sched_last_status),
+                 "delay until %04d-%02d-%02d %02d:%02d (HA)",
+                 lt.tm_year+1900, lt.tm_mon+1, lt.tm_mday,
+                 lt.tm_hour, lt.tm_min);
+    }
+    return true;
 }
 
 // Snapshot of the live schedule for the web UI. Plain copy under no lock

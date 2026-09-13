@@ -505,11 +505,27 @@ bool irrigoto_schedule_next_run(time_t now, time_t *out_t, int *out_zone);
  * irrigoto_schedule_get_delay_until():
  *   Returns the absolute delay-until epoch, or 0 if no delay is active
  *   (which includes expired delays — they self-clear lazily on read).
+ *
+ * b524 — HA-side rain delay that survives device sleep:
+ *
+ * irrigoto_schedule_get_delay_lm():
+ *   Epoch stamp of the last delay set/clear on this device (0 = never).
+ *   Local changes (web UI, HA service, REST hours=) stamp the device
+ *   clock; a sync from HA stamps HA's value. Reported in /api/schedule
+ *   as delay_lm.
+ *
+ * irrigoto_schedule_sync_delay(until, lm):
+ *   Last-writer-wins reconcile with HA's desired delay: applied (and
+ *   returns true) only if lm is strictly newer than the device's stamp;
+ *   otherwise ignored (device wins a tie) and returns false so HA can
+ *   read back and adopt the device's delay_until/delay_lm.
  */
 void   irrigoto_schedule_set_delay_until(time_t t);
 void   irrigoto_schedule_set_delay_hours(uint32_t hours);
 void   irrigoto_schedule_clear_delay(void);
 time_t irrigoto_schedule_get_delay_until(void);
+time_t irrigoto_schedule_get_delay_lm(void);
+bool   irrigoto_schedule_sync_delay(time_t until, time_t lm);
 
 /** Web UI theme. true=dark (legacy), false=light. Persists to NVS. */
 bool irrigoto_get_theme_dark(void);

@@ -114,8 +114,16 @@ views:
                   - entity: sensor.<<DEV_USC>>_irrigoto_next_scheduled_run
                     name: Next run
                     icon: mdi:clock-outline
-                  - entity: sensor.<<DEV_USC>>_irrigoto_schedule_delay
+                  - entity: sensor.<<DEV_USC>>_rain_delay
                     name: Rain delay
+                    icon: mdi:weather-pouring
+                  - type: attribute
+                    entity: sensor.<<DEV_USC>>_rain_delay
+                    attribute: sync
+                    name: Rain delay sync
+                    icon: mdi:sync
+                  - entity: sensor.<<DEV_USC>>_irrigoto_schedule_delay
+                    name: Rain delay (device)
                     icon: mdi:weather-pouring
                   - entity: sensor.<<DEV_USC>>_irrigoto_last_schedule_update
                     name: Last update
@@ -753,6 +761,17 @@ views:
               - type: markdown
                 title: Schedule
                 content: >
+                  {%- set rd = states('sensor.<<DEV_USC>>_rain_delay') -%}
+                  {%- set rd_sync = state_attr('sensor.<<DEV_USC>>_rain_delay', 'sync') | default('', true) | string -%}
+                  {%- set rd_dev = states('sensor.<<DEV_USC>>_irrigoto_schedule_delay') -%}
+                  {%- if rd not in ['off', 'unknown', 'unavailable'] -%}
+                  **Rain delay {{ rd }}** · {{ rd_sync }}{{ '' if rd_sync == 'synced' else ' · device reports: ' ~ rd_dev }}
+                  {%- elif rd_sync.startswith('pending') -%}
+                  **Rain delay off** · {{ rd_sync }} · device reports: {{ rd_dev }}
+                  {%- else -%}
+                  Rain delay: off
+                  {%- endif %}
+
                   {% set ha_entries =
                   (state_attr('sensor.irrigoto_desired_schedule', 'entries') |
                   default([], true)) | selectattr('device', 'equalto',
@@ -979,9 +998,27 @@ views:
                     tap_action:
                       action: url
                       url_path: <<DEV_URL>>/schedule
+              - type: entities
+                title: Rain delay
+                show_header_toggle: false
+                entities:
+                  - entity: sensor.<<DEV_USC>>_rain_delay
+                    name: Requested (HA)
+                    icon: mdi:weather-pouring
+                  - type: attribute
+                    entity: sensor.<<DEV_USC>>_rain_delay
+                    attribute: sync
+                    name: Sync with device
+                    icon: mdi:sync
+                  - entity: sensor.<<DEV_USC>>_irrigoto_schedule_delay
+                    name: Device reports
+                    icon: mdi:chip
+                  - entity: sensor.<<DEV_USC>>_irrigoto_next_scheduled_run
+                    name: Next run (device)
+                    icon: mdi:clock-outline
               - type: conditional
                 conditions:
-                  - entity: sensor.<<DEV_USC>>_irrigoto_schedule_delay
+                  - entity: sensor.<<DEV_USC>>_rain_delay
                     state: 'off'
                 card:
                   type: horizontal-stack
@@ -991,7 +1028,7 @@ views:
                       icon: mdi:timer-sand
                       tap_action:
                         action: perform-action
-                        perform_action: esphome.<<DEV_USC>>_delay_schedule_hours
+                        perform_action: script.<<DEV_USC>>_set_rain_delay
                         data:
                           hours: 6
                     - type: button
@@ -999,7 +1036,7 @@ views:
                       icon: mdi:timer-sand
                       tap_action:
                         action: perform-action
-                        perform_action: esphome.<<DEV_USC>>_delay_schedule_hours
+                        perform_action: script.<<DEV_USC>>_set_rain_delay
                         data:
                           hours: 12
                     - type: button
@@ -1007,7 +1044,7 @@ views:
                       icon: mdi:timer-sand
                       tap_action:
                         action: perform-action
-                        perform_action: esphome.<<DEV_USC>>_delay_schedule_hours
+                        perform_action: script.<<DEV_USC>>_set_rain_delay
                         data:
                           hours: 24
                     - type: button
@@ -1015,12 +1052,12 @@ views:
                       icon: mdi:timer-sand
                       tap_action:
                         action: perform-action
-                        perform_action: esphome.<<DEV_USC>>_delay_schedule_hours
+                        perform_action: script.<<DEV_USC>>_set_rain_delay
                         data:
                           hours: 48
               - type: conditional
                 conditions:
-                  - entity: sensor.<<DEV_USC>>_irrigoto_schedule_delay
+                  - entity: sensor.<<DEV_USC>>_rain_delay
                     state_not: 'off'
                 card:
                   type: button
@@ -1028,7 +1065,7 @@ views:
                   icon: mdi:close-circle-outline
                   tap_action:
                     action: perform-action
-                    perform_action: esphome.<<DEV_USC>>_delay_schedule_hours
+                    perform_action: script.<<DEV_USC>>_set_rain_delay
                     data:
                       hours: 0
   - title: Device

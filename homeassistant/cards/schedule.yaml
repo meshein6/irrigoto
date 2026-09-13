@@ -16,8 +16,16 @@ entities:
   - entity: sensor.<<DEV_USC>>_irrigoto_next_scheduled_run
     name: Next run
     icon: mdi:clock-outline
-  - entity: sensor.<<DEV_USC>>_irrigoto_schedule_delay
+  - entity: sensor.<<DEV_USC>>_rain_delay
     name: Rain delay
+    icon: mdi:weather-pouring
+  - type: attribute
+    entity: sensor.<<DEV_USC>>_rain_delay
+    attribute: sync
+    name: Rain delay sync
+    icon: mdi:sync
+  - entity: sensor.<<DEV_USC>>_irrigoto_schedule_delay
+    name: Rain delay (device)
     icon: mdi:weather-pouring
   - entity: sensor.<<DEV_USC>>_irrigoto_last_schedule_update
     name: Last update
@@ -29,10 +37,15 @@ entities:
 # ── Card B: Rain delay quick buttons (paste as a separate card) ──────
 # Pair with the conditional below; the conditional flips visibility
 # based on whether a delay is currently active.
+# b524: the buttons call script.<<DEV_USC>>_set_rain_delay, which stores
+# the delay in HA and pushes it to the device on its next wake (the old
+# esphome.<<DEV_USC>>_delay_schedule_hours service only worked while the
+# device was awake). sensor.<<DEV_USC>>_rain_delay is HA's desired delay;
+# its `sync` attribute shows whether the device has it yet.
 #
 # type: conditional
 # conditions:
-#   - entity: sensor.<<DEV_USC>>_irrigoto_schedule_delay
+#   - entity: sensor.<<DEV_USC>>_rain_delay
 #     state: "off"
 # card:
 #   type: horizontal-stack
@@ -42,7 +55,7 @@ entities:
 #       icon: mdi:timer-sand
 #       tap_action:
 #         action: perform-action
-#         perform_action: esphome.<<DEV_USC>>_delay_schedule_hours
+#         perform_action: script.<<DEV_USC>>_set_rain_delay
 #         data:
 #           hours: 6
 #     - type: button
@@ -50,7 +63,7 @@ entities:
 #       icon: mdi:timer-sand
 #       tap_action:
 #         action: perform-action
-#         perform_action: esphome.<<DEV_USC>>_delay_schedule_hours
+#         perform_action: script.<<DEV_USC>>_set_rain_delay
 #         data:
 #           hours: 24
 #     - type: button
@@ -58,13 +71,13 @@ entities:
 #       icon: mdi:timer-sand
 #       tap_action:
 #         action: perform-action
-#         perform_action: esphome.<<DEV_USC>>_delay_schedule_hours
+#         perform_action: script.<<DEV_USC>>_set_rain_delay
 #         data:
 #           hours: 48
 #
 # type: conditional
 # conditions:
-#   - entity: sensor.<<DEV_USC>>_irrigoto_schedule_delay
+#   - entity: sensor.<<DEV_USC>>_rain_delay
 #     state_not: "off"
 # card:
 #   type: button
@@ -72,7 +85,7 @@ entities:
 #   icon: mdi:close-circle-outline
 #   tap_action:
 #     action: perform-action
-#     perform_action: esphome.<<DEV_USC>>_delay_schedule_hours
+#     perform_action: script.<<DEV_USC>>_set_rain_delay
 #     data:
 #       hours: 0
 

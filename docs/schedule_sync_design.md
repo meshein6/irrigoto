@@ -224,6 +224,39 @@ sleeping device with an empty cache), which would otherwise store a corrupt
   of HA's `last_seen_schedule_version` (HA is pulling).
 - `sensor.irrigoto_schedule_overlap_status` — cross-device time-overlap check.
 
+### Rain delay (b524)
+The rain delay is reconciled the same way as entries, so a delay set in HA
+while a unit sleeps lands on its next wake instead of silently failing.
+
+- **HA desired state:** `input_text.<dev>_rain_delay` = `"<until_epoch>,<lm>"`
+  (`until` 0 = no delay, `lm` = when HA last changed it). Written by
+  `script.<dev>_set_rain_delay` (`hours`, 0 = cancel) — the dashboard buttons
+  and any weather automation call the script, never the ESPHome service.
+- **Device state:** `delay_until` + `delay_lm` (NVS, both in `/api/schedule`).
+  Local changes (web UI, ESPHome `delay_schedule_hours`, REST `hours=`) stamp
+  the device clock.
+- **Reconcile:** `automation.<dev>_sync_rain_delay` runs on device wake, on the
+  HA input changing, and on the poll seeing a new device `delay_lm`. Compares
+  the *effective* delay on each side (expired = off). Equal → nothing. HA's
+  stamp newer → `POST /api/schedule/delay until=E&lm=L`; the device applies it
+  only if `L` beats its own stamp and answers `{applied, delay_until, delay_lm}`
+  — a rejection makes HA adopt the device's values. Device newer or tie → HA
+  copies the device's delay into the input (device wins a tie, as for entries).
+  On a wake the automation refreshes the poll sensor first, since it went
+  unavailable during the sleep.
+- **Display / verification:** `sensor.<dev>_rain_delay` (HA's desired delay;
+  attribute `sync` = `synced` / `pending push` / `pending pull`) is what the
+  dashboard shows and gates its buttons on. The Schedule view's markdown card
+  opens with a rain-delay banner and a "Rain delay" card lists requested /
+  sync / device-reported / next run; the Overview Schedule card carries the
+  same rows. Every set, cancel, push and pull is also written to the device's
+  logbook (`sensor.<dev>_watering_log`). `sensor.<dev>_irrigoto_schedule_delay`
+  remains the device-reported value.
+- **Known gap:** an armed timer wake fires its scheduled run before HA
+  reconnects, so a delay set during the *final* sleep interval before a run
+  cannot stop that run. Units wake every few minutes, so this only bites when
+  the delay is set within one sleep cycle of the scheduled time.
+
 ## Design notes (why it's built this way)
 
 - **Per-device slots, not one shared pool.** A single shared slot space with

@@ -177,6 +177,7 @@ generated, never hand-maintained.
 | Chase scripts + valve switch | Quick "chase" watering buttons and a valve open/close toggle (both via the shared HTTP helpers). |
 | Heatmap mirror | Pulls per-zone heatmap data into HA's `www/` so the card renders while the device sleeps. **Namespaced per device** (see Cached files below). |
 | Schedule reconciler (bidirectional) | Per-device sensors + `<slug>_push_schedule` script + reconciler automation. Edit anywhere — HA dashboard or device web UI — and both sides stay in lockstep via per-entry IDs + `last_modified`, conflicts resolving last-writer-wins (device wins on tie). See [the design doc](../docs/schedule_sync_design.md). |
+| Rain delay (survives sleep) | `script.<slug>_set_rain_delay` stores the requested delay in HA; a sync automation pushes it to the device on its next wake and pulls delays set on the device's web UI back into HA. `sensor.<slug>_rain_delay` shows the request and whether the device has it yet. See [Rain delay](#rain-delay) below. |
 
 ## Cached files are per-device
 
@@ -202,10 +203,10 @@ non-negotiable for an outdoor sprinkler controller. But HA can hold a richer
 and reconcile it into each device whenever that device is awake.
 
 Storage is **pure HA helpers** — no files, no `command_line:`, no File Editor
-add-on. 10 per-slot `input_text` helpers (`input_text.irrigoto_sched_1`
-through `_10`) each hold one CSV-formatted entry; a template sensor
-aggregates non-empty slots into the per-device shape the reconciler
-consumes. A compose form on the Schedule tab (dropdowns + time picker) plus
+add-on. Each device owns eight per-slot `input_text` helpers
+(`input_text.<slug>_sched_1` through `_8`) that each hold one CSV-formatted
+entry; a template sensor aggregates non-empty slots into the per-device shape
+the reconciler consumes. A compose form on the Schedule tab (dropdowns + time picker) plus
 four scripts (Save / Load / Clear slot / Clear all) let you edit schedules
 entirely from the HA UI. The compose form's **Device** dropdown is filled
 from the manifest, so an entry is always tied to a specific device's slug.
@@ -252,6 +253,31 @@ the device has whose `id` HA doesn't mention (e.g. added via the web UI
 before HA learned of them) are **preserved unconditionally** — web-UI adds
 survive HA pushes automatically. Clearing an HA slot whose `id` is non-zero
 emits a tombstone telling the device to delete that entry.
+
+### Rain delay
+
+A rain delay suspends all scheduled firing on a device until a given time.
+It is handled like a schedule edit, so it does not need the device awake:
+
+- The dashboard's **Delay 6h / 12h / 24h / 48h** and **Cancel rain delay**
+  buttons call `script.<slug>_set_rain_delay` (field `hours`, 0 cancels).
+  The script stores the requested delay-until time and a timestamp in
+  `input_text.<slug>_rain_delay`, which HA restores across restarts. Weather
+  automations should call the same script.
+- `automation.<slug>_sync_rain_delay` reconciles HA's request with the
+  device whenever the device is online: it pushes when HA's timestamp is
+  newer, pulls a delay set on the device's web UI when the device's is newer,
+  and the device wins a tie. The device keeps the delay in NVS, so it also
+  survives reboots and deep sleep.
+- `sensor.<slug>_rain_delay` shows the requested state (`off` or
+  `until YYYY-MM-DD HH:MM`); its `sync` attribute reads `synced`,
+  `pending push` (with `- device asleep` while it waits for a wake) or
+  `pending pull`. The Schedule tab opens with this as a banner and lists it
+  next to the device-reported value and the device's next run; every set,
+  cancel, push and pull is also written to the device's Logbook.
+- A delay set within the last sleep cycle before a scheduled run cannot stop
+  that run: an armed timer wake fires before HA reconnects. Units wake every
+  few minutes, so in practice set the delay more than one sleep cycle ahead.
 
 ### Cross-device overlap validator
 

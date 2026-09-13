@@ -63,6 +63,20 @@ input_text:
     name: "irrigoto <<DEV_DASH>> last seen schedule_version"
     icon: mdi:counter
     max: 16
+  # b524: HA-side DESIRED rain delay for this device: "<until_epoch>,<lm_epoch>"
+  # (until 0 = no delay; lm = when HA last changed it). The dashboard buttons
+  # write this via script.<<DEV_USC>>_set_rain_delay whether or not the device
+  # is awake. The sync_rain_delay automation reconciles it with the device's
+  # own delay_until/delay_lm (last-writer-wins, device wins a tie) whenever
+  # the device is online -- so the delay rides along like a schedule edit
+  # instead of needing the device awake at click time.
+  # NO `initial:` (restart_slot_wipe fix): HA restores the value across a
+  # restart only when initial is omitted. Fresh installs start 'unknown';
+  # <<DEV_USC>>_init_sched_slots normalizes to "0,0".
+  <<DEV_USC>>_rain_delay:
+    name: "irrigoto <<DEV_DASH>> rain delay (desired)"
+    icon: mdi:weather-pouring
+    max: 40
   # Durable cache of this device's zone-picker options ("<name> (#<id>)" JSON),
   # refreshed whenever the device is awake. input_text values are restored
   # across HA restarts, whereas input_select.set_options is NOT -- so this is
@@ -351,6 +365,50 @@ script:
                 ({{ rendered_count }} entries / tombstones)
               domain: sensor
               entity_id: sensor.<<DEV_USC>>_watering_log
+
+  # b524: set / cancel the rain delay from HA whether or not the device is
+  # awake. Writes the desired delay (absolute epoch + stamp) into
+  # input_text.<<DEV_USC>>_rain_delay; the sync_rain_delay automation pushes
+  # it right away if the device is online, otherwise on its next wake -- the
+  # same way schedule edits reach a sleeping device. hours: 0 cancels.
+  # Replaces the dashboard's direct esphome.<<DEV_USC>>_delay_schedule_hours
+  # calls (which silently failed while the device slept).
+  <<DEV_USC>>_set_rain_delay:
+    alias: "irrigoto <<DEV_DASH>>: set rain delay (hours, 0 = cancel)"
+    icon: mdi:weather-pouring
+    mode: queued
+    fields:
+      hours:
+        name: Hours
+        description: Suspend scheduled watering for this many hours from now (0 cancels).
+        required: true
+        default: 24
+        selector:
+          number:
+            min: 0
+            max: 336
+            unit_of_measurement: h
+    sequence:
+      - variables:
+          h: "{{ [[hours | int(0), 0] | max, 336] | min }}"
+          now_ts: "{{ now().timestamp() | int }}"
+          until: "{{ (now_ts + h * 3600) if h > 0 else 0 }}"
+      - action: input_text.set_value
+        target:
+          entity_id: input_text.<<DEV_USC>>_rain_delay
+        data:
+          value: "{{ until }},{{ now_ts }}"
+      - action: logbook.log
+        data:
+          name: irrigoto
+          message: >-
+            <<DEV_DASH>>: rain delay {{ 'cancelled' if h == 0
+              else 'set for ' ~ h ~ ' h (until ' ~ (until | timestamp_custom('%Y-%m-%d %H:%M')) ~ ')' }}
+            {{ '- device online, pushing now'
+               if is_state('binary_sensor.<<DEV_USC>>_irrigoto_online', 'on')
+               else '- device asleep, will push on its next wake' }}
+          domain: sensor
+          entity_id: sensor.<<DEV_USC>>_watering_log
 
   # Phase 1: zone backup/restore over the b399 by-id endpoints. Backup
   # snapshots every zone to /config/irrigoto_backups/<<DEV_DASH>>/; restore
@@ -1905,6 +1963,17 @@ template:
       - trigger: state
         entity_id: sensor.<<DEV_USC>>_schedule_rest
         not_to: ["unavailable", "unknown", "none"]
+      # b524: a `to`/`not_to` state trigger ignores attribute-only updates, and
+      # the poll's STATE (schedule_version) doesn't move when a delay is set or
+      # cleared -- so after the rain-delay push refreshed the poll, "Rain delay
+      # (device)" kept showing the pre-push value until the next version bump.
+      # Re-render on the attributes these two sensors actually read.
+      - trigger: state
+        entity_id: sensor.<<DEV_USC>>_schedule_rest
+        attribute: delay_until
+      - trigger: state
+        entity_id: sensor.<<DEV_USC>>_schedule_rest
+        attribute: last_status
       - trigger: homeassistant
         event: start
     sensor:
@@ -1913,6 +1982,9 @@ template:
         default_entity_id: sensor.<<DEV_USC>>_irrigoto_last_schedule_update
         icon: mdi:calendar-check-outline
         state: "{{ state_attr('sensor.<<DEV_USC>>_schedule_rest','last_status') }}"
+      # Device-REPORTED delay (what the unit itself will honor). b524: the
+      # dashboard now shows sensor.<<DEV_USC>>_rain_delay (HA's desired
+      # delay + sync status) and keeps this row as "Rain delay (device)".
       - name: "<<DEV_DASH>> Schedule Delay"
         unique_id: <<DEV_USC>>_irrigoto_schedule_delay
         default_entity_id: sensor.<<DEV_USC>>_irrigoto_schedule_delay
@@ -1920,6 +1992,52 @@ template:
         state: >-
           {%- set du = state_attr('sensor.<<DEV_USC>>_schedule_rest','delay_until') | int(0) -%}
           {%- if du > as_timestamp(now()) | int -%}until {{ du | timestamp_custom('%Y-%m-%d %H:%M') }}{%- else -%}off{%- endif -%}
+
+  # b524: HA-side rain delay (desired state + sync status). This is what the
+  # dashboard shows and gates its buttons on: it reflects what the user asked
+  # for even while the device sleeps. `sync` says whether the device has it:
+  #   synced          device delay matches HA's
+  #   pending push    HA is newer; pushed when the device is next online
+  #   pending pull    device is newer (delay set on the web UI); HA adopts it
+  - sensor:
+      - name: "<<DEV_DASH>> Rain Delay"
+        unique_id: <<DEV_USC>>_rain_delay
+        default_entity_id: sensor.<<DEV_USC>>_rain_delay
+        icon: >-
+          {%- if is_state('sensor.<<DEV_USC>>_rain_delay', 'off') -%}mdi:weather-sunny
+          {%- else -%}mdi:weather-pouring{%- endif -%}
+        state: >-
+          {%- set raw = states('input_text.<<DEV_USC>>_rain_delay') | default('', true) | string -%}
+          {%- set until = (raw.split(',')[0] | int(0)) if ',' in raw else 0 -%}
+          {%- if until > (now().timestamp() | int) -%}until {{ until | timestamp_custom('%Y-%m-%d %H:%M') }}{%- else -%}off{%- endif -%}
+        attributes:
+          until: >-
+            {%- set raw = states('input_text.<<DEV_USC>>_rain_delay') | default('', true) | string -%}
+            {{ (raw.split(',')[0] | int(0)) if ',' in raw else 0 }}
+          lm: >-
+            {%- set raw = states('input_text.<<DEV_USC>>_rain_delay') | default('', true) | string -%}
+            {{ (raw.split(',')[1] | int(0)) if ',' in raw else 0 }}
+          device_until: >-
+            {{ state_attr('sensor.<<DEV_USC>>_schedule_rest', 'delay_until') | int(0) }}
+          device_lm: >-
+            {{ state_attr('sensor.<<DEV_USC>>_schedule_rest', 'delay_lm') | int(0) }}
+          device_state: >-
+            {{ states('sensor.<<DEV_USC>>_irrigoto_schedule_delay') }}
+          device_online: >-
+            {{ is_state('binary_sensor.<<DEV_USC>>_irrigoto_online', 'on') }}
+          sync: >-
+            {%- set raw = states('input_text.<<DEV_USC>>_rain_delay') | default('', true) | string -%}
+            {%- set ha_until = (raw.split(',')[0] | int(0)) if ',' in raw else 0 -%}
+            {%- set ha_lm = (raw.split(',')[1] | int(0)) if ',' in raw else 0 -%}
+            {%- set now_ts = now().timestamp() | int -%}
+            {%- set dev_until = state_attr('sensor.<<DEV_USC>>_schedule_rest', 'delay_until') | int(0) -%}
+            {%- set dev_lm = state_attr('sensor.<<DEV_USC>>_schedule_rest', 'delay_lm') | int(0) -%}
+            {%- set ha_eff = ha_until if ha_until > now_ts else 0 -%}
+            {%- set dev_eff = dev_until if dev_until > now_ts else 0 -%}
+            {%- set online = is_state('binary_sensor.<<DEV_USC>>_irrigoto_online', 'on') -%}
+            {%- if ha_eff == dev_eff -%}synced
+            {%- elif ha_lm > dev_lm -%}pending push{{ '' if online else ' - device asleep' }}
+            {%- else -%}pending pull{%- endif -%}
 
 # ── HTTP-PULL: mirror device schedule into HA slots ────────────────
 # b359: REST sensor that periodically fetches the device's structured
@@ -1971,6 +2089,11 @@ sensor:
       # b467: epoch of a scheduled rain/manual delay; 0 = no delay.
       # Drives the Schedule Delay diagnostic tile (restored via HTTP).
       - delay_until
+      # b524: stamp of the device's last delay set/clear. The sync_rain_delay
+      # automation triggers on it (device-side changes) and compares it with
+      # HA's stamp (last-writer-wins). Without it dev_lm reads 0 forever and
+      # web-UI-set delays are never pulled.
+      - delay_lm
       # b479: the device's persisted last-completed-run record, incl. the
       # rich stats (duration/volume/score/...) and finish_epoch. Basis of
       # the self-healing completion notice: survives sleep on the device,
@@ -2690,6 +2813,18 @@ automation:
               entity_id: input_text.<<DEV_USC>>_last_seen_schedule_version
             data:
               value: "0"
+      # b524: desired rain delay "<until>,<lm>"; fresh install = no delay.
+      - if:
+          - condition: template
+            value_template: >-
+              {{ states('input_text.<<DEV_USC>>_rain_delay')
+                 in ['unknown', 'unavailable'] }}
+        then:
+          - action: input_text.set_value
+            target:
+              entity_id: input_text.<<DEV_USC>>_rain_delay
+            data:
+              value: "0,0"
 
   - id: <<DEV_USC>>_mirror_device_schedule_to_slots
     alias: "irrigoto <<DEV_DASH>>: mirror device schedule into HA slots"
@@ -2993,6 +3128,152 @@ automation:
   # Companion to the reconciler: when HA has changes to push BUT a
   # cross-device overlap blocks the sync, log the block so the user
   # can see why nothing happened.
+  # b524: rain delay rides with the schedule. HA's desired delay lives in
+  # input_text.<<DEV_USC>>_rain_delay ("<until>,<lm>"); the device keeps its
+  # own delay_until + delay_lm (NVS, /api/schedule). Whenever the device is
+  # online this reconciles the two, last-writer-wins with the device winning
+  # a tie (same rule as schedule entries):
+  #   HA newer & different  -> POST /api/schedule/delay until=..&lm=..  (push)
+  #   device newer/equal    -> copy the device's delay into the input_text (pull)
+  # A rejected push (device stamp turned out newer than HA's stale poll cache)
+  # adopts the device's answer. Triggers: device wake, HA-side change,
+  # device-side change surfaced by the 30 s schedule poll.
+  - id: <<DEV_USC>>_sync_rain_delay
+    alias: "irrigoto <<DEV_DASH>>: sync rain delay with device"
+    description: >-
+      Reconcile HA's desired rain delay with the device's (last-writer-wins,
+      device wins a tie) whenever the device is online. Pushes a delay set
+      while the device slept on its next wake, and pulls delays set on the
+      device's web UI back into HA.
+    mode: restart
+    triggers:
+      - trigger: state
+        entity_id: binary_sensor.<<DEV_USC>>_irrigoto_online
+        from: "off"
+        to: "on"
+      - trigger: state
+        entity_id: input_text.<<DEV_USC>>_rain_delay
+      - trigger: state
+        entity_id: sensor.<<DEV_USC>>_schedule_rest
+        attribute: delay_lm
+    conditions:
+      - condition: state
+        entity_id: binary_sensor.<<DEV_USC>>_irrigoto_online
+        state: "on"
+    actions:
+      # On a wake the poll sensor is stale from the sleep window (it failed
+      # every 30 s while the unit slept). Refresh it first so the compare is
+      # against the device's real, NVS-restored delay.
+      - if:
+          - condition: template
+            value_template: >-
+              {{ trigger.entity_id == 'binary_sensor.<<DEV_USC>>_irrigoto_online' }}
+        then:
+          - delay: "00:00:02"
+          - action: homeassistant.update_entity
+            target:
+              entity_id: sensor.<<DEV_USC>>_schedule_rest
+          - wait_template: >-
+              {{ not is_state('sensor.<<DEV_USC>>_schedule_rest', 'unavailable') }}
+            timeout: "00:00:15"
+      # NOTE: do NOT stage the raw "<until>,<lm>" string in a variable -- HA's
+      # native-type rendering turns an all-numeric CSV into a list (the same
+      # trap as prev_id in the compose script), so ',' in raw was false and
+      # the push never fired (caught on the first live test, 2026-09-13).
+      # The rain_delay template sensor already splits it inside ONE template.
+      - variables:
+          ha_until: "{{ state_attr('sensor.<<DEV_USC>>_rain_delay', 'until') | int(0) }}"
+          ha_lm: "{{ state_attr('sensor.<<DEV_USC>>_rain_delay', 'lm') | int(0) }}"
+          dev_until: "{{ state_attr('sensor.<<DEV_USC>>_schedule_rest', 'delay_until') | int(0) }}"
+          dev_lm: "{{ state_attr('sensor.<<DEV_USC>>_schedule_rest', 'delay_lm') | int(0) }}"
+          now_ts: "{{ now().timestamp() | int }}"
+          ha_eff: "{{ ha_until if ha_until > now_ts else 0 }}"
+          dev_eff: "{{ dev_until if dev_until > now_ts else 0 }}"
+      # Same effective delay on both sides (both off, or same until): nothing
+      # to do -- neither branch below matches.
+      - choose:
+          # HA is newer: push.
+          - conditions:
+              - condition: template
+                value_template: "{{ ha_eff != dev_eff and ha_lm > dev_lm }}"
+            sequence:
+              - action: rest_command.irrigoto_sync_delay
+                data:
+                  base_url: "<<DEV_URL>>"
+                  until: "{{ ha_until }}"
+                  lm: "{{ ha_lm }}"
+                response_variable: resp
+                continue_on_error: true
+              - if:
+                  - condition: template
+                    value_template: >-
+                      {{ resp is defined and resp.status == 200
+                         and (resp.content.applied | default(false)) }}
+                then:
+                  - action: logbook.log
+                    data:
+                      name: irrigoto
+                      message: >-
+                        <<DEV_DASH>>: rain delay pushed to device
+                        ({{ 'cancelled' if ha_eff == 0
+                            else 'until ' ~ (ha_until | timestamp_custom('%Y-%m-%d %H:%M')) }})
+                      domain: sensor
+                      entity_id: sensor.<<DEV_USC>>_watering_log
+                else:
+                  - if:
+                      - condition: template
+                        value_template: "{{ resp is defined and resp.status == 200 }}"
+                    then:
+                      # Device stamp was newer than our cached copy: adopt it.
+                      - action: input_text.set_value
+                        target:
+                          entity_id: input_text.<<DEV_USC>>_rain_delay
+                        data:
+                          value: >-
+                            {{ resp.content.delay_until | int(0) }},{{ resp.content.delay_lm | int(0) }}
+                      - action: logbook.log
+                        data:
+                          name: irrigoto
+                          message: >-
+                            <<DEV_DASH>>: rain delay push superseded -- device's own
+                            delay is newer, adopted it
+                          domain: sensor
+                          entity_id: sensor.<<DEV_USC>>_watering_log
+                    else:
+                      - action: logbook.log
+                        data:
+                          name: irrigoto
+                          message: >-
+                            <<DEV_DASH>>: rain delay push FAILED
+                            (HTTP {{ resp.status if resp is defined else 'error' }});
+                            will retry on next wake
+                          domain: sensor
+                          entity_id: sensor.<<DEV_USC>>_watering_log
+              # Refresh the poll so the device-reported tiles agree right away.
+              - action: homeassistant.update_entity
+                target:
+                  entity_id: sensor.<<DEV_USC>>_schedule_rest
+          # Device is newer (or same age with a different value, e.g. a delay
+          # set on the web UI): pull it into HA.
+          - conditions:
+              - condition: template
+                value_template: "{{ ha_eff != dev_eff }}"
+            sequence:
+              - action: input_text.set_value
+                target:
+                  entity_id: input_text.<<DEV_USC>>_rain_delay
+                data:
+                  value: "{{ dev_until }},{{ dev_lm }}"
+              - action: logbook.log
+                data:
+                  name: irrigoto
+                  message: >-
+                    <<DEV_DASH>>: rain delay pulled from device
+                    ({{ 'off' if dev_eff == 0
+                        else 'until ' ~ (dev_until | timestamp_custom('%Y-%m-%d %H:%M')) }})
+                  domain: sensor
+                  entity_id: sensor.<<DEV_USC>>_watering_log
+
   - id: <<DEV_USC>>_log_overlap_block
     alias: "irrigoto <<DEV_DASH>>: log overlap-blocked push attempt"
     description: >-
@@ -3034,14 +3315,18 @@ automation:
           entity_id: sensor.<<DEV_USC>>_watering_log
 
   # ── Rain delay glue ────────────────────────────────────────────────
-  # Two automations that drive the device's delay_schedule_hours
-  # service from a weather entity. Both are commented out by default
-  # because they reference weather.home — you almost certainly want
-  # to point them at your own weather integration (Met, OpenWeather,
-  # AccuWeather, etc.). Uncomment + change the entity_id and they
-  # work as-is. The schedule_delay sensor is the source of truth and
-  # is checked in both directions so we don't fight a real user-set
-  # delay from the web UI.
+  # Two automations that drive the rain delay from a weather entity.
+  # Both are commented out by default because they reference
+  # weather.home — you almost certainly want to point them at your own
+  # weather integration (Met, OpenWeather, AccuWeather, etc.). Uncomment
+  # + change the entity_id and they work as-is.
+  # b524: they call script.<<DEV_USC>>_set_rain_delay (HA-side desired
+  # delay, pushed to the device on its next wake) instead of the
+  # esphome.<<DEV_USC>>_delay_schedule_hours service, which only worked
+  # while the device was awake. sensor.<<DEV_USC>>_rain_delay is the
+  # source of truth (HA's desired delay, merged with web-UI-set delays
+  # by the sync_rain_delay automation) and is checked in both
+  # directions so we don't fight a real user-set delay.
   #
   # Example 1: 24-hour rain delay when forecast says rainy. Checked
   # hourly; the condition skips if a delay is already active so we
@@ -3058,10 +3343,10 @@ automation:
   #       entity_id: weather.home          # ← CHANGE to your weather entity
   #       state: "rainy"
   #     - condition: state
-  #       entity_id: sensor.<<DEV_USC>>_irrigoto_schedule_delay
+  #       entity_id: sensor.<<DEV_USC>>_rain_delay
   #       state: "off"
   #   actions:
-  #     - action: esphome.<<DEV_USC>>_delay_schedule_hours
+  #     - action: script.<<DEV_USC>>_set_rain_delay
   #       data:
   #         hours: 24
   #
@@ -3079,13 +3364,13 @@ automation:
   #     - condition: not
   #       conditions:
   #         - condition: state
-  #           entity_id: sensor.<<DEV_USC>>_irrigoto_schedule_delay
+  #           entity_id: sensor.<<DEV_USC>>_rain_delay
   #           state: "off"
   #   actions:
-  #     - action: esphome.<<DEV_USC>>_delay_schedule_hours
+  #     - action: script.<<DEV_USC>>_set_rain_delay
   #       data:
   #         hours: 0   # 0 cancels
   #
-  # The delay also persists across reboot / deep-sleep wake, so an
-  # automation that fires once and then the device sleeps for 10
-  # minutes will still see the delay active when it wakes up.
+  # The delay persists on the device across reboot / deep-sleep wake, and
+  # HA keeps the desired value across HA restarts, so an automation that
+  # fires while the device sleeps still lands on its next wake.

@@ -75,7 +75,8 @@ immutable, while `main` is a flattened snapshot replaced on each release.
 
 After the device comes online, set up the Home Assistant side — see
 [Home Assistant integration](#home-assistant-integration) below for the
-template sensors, automations, schedule sync, and per-zone heatmap.
+template sensors, automations, schedule and rain-delay sync, and per-zone
+heatmap.
 
 ## Local development (compile from a clone)
 
@@ -174,8 +175,9 @@ to load the template sensors, automations, and heatmap dashboard.
 
 ## Home Assistant integration
 
-The HA-side config — template sensors, automations, schedule sync, and the
-per-zone heatmap dashboard — is generated per-fleet from a manifest. The
+The HA-side config — template sensors, automations, schedule and rain-delay
+sync, and the per-zone heatmap dashboard — is generated per-fleet from a
+manifest. The
 files under `homeassistant/packages/` and `homeassistant/dashboards/` are
 **templates** with `<<DEV_*>>` placeholders and will NOT load as-is; run the
 generator first.
