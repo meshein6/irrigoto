@@ -373,6 +373,123 @@ script:
   # same way schedule edits reach a sleeping device. hours: 0 cancels.
   # Replaces the dashboard's direct esphome.<<DEV_USC>>_delay_schedule_hours
   # calls (which silently failed while the device slept).
+  # ── b525: winter sleep ────────────────────────────────────────────
+  # Unlike the rain delay, these are NOT queued for a sleeping device: they
+  # act immediately or not at all, by design. Winterizing is a big, sticky
+  # state change (months of no watering, unit off the network), so it happens
+  # only when someone is looking at a device that is actually awake and can
+  # confirm the valve closed. If the unit is asleep the script says so and
+  # stops -- catch it in a wake window (default cadence: awake ~5 min every
+  # ~5 min) or press the button on the device's own web UI.
+  <<DEV_USC>>_winter_sleep:
+    alias: "irrigoto <<DEV_DASH>>: winter sleep (deep sleep until power-cycled)"
+    icon: mdi:snowflake
+    mode: single
+    sequence:
+      - choose:
+          - conditions:
+              - condition: not
+                conditions:
+                  - condition: state
+                    entity_id: binary_sensor.<<DEV_USC>>_irrigoto_online
+                    state: "on"
+            sequence:
+              - action: persistent_notification.create
+                data:
+                  title: "irrigoto <<DEV_DASH>>: not awake"
+                  notification_id: <<DEV_USC>>_winter_needs_awake
+                  message: >-
+                    <<DEV_DASH>> must be AWAKE to set winter sleep, and it is
+                    currently asleep. It wakes for a few minutes on its normal
+                    sleep cadence — watch "Online" on the Device tab and press
+                    the button again during a wake window, or press "Winter
+                    sleep" on the device's own web UI.
+              - stop: "device asleep"
+      # Awake: winterize now. The device acks, closes the valve, then drops off
+      # the network — so expect it to go unavailable seconds after this runs.
+      # continue_on_error: a non-2xx makes rest_command fail the step, and the
+      # 409 ("watering active") is exactly the case we want to REPORT rather
+      # than die on. Also covers the unit vanishing mid-request.
+      - action: rest_command.irrigoto_winter
+        data:
+          base_url: "<<DEV_URL>>"
+          winter_on: 1
+        response_variable: resp
+        continue_on_error: true
+      - choose:
+          - conditions:
+              - condition: template
+                value_template: >-
+                  {{ resp is not defined or (resp.status | default(0) | int(0)) != 200 }}
+            sequence:
+              - action: persistent_notification.create
+                data:
+                  title: "irrigoto <<DEV_DASH>>: winter sleep refused"
+                  notification_id: <<DEV_USC>>_winter_failed
+                  message: >-
+                    The device did not accept the winter-sleep request
+                    {{ '(a watering run is active — stop it first)'
+                       if resp is defined and (resp.status | default(0) | int(0)) == 409
+                       else '(no response — it may have gone back to sleep; try again during a wake window)' }}.
+              - stop: "refused"
+      - action: persistent_notification.dismiss
+        data:
+          notification_id: <<DEV_USC>>_winter_needs_awake
+      - action: logbook.log
+        data:
+          name: irrigoto
+          message: >-
+            <<DEV_DASH>>: WINTER SLEEP armed — valve closed, deep sleep with no
+            wake timer. Power-cycle (magnet swipe) to wake it; it then stays up
+            5 min before sleeping again. Scheduled watering is suspended.
+          domain: sensor
+          entity_id: sensor.<<DEV_USC>>_winter_sleep
+
+  # The HA-side escape hatch. The device web UI has the same button (it has to
+  # work with HA down), but during the 5-minute wake window this is the
+  # quickest way out of winter mode.
+  <<DEV_USC>>_winter_resume:
+    alias: "irrigoto <<DEV_DASH>>: resume normal operation (cancel winter sleep)"
+    icon: mdi:white-balance-sunny
+    mode: single
+    sequence:
+      - choose:
+          - conditions:
+              - condition: not
+                conditions:
+                  - condition: state
+                    entity_id: binary_sensor.<<DEV_USC>>_irrigoto_online
+                    state: "on"
+            sequence:
+              - action: persistent_notification.create
+                data:
+                  title: "irrigoto <<DEV_DASH>>: not awake"
+                  notification_id: <<DEV_USC>>_winter_needs_awake
+                  message: >-
+                    <<DEV_DASH>> must be AWAKE to cancel winter sleep. Power-cycle
+                    the unit (a magnet swipe on the Hall sensor works) — it stays
+                    awake 5 minutes, and this button works during that window.
+              - stop: "device asleep"
+      - action: rest_command.irrigoto_winter
+        data:
+          base_url: "<<DEV_URL>>"
+          winter_on: 0
+        continue_on_error: true
+      - action: persistent_notification.dismiss
+        data:
+          notification_id: <<DEV_USC>>_winter_needs_awake
+      - action: homeassistant.update_entity
+        target:
+          entity_id: sensor.<<DEV_USC>>_all_rest
+      - action: logbook.log
+        data:
+          name: irrigoto
+          message: >-
+            <<DEV_DASH>>: winter sleep cancelled — normal operation and
+            scheduled watering resume.
+          domain: sensor
+          entity_id: sensor.<<DEV_USC>>_winter_sleep
+
   <<DEV_USC>>_set_rain_delay:
     alias: "irrigoto <<DEV_DASH>>: set rain delay (hours, 0 = cancel)"
     icon: mdi:weather-pouring
@@ -1993,6 +2110,42 @@ template:
           {%- set du = state_attr('sensor.<<DEV_USC>>_schedule_rest','delay_until') | int(0) -%}
           {%- if du > as_timestamp(now()) | int -%}until {{ du | timestamp_custom('%Y-%m-%d %H:%M') }}{%- else -%}off{%- endif -%}
 
+  # b525: winter sleep state. Trigger-based on purpose: a winterized unit is
+  # OFF the network for months, so the REST poll is `unavailable` and a normal
+  # template sensor would render "unknown" all winter. Triggering only on real
+  # readings means the last value the device reported -- "Winterized" -- sticks
+  # until someone wakes it and it reports otherwise.
+  - trigger:
+      - trigger: state
+        entity_id: sensor.<<DEV_USC>>_all_rest
+        attribute: winter
+      - trigger: state
+        entity_id: sensor.<<DEV_USC>>_all_rest
+        not_to: ["unavailable", "unknown", "none"]
+      - trigger: homeassistant
+        event: start
+    sensor:
+      - name: "<<DEV_DASH>> Winter Sleep"
+        unique_id: <<DEV_USC>>_winter_sleep
+        default_entity_id: sensor.<<DEV_USC>>_winter_sleep
+        icon: >-
+          {%- if state_attr('sensor.<<DEV_USC>>_all_rest','winter') -%}mdi:snowflake
+          {%- else -%}mdi:white-balance-sunny{%- endif -%}
+        state: >-
+          {%- set prev = states('sensor.<<DEV_USC>>_winter_sleep') -%}
+          {%- if states('sensor.<<DEV_USC>>_all_rest') in ['unavailable','unknown','none'] -%}
+            {#- No reading: keep what the device last told us. A fresh install
+                whose device is already asleep has no previous value -- show
+                'off' rather than 'unknown'. -#}
+            {{ 'off' if prev in ['unavailable','unknown','none',''] else prev }}
+          {%- elif state_attr('sensor.<<DEV_USC>>_all_rest','winter') -%}winterized
+          {%- else -%}off{%- endif -%}
+        attributes:
+          # Seconds left in the current wake window (0 when not in one). Only
+          # meaningful while the unit is actually awake and reachable.
+          window_left_s: >-
+            {{ state_attr('sensor.<<DEV_USC>>_all_rest','winter_left_s') | int(0) }}
+
   # b524: HA-side rain delay (desired state + sync status). This is what the
   # dashboard shows and gates its buttons on: it reflects what the user asked
   # for even while the device sleeps. `sync` says whether the device has it:
@@ -2125,6 +2278,8 @@ sensor:
       - last_sleep_reason
       - water_vol_l       # b503: live run volume dispensed (L)
       - water_vol_est_l   # b503: expected run volume (L)
+      - winter            # b525: winter sleep armed
+      - winter_left_s     # b525: seconds left in the wake window
       - zones
   - platform: rest
     name: <<DEV_USC>>_cal_rest

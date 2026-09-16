@@ -261,6 +261,20 @@ rest_command:
   # {ok, applied, delay_until, delay_lm} either way, so the caller can adopt
   # the device's values when it lost. Used by the per-device
   # sync_rain_delay automation; caller passes base_url (the device URL).
+  # b525: winter sleep. on=1 winterizes (valve closed, then deep sleep with NO
+  # wake source -- only a power cycle revives it); on=0 cancels winter mode.
+  # The device must be AWAKE: the per-device winter_sleep / winter_resume
+  # scripts check binary_sensor.<slug>_irrigoto_online first and notify
+  # instead of firing this blind. Answers {ok, winter, left_s, window_s}, or
+  # 409 if a watering run is in progress.
+  # NOTE the variable is winter_on, not `on`: a bare `on:` key in the caller's
+  # data block is YAML 1.1 BOOLEAN True, so the variable never arrives and the
+  # URL template renders undefined. Same family of trap as the `initial: ""`
+  # and native-type CSV gotchas elsewhere in this config.
+  irrigoto_winter:
+    url: "{{ base_url }}/api/winter?on={{ winter_on }}"
+    method: POST
+    timeout: 15
   irrigoto_sync_delay:
     url: "{{ base_url }}/api/schedule/delay"
     method: POST

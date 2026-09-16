@@ -1122,6 +1122,51 @@ views:
             tap_action:
               action: url
               url_path: http://<<DEV_DASH>>.local
+      # b525: winter sleep. Both buttons need the device AWAKE -- the scripts
+      # check and raise a persistent notification rather than failing silently.
+      # Winter sleep = deep sleep with no wake timer; only a power cycle (a
+      # magnet swipe on the Hall sensor counts) brings it back, and it then
+      # stays up 5 minutes before sleeping again. The device's own web UI
+      # carries the same cancel button for when HA can't reach it.
+      - type: vertical-stack
+        cards:
+          - type: entities
+            title: Winter sleep
+            show_header_toggle: false
+            entities:
+              - entity: sensor.<<DEV_USC>>_winter_sleep
+                name: Winter sleep
+              - type: attribute
+                entity: sensor.<<DEV_USC>>_winter_sleep
+                attribute: window_left_s
+                name: Wake window left (s)
+          # Both buttons are always shown. The awake requirement is NOT
+          # advertised up front on purpose -- it only surfaces if you press a
+          # button while the unit happens to be asleep, as a persistent
+          # notification raised by the script itself.
+          - type: horizontal-stack
+            cards:
+              - type: button
+                name: Winter sleep
+                icon: mdi:snowflake
+                icon_height: 28px
+                tap_action:
+                  action: perform-action
+                  perform_action: script.<<DEV_USC>>_winter_sleep
+                  confirmation:
+                    text: >-
+                      Put <<DEV_DASH>> into WINTER SLEEP? The valve closes and the
+                      unit deep-sleeps with no wake timer — only a power cycle
+                      wakes it, and scheduled watering stops until you cancel.
+              - type: button
+                name: Resume normal
+                icon: mdi:white-balance-sunny
+                icon_height: 28px
+                tap_action:
+                  action: perform-action
+                  perform_action: script.<<DEV_USC>>_winter_resume
+                  confirmation:
+                    text: "Cancel winter sleep on <<DEV_DASH>> and resume normal operation?"
       - type: entities
         title: Zone backup
         show_header_toggle: false

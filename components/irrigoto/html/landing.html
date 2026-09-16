@@ -152,6 +152,19 @@ section{margin-bottom:18px;}
 </header>
 <!-- b490: shown when the saved pressure cal was finished on the await timeout
      with throw anchors inherited from the previous cal instead of measured. -->
+<!-- b525: winter-sleep banner. This is the no-HA escape hatch -- if the unit
+     comes up winterized, the countdown and the cancel button are the first
+     things on the page. -->
+<div id="winter-banner" style="display:none;margin:8px 12px;padding:10px 12px;
+     border:1px solid #60a5fa;border-radius:6px;background:rgba(96,165,250,0.12);
+     color:#60a5fa;font-size:13px;font-weight:600;text-align:center;">
+  &#10052; Winter sleep active &mdash; sleeping again in
+  <span id="winter-left">&mdash;</span>
+  <div style="margin-top:8px">
+    <button class="btn" style="border-color:#60a5fa;color:#60a5fa"
+            onclick="exitWinter()">Resume normal operation</button>
+  </div>
+</div>
 <div id="cal-incomplete" style="display:none;margin:8px 12px;padding:8px 12px;
      border:1px solid #f87171;border-radius:6px;background:rgba(248,113,113,0.12);
      color:#f87171;font-size:13px;font-weight:600;text-align:center;">
@@ -202,9 +215,15 @@ section{margin-bottom:18px;}
           <span class="theme-slider"></span>
         </label>
       </div>
+      <div class="dev-row" title="Off-season hibernation: deep sleep with no wake timer">
+        <span class="dev-label">Winter sleep</span><span class="dev-val" id="d-winter">Off</span>
+      </div>
       <div class="zone-actions" style="margin-top:10px">
         <button class="btn" id="ap-mode-btn" onclick="apMode()">&#128246; AP Setup Mode</button>
         <button class="btn" id="reconnect-btn" style="display:none" onclick="reconnectNet()">&#128268; Reconnect to network</button>
+      </div>
+      <div class="zone-actions" style="margin-top:10px">
+        <button class="btn" id="winter-btn" onclick="enterWinter()">&#10052; Winter sleep</button>
       </div>
     </div>
   </section>
@@ -475,6 +494,33 @@ async function apMode(){
   try{ const d=await fetch('/wifi/ap_mode',{method:'POST'}).then(r=>r.json()); alert(d.msg||'AP mode enabled. Join the device WiFi, then open http://192.168.4.1'); }
   catch(e){ alert('AP mode requested. Join the device WiFi, then open http://192.168.4.1'); }
 }
+// b525: winter sleep. Arming it drops the unit off the network immediately,
+// so there's no success response to wait for -- confirm hard, then tell the
+// user what to expect. Cancelling is the escape hatch that must work with HA
+// down, which is why it lives here and not only in the dashboard.
+async function enterWinter(){
+  const msg = `Put this unit into WINTER SLEEP?
+
+The valve closes, then the device deep-sleeps with NO wake timer. Only a power cycle wakes it (a magnet swipe on the Hall sensor counts).
+
+On each wake it stays up 5 minutes so you can resume normal operation, then sleeps again. Scheduled watering will NOT run until you cancel winter sleep.`;
+  if(!confirm(msg)) return;
+  try{
+    const d=await fetch('/api/winter?on=1',{method:'POST'}).then(r=>r.json());
+    if(d && d.ok===false){ alert('Could not winterize: '+(d.error||'unknown error')); return; }
+    alert('Winter sleep armed. The device is closing the valve and going to sleep — it will drop off the network now.');
+  }catch(e){
+    alert('Winter sleep requested. The device is dropping off the network.');
+  }
+}
+async function exitWinter(){
+  try{
+    const d=await fetch('/api/winter?on=0',{method:'POST'}).then(r=>r.json());
+    if(d && d.winter===false)
+      alert('Winter sleep cancelled. Normal operation and scheduled watering resume.');
+  }catch(e){ alert('Could not reach the device — try again.'); }
+  refresh();
+}
 async function reconnectNet(){
   if(!confirm('Reboot and reconnect to your home WiFi network?')) return;
   try{ await fetch('/wifi/reconnect',{method:'POST'}); }catch(e){}
@@ -501,6 +547,7 @@ async function refresh(){
     const dlEl=document.getElementById('d-detail');
     dlEl.textContent=d.detail_log?'On':'Off';
     dlEl.style.color=d.detail_log?'var(--green)':'var(--text-mid)';
+    renderWinter(d.winter, d.winter_left_s);
     // Update device name (skip if user is editing)
     const dni=document.getElementById('dev-name-inp');
     if(d.device_name&&dni&&!dni.matches(':focus')&&dni.value!==d.device_name){
@@ -510,6 +557,26 @@ async function refresh(){
     renderZones(d.zones);
     updateWateringState(d.watering, d.water_mode, d.water_est_min, d.water_zone_id, d.cleanup_pass||0);
   }catch(e){ dot(false); }
+}
+
+// b525: winter state -> banner + Device-card row. left_s counts down the
+// awake window; it comes straight off /api/all so the poll cadence drives it.
+function renderWinter(winter, leftS){
+  const row=document.getElementById('d-winter');
+  const ban=document.getElementById('winter-banner');
+  const btn=document.getElementById('winter-btn');
+  if(winter===undefined) return;   // older firmware: leave the row alone
+  if(row){
+    row.textContent=winter?'Active':'Off';
+    row.style.color=winter?'#60a5fa':'var(--text-mid)';
+  }
+  if(ban) ban.style.display=winter?'block':'none';
+  if(btn) btn.style.display=winter?'none':'';
+  if(winter){
+    const s=Math.max(0,leftS|0);
+    const el=document.getElementById('winter-left');
+    if(el) el.textContent=Math.floor(s/60)+':'+String(s%60).padStart(2,'0');
+  }
 }
 
 let activeWaterZoneId = -1;

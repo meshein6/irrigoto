@@ -344,6 +344,48 @@ void irrigoto_set_auto_sleep_enabled(bool enabled);
 bool irrigoto_get_auto_sleep_enabled(void);
 
 /**
+ * b525: WINTER SLEEP — off-season hibernation.
+ *
+ * irrigoto_set_winter_sleep(true) persists the intent and asks the ESPHome
+ * loop to enter a deep sleep with NO wake source armed. Only a power cycle
+ * revives the unit; on OtO hardware the Hall sensor interrupts power, so a
+ * magnet swipe is the intended wake gesture (docs/oto_pin_summary.md).
+ *
+ * Because the flag is persisted, the wake boot lands back in winter mode:
+ * check_battery_on_boot() applies the usual BATT_MIN_VOLTAGE_V gate (a flat
+ * pack goes straight back to sleep_forever_quiet), and on a healthy pack
+ * irrigoto_winter_arm_wake_window() gives the operator a 5-minute awake
+ * window — WiFi, HA and the web UI all up — to call
+ * irrigoto_set_winter_sleep(false). If nobody does, check_inactivity() calls
+ * irrigoto_enter_winter_sleep() again when the window expires.
+ *
+ * Scheduled watering is suppressed for as long as the flag is set.
+ */
+void     irrigoto_set_winter_sleep(bool on);
+bool     irrigoto_get_winter_sleep(void);
+/** Seconds left in the current winter wake window (0 if not in one). */
+uint32_t irrigoto_winter_window_left_s(void);
+/** Arm the wake window at boot. No-op unless the persisted flag is set. */
+void     irrigoto_winter_arm_wake_window(void);
+/** Ask the ESPHome loop to enter winter sleep on its next tick (b526). */
+void     irrigoto_request_winter_sleep(const char *reason);
+/** The reason passed to the pending request ("requested" if none). */
+const char *irrigoto_winter_reason(void);
+/** True once a winter sleep has been requested; the ESPHome loop consumes it. */
+bool     irrigoto_winter_sleep_pending(void);
+/**
+ * b526: two-step entry so the ESPHome component can run its clean teardown
+ * (run_safe_shutdown_hooks / teardown_components / run_powerdown_hooks) in
+ * between -- without it HA keeps showing a winterized unit ONLINE until TCP
+ * times out. _prepare returns false if another task already owns the sleep;
+ * _finish disarms every wake source and never returns.
+ */
+bool     irrigoto_prepare_winter_sleep(const char *reason);
+void     irrigoto_finish_winter_sleep(void);
+/** prepare + finish, for the standalone build with no component loop. */
+void     irrigoto_enter_winter_sleep(const char *reason);
+
+/**
  * Request a deep sleep with timer wake after `duration_s` seconds.
  * duration_s = 0 -> use the configured default (irrigoto_get_sleep_duration_s).
  *

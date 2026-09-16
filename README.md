@@ -1,10 +1,11 @@
 # irrigoto
 
 ESP-IDF + ESPHome firmware for the OtO sprinkler. Provides zone-based
-watering with multiple spray modes (smooth / pulse / gentle / chase),
-pressure and throw calibration, scheduling, OTA updates, a built-in web
-UI, and integrates with Home Assistant via the native ESPHome API. A
-Lovelace heatmap card visualizes per-zone watering depth.
+watering in [several spray modes](#watering-modes) (pulse, gentle, smooth,
+serpentine, chase), pressure and throw calibration, scheduling with rain
+delay, [winter sleep](#winter-sleep), OTA updates, a built-in web UI, and
+integrates with Home Assistant via the native ESPHome API. A Lovelace heatmap
+card visualizes per-zone watering depth.
 
 ## ⚠ Use at your own risk
 
@@ -172,6 +173,68 @@ a new HA service or sensor only needs to be edited in one place.
 Once flashed, the device announces itself to Home Assistant via the
 native ESPHome API. See [Home Assistant integration](#home-assistant-integration)
 to load the template sensors, automations, and heatmap dashboard.
+
+## Watering modes
+
+A mode is a watering *style* — how the stream is swept over the zone and how
+the requested depth is delivered. Pick one per run (web UI water modal, HA
+dashboard, or a schedule entry). Depth is in eighths of an inch.
+
+| Mode | Web digit | What it does |
+| ---- | --------- | ------------ |
+| **Pulse 1/8"** | `1` | One pass, ~13 min. Ring-by-ring sweep, valve stepped per ring. The simplest mode and the default. |
+| **Pulse 1/4"** | `2` | One pass at double depth, ~26 min. |
+| **Pulse 1/8" ×2** | `3` | Two passes of 1/8", ~26 min. Two lighter applications instead of one heavy one — less runoff on slopes. |
+| **Gentle 1/8"** | `5` | 5 passes, seed-safe. Low pressure held by closed-loop control so the stream doesn't dig in. For new seed and bare soil. |
+| **Gentle 1/4"** | `6` | 10 passes, seed-safe. Same idea, double depth. |
+| **Smooth 1/8"** | `7` | Multipass, open-loop. Aggregates delivery across passes and re-aims at what's still short, rather than re-running the whole zone. |
+| **Serpentine 1/8"** | `8` | Multipass continuous glide. The nozzle never stops — a boustrophedon sweep with the valve fed forward from the supply trend, which avoids the pressure hunting the stepped modes can show on a well/pressure-tank supply. |
+| **Chase** | `c` | Play mode, 1–10 min. Sweeps for a dog to chase. Not a watering mode — no depth accounting. |
+| **Demo** | `d` | Max-speed sweep for demonstrations. |
+
+Pulse digit `4` (1/4" over two passes) is accepted by `POST /zone/water` but
+isn't offered in the UI. When a run supplies an explicit depth — as the web UI,
+HA and the scheduler all do — the depth argument wins and pulse simply repeats
+the 1/8" pass that many times, so the digit's built-in depth only matters to a
+hand-rolled request that omits it.
+
+Schedule entries and the HA select use their own numbering — `0` Pulse,
+`1` Gentle, `2` Smooth, `3` Serpentine — which the firmware translates to the
+web digit. If you add a mode, `docs/adding_a_watering_mode.md` lists every
+place a mode list is hardcoded.
+
+## Winter sleep
+
+Off-season hibernation. The device closes and pressure-verifies the valve,
+then deep-sleeps with **no wake source armed** — no RTC timer, nothing. Only a
+power cycle revives it, and because the Hall sensor interrupts power on this
+hardware, a magnet swipe at the unit is the intended wake gesture. Nothing has
+to be opened or unplugged.
+
+```
+POST /api/winter?on=1     # winterize now (409 if a run is active)
+POST /api/winter?on=0     # cancel, resume normal operation
+GET  /api/winter          # {"winter":bool,"left_s":N,"window_s":300}
+```
+
+On each wake the unit boots normally — WiFi, Home Assistant and the web UI all
+come up — and stays awake for **5 minutes** so you can cancel, then goes back
+to sleep. Scheduled watering is suppressed for as long as winter sleep is set,
+so a wake can't fire a run into a drained system.
+
+Battery is gated by the normal boot check: below 3.6 V the unit returns to
+sleep without powering the motors, so a winter wake on a flat pack can't
+strand it awake.
+
+To cancel, use either:
+
+- the **device web UI** — a banner with a countdown and a "Resume normal
+  operation" button appears at the top of the landing page whenever the unit
+  is winterized. This works with Home Assistant down, and is the escape hatch
+  to reach for if anything else fails.
+- the **Home Assistant** dashboard — Winter sleep card on the Device tab.
+  Both its buttons need the device awake; press one while it's asleep and you
+  get a notification saying so rather than a silent no-op.
 
 ## Home Assistant integration
 

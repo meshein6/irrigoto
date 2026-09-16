@@ -300,3 +300,37 @@ POST /api/fault_hold?min=0      # back to the default: no hold
 The setting is persisted in NVS and reported in `/api/all` as
 `fault_hold_min`. Default is 0 (no hold) because the hold costs battery on
 every fault.
+
+## Winter sleep (build 525+)
+
+Off-season hibernation. The unit closes and pressure-verifies the valve, then
+deep-sleeps with **no wake source armed** — no RTC timer, nothing. Only a power
+cycle revives it, and on this hardware the Hall sensor interrupts power, so a
+magnet swipe at the unit is the intended wake gesture (see
+[oto_pin_summary.md](oto_pin_summary.md)).
+
+```
+POST /api/winter?on=1     # winterize now (409 if a run is active)
+POST /api/winter?on=0     # cancel winter mode, resume normal operation
+GET  /api/winter          # {"winter":bool,"left_s":N,"window_s":300}
+```
+
+The flag is persisted in NVS (`OtO`/`pm_winter`) and reported in `/api/all` as
+`winter` / `winter_left_s`, so the wake boot lands back in winter mode:
+
+1. `check_battery_on_boot()` applies the usual gate first — below
+   `BATT_MIN_VOLTAGE_V` (3.6 V) the unit goes straight back to
+   `sleep_forever_quiet()` without touching the motors. A winter wake on a
+   flat pack dies the same quiet death as any other low-battery boot.
+2. On a healthy pack it boots **normally** — WiFi, HA and the web UI all come
+   up — and holds awake for 5 minutes regardless of the inactivity or
+   auto-sleep settings.
+3. If nobody cancels within that window, it re-enters winter sleep.
+
+Scheduled watering is suppressed for as long as the flag is set, so a winter
+wake can't fire a run into a drained system.
+
+Cancel it from the device's own web UI (landing page — a banner with a
+countdown and a "Resume normal operation" button appears at the top whenever
+the unit is winterized) or from the HA dashboard's Device tab. The web UI is
+the authoritative escape hatch: it works with HA down.

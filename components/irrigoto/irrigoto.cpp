@@ -56,6 +56,33 @@ void IrrigotoComponent::loop() {
     }
     prev_cal_state_ = cur_cal;
 
+    // b525: winter sleep handoff. Checked BEFORE the timed-sleep request:
+    // this one must NOT go through ESPHome's deep_sleep component, which
+    // always arms an RTC timer. Winter sleep is defined by having no wake
+    // source at all.
+    //
+    // b526: but bypassing deep_sleep also skipped its teardown, and that
+    // teardown is what makes HA notice. deep_sleep's own comment: "critical to
+    // teardown components cleanly for deep sleep to ensure Home Assistant sees
+    // a clean disconnect instead of marking the device unavailable". Without
+    // it a winterized unit went dark mid-connection and HA kept showing it
+    // ONLINE until TCP timed out -- which looks exactly like the button having
+    // done nothing. So run the same three hooks here, between closing the
+    // valve and actually sleeping. Both entry paths (this one and the idle
+    // task's window expiry) funnel through here for that reason.
+    if (irrigoto_winter_sleep_pending()) {
+        ESP_LOGW(TAG, "Winter sleep requested -- deep sleep with no wake source");
+        if (irrigoto_prepare_winter_sleep(irrigoto_winter_reason())) {
+            // Matches deep_sleep_component.cpp's TEARDOWN_TIMEOUT_DEEP_SLEEP_MS
+            // (file-static there, so duplicated rather than included).
+            static const uint32_t TEARDOWN_TIMEOUT_MS = 5000;
+            App.run_safe_shutdown_hooks();
+            App.teardown_components(TEARDOWN_TIMEOUT_MS);
+            App.run_powerdown_hooks();
+            irrigoto_finish_winter_sleep();   // never returns
+        }
+    }
+
     // Sleep request handoff. Polled every loop tick (not gated by the
     // publish interval) so the device sleeps promptly after a request.
     uint32_t sleep_dur_s = 0;

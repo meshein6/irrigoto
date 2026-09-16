@@ -211,6 +211,26 @@ static uint32_t      s_dwell_timeout_ms = 30000u;               // NVS "pm_dwell
 // Last sleep reason published to HA on boot (text_sensor "Last sleep reason").
 // Set just before each sleep entry, persisted in NVS as "pm_reason".
 static char          s_last_sleep_reason[32] = "";
+// b525: WINTER SLEEP -- off-season hibernation. When set, the unit deep-sleeps
+// with NO wake source armed (the sleep_forever path): only a power cycle
+// revives it, and on this hardware the Hall sensor interrupts power, so a
+// magnet swipe is the intended "power cycle" (see docs/oto_pin_summary.md).
+// The flag is persisted, so the wake boot lands back in winter mode: the unit
+// comes up normally (WiFi, HA, web UI) for WINTER_WAKE_WINDOW_S so someone can
+// cancel winter mode, then goes straight back to forever-sleep. Scheduled
+// watering is suppressed for as long as the flag is set. NVS "pm_winter".
+// Battery gating is the EXISTING boot gate: check_battery_on_boot() already
+// forever-sleeps below BATT_MIN_VOLTAGE_V before this window is ever armed,
+// so a winter wake on a flat pack dies in the same quiet path as any other.
+static bool          s_winter_sleep    = false;              // NVS "pm_winter"
+#define WINTER_WAKE_WINDOW_S 300u   // 5 min awake per winter wake
+// Tick at which the winter wake window expires (0 = not in one).
+static TickType_t    s_winter_wake_deadline = 0;
+// Set by the /api/winter POST; consumed by the ESPHome component loop, which
+// calls irrigoto_enter_winter_sleep() so the HTTP response goes out first.
+static volatile bool s_winter_sleep_requested = false;
+// b526: why we're winterizing, carried from the requester to the loop.
+static char          s_winter_reason[32] = "";
 // Web UI theme. true=dark (legacy default), false=light. NVS key "ui_theme".
 static bool          s_theme_dark      = true;
 static int s_nozzle_last_dir = 0;  // +1=CW, -1=CCW, 0=unknown
@@ -3687,6 +3707,7 @@ static void sched_fire_mark(uint32_t epoch);    // fwd; defined far below
 static void sched_fire_save(void);              // fwd; defined far below
 static void sched_fire_set_inprogress(uint32_t epoch, uint16_t zone);  // b452 fwd
 static void sched_fire_clear_inprogress(void);  // b452 fwd
+static void sched_fire_disarm(void);            // b525 fwd
 static inline void sched_note_flow_started(void) {
     if (s_active_sched_epoch) {
         sched_fire_set_inprogress(s_active_sched_epoch, s_active_sched_zone);  // b452
@@ -6217,6 +6238,64 @@ static void sleep_forever(const char *reason)
     esp_deep_sleep_start();
 }
 
+// b525: winter sleep entry. Same no-wake-source sleep as sleep_forever(), but
+// reached from a RUNNING system -- so unlike the boot-time paths we must
+// actively DISARM the RTC timer. ESPHome's deep_sleep component and every
+// normal nap call esp_sleep_enable_timer_wakeup() before sleeping, and that
+// config survives in the RTC domain; entering winter sleep without clearing it
+// would leave the unit waking on the stale timer all winter. Never returns.
+static volatile bool s_winter_entering = false;
+
+// b526: split in two so the ESPHome component can run its clean teardown
+// BETWEEN them. ESPHome's own deep_sleep does
+// run_safe_shutdown_hooks + teardown_components + run_powerdown_hooks before
+// sleeping, with the comment "critical ... to ensure Home Assistant sees a
+// clean disconnect instead of marking the device unavailable". b525 bypassed
+// deep_sleep (it always arms a timer) and lost the teardown with it, so a
+// winterized unit went dark without saying goodbye and HA showed it ONLINE
+// until the TCP connection timed out. Reported from the field on the first
+// real winterize.
+//
+// Returns true if this caller owns the sleep. Two tasks can reach here -- the
+// loop consuming an /api/winter request and the idle task at window expiry --
+// and prepare_for_sleep() drives the valve motor, which must never run from
+// two tasks at once. First caller wins; the other gets false and backs off.
+bool irrigoto_prepare_winter_sleep(const char *reason)
+{
+    if (s_winter_entering) return false;
+    s_winter_entering = true;
+    s_winter_sleep_requested = false;
+    ESP_LOGW(TAG, "WINTER SLEEP: %s -- deep sleep with no wake source. "
+                  "Power-cycle (magnet / Hall reset) to wake; the unit then "
+                  "stays awake %u min before re-sleeping.",
+             reason ? reason : "requested", (unsigned)(WINTER_WAKE_WINDOW_S / 60u));
+    pm_record_reason("winter");
+    // Don't let an armed scheduled run fire on the next wake -- a winter wake
+    // is for maintenance, not watering (the schedule task is gated on the
+    // winter flag too, but clear the intent so nothing survives a cancel).
+    sched_fire_disarm();
+    prepare_for_sleep();   // closes + pressure-verifies the valve, rails down
+    return true;
+}
+
+// Never returns. Call only after irrigoto_prepare_winter_sleep() returned true.
+void irrigoto_finish_winter_sleep(void)
+{
+    // Unlike the boot-time sleep_forever paths, we get here from a RUNNING
+    // system where the RTC timer has already been armed (every nap, and
+    // ESPHome's deep_sleep, call esp_sleep_enable_timer_wakeup). That config
+    // lives in the RTC domain and would wake the unit all winter.
+    esp_sleep_disable_wakeup_source(ESP_SLEEP_WAKEUP_ALL);
+    esp_deep_sleep_start();
+}
+
+// Standalone (non-ESPHome) path: no component loop to run a teardown on.
+void irrigoto_enter_winter_sleep(const char *reason)
+{
+    if (!irrigoto_prepare_winter_sleep(reason)) return;
+    irrigoto_finish_winter_sleep();
+}
+
 // b347: persistent boot diagnostics. Captures what the boot-time battery +
 // valve checks observed and writes the record to NVS BEFORE the device can
 // reach the working state (and BEFORE sleep_forever_quiet on a low-battery
@@ -6756,6 +6835,32 @@ static void check_inactivity(void)
 {
     if (s_last_activity == 0) return;  // not yet initialised
     if (s_ota_in_progress) return;  // never sleep during OTA
+    // b525: winter mode owns the sleep decision -- the unit holds awake for
+    // the whole WINTER_WAKE_WINDOW_S (so HA and the web UI get a reliable
+    // window to cancel, no matter what the inactivity knob says) and then
+    // goes back to forever-sleep rather than taking a timed nap. Deliberately
+    // ABOVE the s_sleep_disabled check: auto-sleep off must not strand a
+    // winterized unit awake until the battery flattens. The watering / cal /
+    // frame-sweep guards below are re-tested here so a winter re-sleep can't
+    // cut off work started during the window.
+    if (s_winter_sleep) {
+        if (s_winter_wake_deadline == 0) return;            // window not armed
+        if ((int32_t)(xTaskGetTickCount() - s_winter_wake_deadline) < 0) return;
+        if (s_web_water_mode != 0 || s_frame_sweep_active) return;
+        if (s_wcal.state == WCAL_PRESSURE_SCANNING        ||
+            s_wcal.state == WCAL_PRESSURE_AWAIT_THROW     ||
+            s_wcal.state == WCAL_PRESSURE_AWAIT_THROW_LOW ||
+            s_wcal.state == WCAL_NOZZLE_RUNNING           ||
+            s_wcal.state == WCAL_JOG_RUNNING) return;
+#ifdef ESPHOME_COMPONENT
+        // b526: don't sleep from this task -- hand it to the component loop,
+        // which tears the API down cleanly first so HA sees the disconnect.
+        irrigoto_request_winter_sleep("wake window expired");
+#else
+        irrigoto_enter_winter_sleep("wake window expired");  // never returns
+#endif
+        return;
+    }
     if (s_sleep_disabled)  return;  // user disabled auto-sleep
     // b490: NEVER sleep mid-calibration. A cal holds the valve OPEN while the
     // operator measures, the cal task has already exited at the await steps, and
@@ -15664,10 +15769,16 @@ static esp_err_t api_all_handler(httpd_req_t *req)
     // Static DRAM sits at ~97% of its *segment* (b485 build: 175784/180736)
     // but that segment is static data only -- these counters measure the
     // separate ~150KB heap pool, which is what actually ran out.
+    // b525: winter fields ride in THIS chunk, not the head one -- b522 widened
+    // the head past its buffer and streamed garbage for 25 min (see b523).
     n = snprintf(buf, sizeof(buf),
         ",\"water_vol_l\":%.1f,\"water_vol_est_l\":%.1f,"   // b503: live run progress
+        "\"winter\":%s,\"winter_left_s\":%lu,\"winter_window_s\":%lu,"  // b525
         "\"heap_free\":%lu,\"heap_min_free\":%lu,\"heap_largest\":%lu,\"zones\":[",
         s_water_vol_disp_l, s_water_vol_exp_l,
+        s_winter_sleep ? "true" : "false",
+        (unsigned long)irrigoto_winter_window_left_s(),
+        (unsigned long)WINTER_WAKE_WINDOW_S,
         (unsigned long)esp_get_free_heap_size(),
         (unsigned long)esp_get_minimum_free_heap_size(),
         (unsigned long)heap_caps_get_largest_free_block(MALLOC_CAP_8BIT));
@@ -15931,6 +16042,50 @@ static esp_err_t api_uart_log_handler(httpd_req_t *req)
 }
 
 // b522: post-fault awake hold knob. GET reads, POST min=N sets (persisted).
+// b525: GET /api/winter -> {"winter":bool,"left_s":N,"window_s":300}
+// POST /api/winter?on=1 -> winterize: persist the flag, close + verify the
+//   valve, then deep-sleep with NO wake source. Only a power cycle wakes it
+//   (the Hall sensor interrupts power on this hardware, so a magnet swipe
+//   counts). The response is sent BEFORE the sleep -- the caller gets an ack,
+//   then the unit drops off the network.
+// POST /api/winter?on=0 -> cancel winter mode and resume normal operation.
+//   This is the escape hatch that has to work WITHOUT HA, which is why it's
+//   on the device web UI too (landing page, Device card).
+// Refuses to winterize mid-run: stop the watering first, otherwise the
+// caller can't tell the "valve closed cleanly" ack from a cut-short run.
+static esp_err_t api_winter_handler(httpd_req_t *req)
+{
+    if (req->method == HTTP_POST) {
+        char qs[48]={0}; httpd_req_get_url_query_str(req, qs, sizeof(qs));
+        char val[4]={0};
+        bool have_on = (httpd_query_key_value(qs, "on", val, sizeof(val)) == ESP_OK && val[0]);
+        if (!have_on) {
+            httpd_resp_set_status(req, "400 Bad Request");
+            httpd_resp_set_type(req, "application/json");
+            httpd_resp_sendstr(req, "{\"ok\":false,\"error\":\"need on=0|1\"}");
+            return ESP_OK;
+        }
+        bool on = (val[0] == '1');
+        if (on && s_web_water_mode != 0) {
+            httpd_resp_set_status(req, "409 Conflict");
+            httpd_resp_set_type(req, "application/json");
+            httpd_resp_sendstr(req,
+                "{\"ok\":false,\"error\":\"watering active -- stop the run first\"}");
+            return ESP_OK;
+        }
+        irrigoto_set_winter_sleep(on);
+    }
+    char resp[160];
+    snprintf(resp, sizeof(resp),
+             "{\"ok\":true,\"winter\":%s,\"left_s\":%lu,\"window_s\":%lu}",
+             s_winter_sleep ? "true" : "false",
+             (unsigned long)irrigoto_winter_window_left_s(),
+             (unsigned long)WINTER_WAKE_WINDOW_S);
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_sendstr(req, resp);
+    return ESP_OK;
+}
+
 static esp_err_t api_fault_hold_handler(httpd_req_t *req)
 {
     if (req->method == HTTP_POST) {
@@ -18372,7 +18527,7 @@ static void zone_web_start(void)
     httpd_config_t cfg   = HTTPD_DEFAULT_CONFIG();
     cfg.server_port      = ZONE_WEB_PORT;
     cfg.ctrl_port        = ZONE_WEB_CTRL_PORT;
-    cfg.max_uri_handlers  = 74;  // b522: 72 -> 74 (/api/fault_hold GET+POST); b512: 70 -> 72 (/api/uart_log GET+POST); b489: 68 -> 70, keeping the 2-slot margin over
+    cfg.max_uri_handlers  = 76;  // b525: 74 -> 76 (/api/winter GET+POST); b522: 72 -> 74 (/api/fault_hold GET+POST); b512: 70 -> 72 (/api/uart_log GET+POST); b489: 68 -> 70, keeping the 2-slot margin over
                                  // the _Static_assert below.
                                  // MUST be set before httpd_start (cfg is copied there);
                                  // headroom over uris[] count -- _Static_assert below guards it.
@@ -18407,6 +18562,8 @@ static void zone_web_start(void)
         {.uri="/api/detail_log",  .method=HTTP_GET,  .handler=api_detail_log_handler},
         {.uri="/api/uart_log",    .method=HTTP_GET,  .handler=api_uart_log_handler},   // b512
         {.uri="/api/uart_log",    .method=HTTP_POST, .handler=api_uart_log_handler},   // b512
+        {.uri="/api/winter",      .method=HTTP_GET,  .handler=api_winter_handler},     // b525
+        {.uri="/api/winter",      .method=HTTP_POST, .handler=api_winter_handler},     // b525
         {.uri="/api/fault_hold",  .method=HTTP_GET,  .handler=api_fault_hold_handler}, // b522
         {.uri="/api/fault_hold",  .method=HTTP_POST, .handler=api_fault_hold_handler}, // b522
         {.uri="/api/cal",         .method=HTTP_GET,  .handler=api_cal_handler},
@@ -18465,7 +18622,7 @@ static void zone_web_start(void)
         {.uri="/fs/upload",             .method=HTTP_POST, .handler=fs_upload_handler},
         {.uri="/fs/delete",             .method=HTTP_POST, .handler=fs_delete_handler},
     };
-    _Static_assert(sizeof(uris)/sizeof(uris[0]) <= 72,   // b522: 70 -> 72 (/api/fault_hold GET+POST); b512: 68 -> 70 (/api/uart_log GET+POST); b489: 66 -> 68
+    _Static_assert(sizeof(uris)/sizeof(uris[0]) <= 74,   // b525: 72 -> 74 (/api/winter GET+POST); b522: 70 -> 72 (/api/fault_hold GET+POST); b512: 68 -> 70 (/api/uart_log GET+POST); b489: 66 -> 68
                    "uris[] exceeds cfg.max_uri_handlers -- raise it before httpd_start");
     for (size_t i = 0; i < sizeof(uris)/sizeof(uris[0]); i++)
         httpd_register_uri_handler(s_zone_server, &uris[i]);
@@ -18671,8 +18828,11 @@ void irrigoto_init(void)
 
     pm_nvs_load();        // restore auto_sleep + thresholds + last reason
     valve_offset_nvs_load();  // b389: per-unit valve frame, BEFORE boot valve-close
-    check_battery_on_boot();
+    check_battery_on_boot();   // b525: also the winter-wake battery gate --
+                               // forever-sleeps below BATT_MIN_VOLTAGE_V
+                               // before the wake window is ever armed
     log_wake_cause();
+    irrigoto_winter_arm_wake_window();   // b525: no-op unless winterized
 
     xTaskCreate(led_blink_task, "led_blink", 2048, NULL, 5, NULL);
 
@@ -20617,10 +20777,13 @@ static void schedule_task(void *arg)
     (void)arg;
     // b437: clock-independent intent fire first -- a wake armed for a run
     // waters even if HA hasn't re-synced the clock yet.
-    schedule_fire_check_on_wake();
+    // b525: ...unless the unit is winterized. A winter wake exists to let
+    // someone cancel winter mode, not to water a drained system.
+    if (!s_winter_sleep) schedule_fire_check_on_wake();
 
     while (true) {
         time_t now = time(NULL);
+        if (s_winter_sleep) goto sleep_poll;    // b525: no unattended watering
         if (now < 1700000000) goto sleep_poll;  // clock-based path needs time
         time_t delay_until = irrigoto_schedule_get_delay_until();
         if (delay_until > now) goto sleep_poll;
@@ -20699,7 +20862,8 @@ static void log_wake_cause(void)
 }
 
 // ── Power-management persistence (NVS namespace "OtO") ─────────────────────
-// Keys: pm_disable (u8), pm_inact_s (u32), pm_dur_s (u32), pm_reason (str)
+// Keys: pm_disable (u8), pm_inact_s (u32), pm_dur_s (u32), pm_reason (str),
+//       pm_winter (u8, b525)
 
 static void pm_nvs_load(void)
 {
@@ -20721,6 +20885,8 @@ static void pm_nvs_load(void)
         s_last_sleep_reason[0] = '\0';
     uint8_t th = 1;
     if (nvs_get_u8(h, "ui_theme", &th) == ESP_OK) s_theme_dark = (th != 0);
+    uint8_t win = 0;
+    if (nvs_get_u8(h, "pm_winter", &win) == ESP_OK) s_winter_sleep = (win != 0);  // b525
     nvs_close(h);
 }
 
@@ -20782,6 +20948,79 @@ void irrigoto_set_auto_sleep_enabled(bool enabled)
 bool irrigoto_get_auto_sleep_enabled(void)
 {
     return !s_sleep_disabled;
+}
+
+// ── b525: winter sleep ──────────────────────────────────────────────────────
+bool irrigoto_get_winter_sleep(void)
+{
+    return s_winter_sleep;
+}
+
+// Seconds left in the current winter wake window (0 when not in one). The web
+// UI counts this down so it's obvious how long you have to cancel.
+uint32_t irrigoto_winter_window_left_s(void)
+{
+    if (!s_winter_sleep || s_winter_wake_deadline == 0) return 0;
+    int32_t left = (int32_t)(s_winter_wake_deadline - xTaskGetTickCount());
+    if (left <= 0) return 0;
+    return (uint32_t)((left * portTICK_PERIOD_MS) / 1000);
+}
+
+// Arm the wake window. Called once at boot when the persisted flag is set.
+void irrigoto_winter_arm_wake_window(void)
+{
+    if (!s_winter_sleep) return;
+    s_winter_wake_deadline = xTaskGetTickCount()
+                           + pdMS_TO_TICKS(WINTER_WAKE_WINDOW_S * 1000u);
+    ESP_LOGW(TAG, "WINTER SLEEP active -- awake %u min, then back to sleep. "
+                  "Cancel from HA or the device web UI to resume normal operation.",
+             (unsigned)(WINTER_WAKE_WINDOW_S / 60u));
+}
+
+// on=true  -> persist the flag and request the sleep (the ESPHome loop enters
+//             it, so the HTTP response goes out first).
+// on=false -> clear the flag; the unit resumes normal operation immediately
+//             (fresh inactivity window, schedule un-gated).
+void irrigoto_set_winter_sleep(bool on)
+{
+    s_winter_sleep = on;
+    pm_nvs_save_u8("pm_winter", on ? 1 : 0);
+    if (on) {
+        s_winter_wake_deadline = 0;
+        irrigoto_request_winter_sleep("HA/web request");
+        ESP_LOGW(TAG, "Winter sleep ARMED (persisted) -- entering deep sleep, "
+                      "power-cycle to wake");
+    } else {
+        s_winter_wake_deadline   = 0;
+        // Drop a request the loop hasn't consumed yet: arming and then
+        // cancelling within the same loop tick must not still sleep the unit.
+        s_winter_sleep_requested = false;
+        TOUCH_ACTIVITY();   // give the user a full inactivity window to work in
+        ESP_LOGW(TAG, "Winter sleep CANCELLED (persisted) -- normal operation "
+                      "and scheduled watering resume");
+    }
+}
+
+// b526: ask the ESPHome loop to take us into winter sleep on its next tick.
+// The reason is carried across so the log and the persisted sleep reason say
+// which path we took -- "wake window expired" vs a button press.
+void irrigoto_request_winter_sleep(const char *reason)
+{
+    if (reason && reason[0]) {
+        strncpy(s_winter_reason, reason, sizeof(s_winter_reason) - 1);
+        s_winter_reason[sizeof(s_winter_reason) - 1] = ' ';
+    }
+    s_winter_sleep_requested = true;
+}
+
+const char *irrigoto_winter_reason(void)
+{
+    return s_winter_reason[0] ? s_winter_reason : "requested";
+}
+
+bool irrigoto_winter_sleep_pending(void)
+{
+    return s_winter_sleep_requested;
 }
 
 uint32_t irrigoto_get_inactivity_minutes(void)

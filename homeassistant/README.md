@@ -178,6 +178,7 @@ generated, never hand-maintained.
 | Heatmap mirror | Pulls per-zone heatmap data into HA's `www/` so the card renders while the device sleeps. **Namespaced per device** (see Cached files below). |
 | Schedule reconciler (bidirectional) | Per-device sensors + `<slug>_push_schedule` script + reconciler automation. Edit anywhere — HA dashboard or device web UI — and both sides stay in lockstep via per-entry IDs + `last_modified`, conflicts resolving last-writer-wins (device wins on tie). See [the design doc](../docs/schedule_sync_design.md). |
 | Rain delay (survives sleep) | `script.<slug>_set_rain_delay` stores the requested delay in HA; a sync automation pushes it to the device on its next wake and pulls delays set on the device's web UI back into HA. `sensor.<slug>_rain_delay` shows the request and whether the device has it yet. See [Rain delay](#rain-delay) below. |
+| Winter sleep (device must be awake) | `script.<slug>_winter_sleep` / `script.<slug>_winter_resume` — off-season hibernation. Unlike the rain delay these are **not** queued for a sleeping device: they act immediately or notify you that the unit must be awake. See [Winter sleep](#winter-sleep) below. |
 
 ## Cached files are per-device
 
@@ -278,6 +279,43 @@ It is handled like a schedule edit, so it does not need the device awake:
 - A delay set within the last sleep cycle before a scheduled run cannot stop
   that run: an armed timer wake fires before HA reconnects. Units wake every
   few minutes, so in practice set the delay more than one sleep cycle ahead.
+
+### Winter sleep
+
+Two buttons on the dashboard's **Device** tab, backed by
+`script.<slug>_winter_sleep` and `script.<slug>_winter_resume`.
+
+Winter sleep closes the valve and puts the unit into a deep sleep with **no
+wake timer**. Only a power cycle wakes it — a magnet swipe at the Hall sensor
+counts, so you don't have to open anything. On that wake it comes up normally
+(WiFi, HA, web UI) and holds awake for **5 minutes**, then goes back to sleep
+unless you cancel. Scheduled watering is suspended the whole time.
+
+If the battery is below the firmware's 3.6 V boot threshold the unit goes
+straight back to sleep without powering the motors, so a winter wake on a flat
+pack can't strand it awake burning the dregs.
+
+**Both buttons require the device to be awake.** They are deliberately not
+queued the way rain delay is: winterizing is a months-long, sticky state
+change, so it happens only when someone is looking at a unit that can actually
+confirm the valve closed.
+
+The requirement is not advertised up front — the buttons are always there and
+the confirmation dialog only describes what winter sleep does. If you press one
+while the unit happens to be asleep, the script raises a persistent
+notification saying it must be awake and does nothing else. Watch **Online** on
+the Device tab and press again during a wake window (a unit on the default
+cadence wakes every few minutes), or use the device's own web UI.
+
+`sensor.<slug>_winter_sleep` reads `winterized` or `off`. It is trigger-based
+on purpose: a winterized unit is off the network for months, so the REST poll
+goes `unavailable` and the sensor keeps showing the last thing the device
+actually reported.
+
+**The device web UI carries the same cancel button** — a banner with a
+countdown appears at the top of the landing page whenever the unit is
+winterized. That is the escape hatch that still works with HA down, which is
+why it exists in both places.
 
 ### Cross-device overlap validator
 

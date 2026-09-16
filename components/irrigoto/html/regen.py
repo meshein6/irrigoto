@@ -18,7 +18,10 @@ zone_setup.html was ~220 lines behind its header by b435, and cal/fs/landing
 had no .html source at all until they were re-extracted from the headers.
 """
 import re
+import shutil
+import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
 HERE = Path(__file__).parent          # html/ — .html sources
@@ -26,9 +29,47 @@ OUT = HERE.parent                     # component root — *_html.h payloads
 WRAP = re.compile(r'R"([A-Z]+)\(\r?\n(.*)\)\1"', re.S)
 
 
+def js_syntax_check(html_path) -> list:
+    """Parse each inline <script> with node --check.
+
+    b527: a JS syntax error in one of these pages takes out the WHOLE inline
+    script block, so the page renders as bare markup -- zone list stuck on
+    "Loading...", every device field showing an em dash, no button doing
+    anything. The firmware still compiles and the header still regenerates
+    (it's just text to them), so nothing else in this repo notices. That is
+    exactly how a broken string literal reached three units in b525: a newline
+    escape in a confirm() string had become a REAL newline, which a JS string
+    cannot span. Cheap to check, invisible until someone opens the page.
+
+    Returns a list of error strings; empty means clean. Skipped silently if
+    node isn't installed.
+    """
+    if shutil.which("node") is None:
+        return []
+    src = html_path.read_text(encoding="utf-8")
+    errors = []
+    with tempfile.TemporaryDirectory() as td:
+        for i, block in enumerate(re.findall(r"<script>(.*?)</script>", src, re.S)):
+            f = Path(td) / f"{html_path.stem}_{i}.js"
+            f.write_text(block, encoding="utf-8")
+            r = subprocess.run(["node", "--check", str(f)],
+                               capture_output=True, text=True)
+            if r.returncode != 0:
+                detail = chr(10).join(r.stderr.strip().splitlines()[:4])
+                errors.append(f"{html_path.name} <script> #{i}:{chr(10)}{detail}")
+    return errors
+
+
 def main() -> int:
     check = "--check" in sys.argv
     fail = False
+    for html in sorted(HERE.glob("*.html")):
+        for err in js_syntax_check(html):
+            print(f"JS SYNTAX ERROR -- {err}")
+            fail = True
+    if fail:
+        print("Refusing to regenerate: fix the JavaScript first.")
+        return 1
     for h in sorted(OUT.glob("*_html.h")):
         html = HERE / h.name.replace("_html.h", ".html")
         raw = h.read_bytes().decode("utf-8")
