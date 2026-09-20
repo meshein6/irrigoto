@@ -18760,6 +18760,120 @@ static esp_err_t api_gpio_probe_handler(httpd_req_t *req)
     return ESP_OK;
 }
 
+// ── /api/pump_run — run one pump at a PWM duty (b532, bench) ─────────────────
+// GET /api/pump_run?pump=1|2|3&ms=2000&duty=100
+//   pump   1 = GPIO16 alone, 2 = GPIO21 selector, 3 = GPIO19 selector
+//          (physical positions per HANDOFF.md, owner-confirmed 2026-09-20)
+//   ms     run length, default 2000, hard-capped at 10000
+//   duty   0-100 %, default 100. 100 drives GPIO16 as a plain level; anything
+//          lower puts LEDC PWM (20 kHz) on it -- speed-variability test.
+// Selector is set before the drive and cleared after; the 9V rail is held
+// on for the run. PCur is sampled every 100 ms and reported avg/min/max.
+#include "driver/ledc.h"
+#define PUMP_GPIO_DRIVE   GPIO_NUM_16
+#define PUMP_GPIO_SEL2    GPIO_NUM_21
+#define PUMP_GPIO_SEL3    GPIO_NUM_19
+#define PUMP_LEDC_TIMER   LEDC_TIMER_3
+#define PUMP_LEDC_CH      LEDC_CHANNEL_7
+static esp_err_t api_pump_run_handler(httpd_req_t *req)
+{
+    char qs[64] = {0};
+    httpd_req_get_url_query_str(req, qs, sizeof(qs));
+    char pump_s[4] = {0}, ms_s[8] = {0}, duty_s[8] = {0};
+    httpd_query_key_value(qs, "pump", pump_s, sizeof(pump_s));
+    httpd_query_key_value(qs, "ms",   ms_s,   sizeof(ms_s));
+    httpd_query_key_value(qs, "duty", duty_s, sizeof(duty_s));
+    int pump = atoi(pump_s);
+    int ms   = ms_s[0]   ? atoi(ms_s)   : 2000;
+    int duty = duty_s[0] ? atoi(duty_s) : 100;
+    if (pump < 1 || pump > 3) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "pump must be 1, 2 or 3");
+        return ESP_OK;
+    }
+    if (ms < 100)    ms = 100;
+    if (ms > 10000)  ms = 10000;
+    if (duty < 0)    duty = 0;
+    if (duty > 100)  duty = 100;
+    if (s_web_water_mode != 0 || s_exp_running) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "device busy (watering / experiment)");
+        return ESP_OK;
+    }
+    s_exp_running = true;
+
+    gpio_num_t sel = (pump == 2) ? PUMP_GPIO_SEL2 : (pump == 3) ? PUMP_GPIO_SEL3 : GPIO_NUM_NC;
+    bool motor_was_on = s_motor_rail;
+    if (!motor_was_on) motor_rail_on();
+    uint32_t vbatt_before = adc_mv(ADC_CH_VBATT);
+
+    if (sel != GPIO_NUM_NC) {
+        gpio_set_level(sel, 1);
+        gpio_set_direction(sel, GPIO_MODE_OUTPUT);
+        vTaskDelay(pdMS_TO_TICKS(20));
+    }
+
+    bool pwm = (duty < 100);
+    if (pwm) {
+        ledc_timer_config_t tc = {
+            .speed_mode      = LEDC_HIGH_SPEED_MODE,
+            .duty_resolution = LEDC_TIMER_10_BIT,
+            .timer_num       = PUMP_LEDC_TIMER,
+            .freq_hz         = 20000,
+            .clk_cfg         = LEDC_AUTO_CLK,
+        };
+        ledc_timer_config(&tc);
+        ledc_channel_config_t cc = {
+            .gpio_num   = PUMP_GPIO_DRIVE,
+            .speed_mode = LEDC_HIGH_SPEED_MODE,
+            .channel    = PUMP_LEDC_CH,
+            .timer_sel  = PUMP_LEDC_TIMER,
+            .duty       = (uint32_t)(duty * 1023 / 100),
+            .hpoint     = 0,
+        };
+        ledc_channel_config(&cc);
+    } else {
+        gpio_set_level(PUMP_GPIO_DRIVE, 1);
+        gpio_set_direction(PUMP_GPIO_DRIVE, GPIO_MODE_OUTPUT);
+    }
+
+    uint32_t sum = 0, mn = 0xFFFFFFFF, mx = 0; int n = 0;
+    for (int t = 0; t < ms; t += 100) {
+        vTaskDelay(pdMS_TO_TICKS(100));
+        uint32_t mv = adc_mv(ADC_CH_PCUR);
+        sum += mv; n++;
+        if (mv < mn) mn = mv;
+        if (mv > mx) mx = mv;
+    }
+
+    if (pwm) {
+        ledc_stop(LEDC_HIGH_SPEED_MODE, PUMP_LEDC_CH, 0);
+        ledc_timer_pause(LEDC_HIGH_SPEED_MODE, PUMP_LEDC_TIMER);
+    }
+    gpio_reset_pin(PUMP_GPIO_DRIVE);                 /* detach LEDC, back to plain GPIO */
+    gpio_set_direction(PUMP_GPIO_DRIVE, GPIO_MODE_INPUT);
+    gpio_set_pull_mode(PUMP_GPIO_DRIVE, GPIO_FLOATING);
+    if (sel != GPIO_NUM_NC) {
+        gpio_set_direction(sel, GPIO_MODE_INPUT);
+        gpio_set_pull_mode(sel, GPIO_FLOATING);
+    }
+    uint32_t vbatt_after = adc_mv(ADC_CH_VBATT);
+    if (!motor_was_on) motor_rail_off();
+    s_exp_running = false;
+
+    float avg_ma = n ? ((float)sum / n - 142.0f) * 0.2f : 0;
+    float min_ma = ((float)mn - 142.0f) * 0.2f, max_ma = ((float)mx - 142.0f) * 0.2f;
+    httpd_resp_set_type(req, "application/json");
+    HTTP_CONN_CLOSE(req);
+    char buf[256];
+    snprintf(buf, sizeof(buf),
+        "{\"pump\":%d,\"ms\":%d,\"duty\":%d,\"samples\":%d,"
+        "\"avg_ma\":%.1f,\"min_ma\":%.1f,\"max_ma\":%.1f,"
+        "\"vbatt_before_mv\":%lu,\"vbatt_after_mv\":%lu}",
+        pump, ms, duty, n, avg_ma, min_ma, max_ma,
+        (unsigned long)vbatt_before, (unsigned long)vbatt_after);
+    httpd_resp_sendstr(req, buf);
+    return ESP_OK;
+}
+
 static void zone_web_start(void)
 {
     s_zone_mutex = xSemaphoreCreateMutex();
@@ -18768,7 +18882,7 @@ static void zone_web_start(void)
     httpd_config_t cfg   = HTTPD_DEFAULT_CONFIG();
     cfg.server_port      = ZONE_WEB_PORT;
     cfg.ctrl_port        = ZONE_WEB_CTRL_PORT;
-    cfg.max_uri_handlers  = 78;  // b530: 77 -> 78 (/api/gpio_probe GET); b529: 76 -> 77 (/api/probe GET); b525: 74 -> 76 (/api/winter GET+POST); b522: 72 -> 74 (/api/fault_hold GET+POST); b512: 70 -> 72 (/api/uart_log GET+POST); b489: 68 -> 70, keeping the 2-slot margin over
+    cfg.max_uri_handlers  = 79;  // b532: 78 -> 79 (/api/pump_run GET); b530: 77 -> 78 (/api/gpio_probe GET); b529: 76 -> 77 (/api/probe GET); b525: 74 -> 76 (/api/winter GET+POST); b522: 72 -> 74 (/api/fault_hold GET+POST); b512: 70 -> 72 (/api/uart_log GET+POST); b489: 68 -> 70, keeping the 2-slot margin over
                                  // the _Static_assert below.
                                  // MUST be set before httpd_start (cfg is copied there);
                                  // headroom over uris[] count -- _Static_assert below guards it.
@@ -18806,6 +18920,7 @@ static void zone_web_start(void)
         {.uri="/api/winter",      .method=HTTP_POST, .handler=api_winter_handler},     // b525
         {.uri="/api/probe",       .method=HTTP_GET,  .handler=api_probe_handler},   // probe
         {.uri="/api/gpio_probe",  .method=HTTP_GET,  .handler=api_gpio_probe_handler},   // probe (b530)
+        {.uri="/api/pump_run",    .method=HTTP_GET,  .handler=api_pump_run_handler},     // bench (b532)
         {.uri="/api/fault_hold",  .method=HTTP_GET,  .handler=api_fault_hold_handler}, // b522
         {.uri="/api/fault_hold",  .method=HTTP_POST, .handler=api_fault_hold_handler}, // b522
         {.uri="/api/cal",         .method=HTTP_GET,  .handler=api_cal_handler},
@@ -18864,7 +18979,7 @@ static void zone_web_start(void)
         {.uri="/fs/upload",             .method=HTTP_POST, .handler=fs_upload_handler},
         {.uri="/fs/delete",             .method=HTTP_POST, .handler=fs_delete_handler},
     };
-    _Static_assert(sizeof(uris)/sizeof(uris[0]) <= 76,   // b530: 75 -> 76 (/api/gpio_probe GET); b529: 74 -> 75 (/api/probe GET); b525: 72 -> 74 (/api/winter GET+POST); b522: 70 -> 72 (/api/fault_hold GET+POST); b512: 68 -> 70 (/api/uart_log GET+POST); b489: 66 -> 68
+    _Static_assert(sizeof(uris)/sizeof(uris[0]) <= 77,   // b532: 76 -> 77 (/api/pump_run GET); b530: 75 -> 76 (/api/gpio_probe GET); b529: 74 -> 75 (/api/probe GET); b525: 72 -> 74 (/api/winter GET+POST); b522: 70 -> 72 (/api/fault_hold GET+POST); b512: 68 -> 70 (/api/uart_log GET+POST); b489: 66 -> 68
                    "uris[] exceeds cfg.max_uri_handlers -- raise it before httpd_start");
     for (size_t i = 0; i < sizeof(uris)/sizeof(uris[0]); i++)
         httpd_register_uri_handler(s_zone_server, &uris[i]);
