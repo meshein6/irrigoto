@@ -18595,6 +18595,8 @@ static esp_err_t api_probe_handler(httpd_req_t *req)
     i2c_bus_write_reg(ADDR_TCA6408A, reg, &pulsed, 1);
     vTaskDelay(pdMS_TO_TICKS(ms));
     uint32_t pcur_during = adc_mv(ADC_CH_PCUR);
+    uint8_t readback = 0xFF;   // b530: what the register holds after the write --
+    i2c_bus_read_reg(ADDR_TCA6408A, reg, &readback, 1);   // bits that never take a 1 are unimplemented (SX1501?)
     i2c_bus_write_reg(ADDR_TCA6408A, reg, &orig, 1);   /* restore */
     if (want_motor && !motor_was_on) motor_rail_off();
 
@@ -18607,17 +18609,106 @@ static esp_err_t api_probe_handler(httpd_req_t *req)
         "{\"bit\":%d,\"ms\":%d,\"polarity\":\"%s\","
         "\"expander\":\"%s\",\"reg\":\"0x%02X\","
         "\"pcur_before_mv\":%lu,\"pcur_during_mv\":%lu,\"delta_ma\":%.1f,"
-        "\"orig\":\"0x%02X\",\"pulsed\":\"0x%02X\",\"motor\":%s}",
+        "\"orig\":\"0x%02X\",\"pulsed\":\"0x%02X\",\"readback\":\"0x%02X\",\"motor\":%s}",
         bit, ms, active_high ? "high" : "low",
         (s_led_expander == LED_EXP_SX1502) ? "SX1502" : "TCA6408A",
         reg, (unsigned long)pcur_before, (unsigned long)pcur_during,
-        delta_ma, orig, pulsed, (want_motor || motor_was_on) ? "true" : "false");
+        delta_ma, orig, pulsed, readback, (want_motor || motor_was_on) ? "true" : "false");
     httpd_resp_sendstr(req, buf);
     return ESP_OK;
 }
 
 
 
+
+// ── /api/gpio_probe — pulse one spare ESP32 GPIO for pump identification ─────
+// GET /api/gpio_probe?pin=N&ms=300&polarity=high&motor=1
+//   pin       one of the GPIOs the pin summary lists as unused on the WROOM
+//             module and that this firmware never configures: 2 5 12 14 15
+//             16 19 21 33. Everything else is refused -- never the rail
+//             enables (4/18/13), the H-bridge (22/25/26/27), I2C (17/23) or
+//             the ADC inputs.
+//   ms        pulse width, default 300, hard-capped at 500.
+//   polarity  "high" (default) or "low".
+//   motor=1   hold the 9V motor rail on for the pulse (pumps likely need it).
+//
+// Reads the pin's idle level as a floating input first (an external pull tells
+// you which way a driver input rests), drives it for the pulse, samples PCur
+// and battery before/during, then returns it to a floating input. Bench/probe
+// only.
+static esp_err_t api_gpio_probe_handler(httpd_req_t *req)
+{
+    static const int allowed[] = { 2, 5, 12, 14, 15, 16, 19, 21, 33 };
+
+    char qs[64] = {0};
+    httpd_req_get_url_query_str(req, qs, sizeof(qs));
+    char pin_s[4] = {0}, ms_s[8] = {0}, pol_s[8] = {0}, mot_s[4] = {0};
+    httpd_query_key_value(qs, "pin",      pin_s, sizeof(pin_s));
+    httpd_query_key_value(qs, "ms",       ms_s,  sizeof(ms_s));
+    httpd_query_key_value(qs, "polarity", pol_s, sizeof(pol_s));
+    httpd_query_key_value(qs, "motor",    mot_s, sizeof(mot_s));
+
+    int  pin         = atoi(pin_s);
+    int  ms          = ms_s[0] ? atoi(ms_s) : 300;
+    bool active_high = !(pol_s[0] == 'l' || pol_s[0] == 'L');
+    bool want_motor  = (mot_s[0] == '1');
+
+    bool ok = false;
+    for (size_t i = 0; i < sizeof(allowed)/sizeof(allowed[0]); i++)
+        if (allowed[i] == pin) { ok = true; break; }
+    if (!ok) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST,
+            "pin must be one of 2 5 12 14 15 16 19 21 33");
+        return ESP_OK;
+    }
+    if (ms < 1)   ms = 1;
+    if (ms > 500) ms = 500;
+
+    if (s_web_water_mode != 0 || s_exp_running) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST,
+            "device busy (watering / experiment)");
+        return ESP_OK;
+    }
+
+    gpio_num_t g = (gpio_num_t)pin;
+    bool motor_was_on = s_motor_rail;
+    if (want_motor && !motor_was_on) motor_rail_on();
+
+    // Idle level as a floating input: 1 = something pulls it up, 0 = down/float.
+    gpio_set_direction(g, GPIO_MODE_INPUT);
+    gpio_set_pull_mode(g, GPIO_FLOATING);
+    vTaskDelay(pdMS_TO_TICKS(5));
+    int idle = gpio_get_level(g);
+
+    uint32_t pcur_before  = adc_mv(ADC_CH_PCUR);
+    uint32_t vbatt_before = adc_mv(ADC_CH_VBATT);
+
+    gpio_set_level(g, active_high ? 1 : 0);
+    gpio_set_direction(g, GPIO_MODE_OUTPUT);
+    vTaskDelay(pdMS_TO_TICKS(ms));
+    uint32_t pcur_during  = adc_mv(ADC_CH_PCUR);
+    uint32_t vbatt_during = adc_mv(ADC_CH_VBATT);
+    gpio_set_direction(g, GPIO_MODE_INPUT);    /* restore: floating input */
+    gpio_set_pull_mode(g, GPIO_FLOATING);
+
+    if (want_motor && !motor_was_on) motor_rail_off();
+
+    float delta_ma = (float)((int32_t)pcur_during - (int32_t)pcur_before) * 0.2f;
+
+    httpd_resp_set_type(req, "application/json");
+    HTTP_CONN_CLOSE(req);
+    char buf[320];
+    snprintf(buf, sizeof(buf),
+        "{\"pin\":%d,\"ms\":%d,\"polarity\":\"%s\",\"idle_level\":%d,"
+        "\"pcur_before_mv\":%lu,\"pcur_during_mv\":%lu,\"delta_ma\":%.1f,"
+        "\"vbatt_before_mv\":%lu,\"vbatt_during_mv\":%lu,\"motor\":%s}",
+        pin, ms, active_high ? "high" : "low", idle,
+        (unsigned long)pcur_before, (unsigned long)pcur_during, delta_ma,
+        (unsigned long)vbatt_before, (unsigned long)vbatt_during,
+        (want_motor || motor_was_on) ? "true" : "false");
+    httpd_resp_sendstr(req, buf);
+    return ESP_OK;
+}
 
 static void zone_web_start(void)
 {
@@ -18627,7 +18718,7 @@ static void zone_web_start(void)
     httpd_config_t cfg   = HTTPD_DEFAULT_CONFIG();
     cfg.server_port      = ZONE_WEB_PORT;
     cfg.ctrl_port        = ZONE_WEB_CTRL_PORT;
-    cfg.max_uri_handlers  = 77;  // b529: 76 -> 77 (/api/probe GET); b525: 74 -> 76 (/api/winter GET+POST); b522: 72 -> 74 (/api/fault_hold GET+POST); b512: 70 -> 72 (/api/uart_log GET+POST); b489: 68 -> 70, keeping the 2-slot margin over
+    cfg.max_uri_handlers  = 78;  // b530: 77 -> 78 (/api/gpio_probe GET); b529: 76 -> 77 (/api/probe GET); b525: 74 -> 76 (/api/winter GET+POST); b522: 72 -> 74 (/api/fault_hold GET+POST); b512: 70 -> 72 (/api/uart_log GET+POST); b489: 68 -> 70, keeping the 2-slot margin over
                                  // the _Static_assert below.
                                  // MUST be set before httpd_start (cfg is copied there);
                                  // headroom over uris[] count -- _Static_assert below guards it.
@@ -18664,6 +18755,7 @@ static void zone_web_start(void)
         {.uri="/api/winter",      .method=HTTP_GET,  .handler=api_winter_handler},     // b525
         {.uri="/api/winter",      .method=HTTP_POST, .handler=api_winter_handler},     // b525
         {.uri="/api/probe",       .method=HTTP_GET,  .handler=api_probe_handler},   // probe
+        {.uri="/api/gpio_probe",  .method=HTTP_GET,  .handler=api_gpio_probe_handler},   // probe (b530)
         {.uri="/api/fault_hold",  .method=HTTP_GET,  .handler=api_fault_hold_handler}, // b522
         {.uri="/api/fault_hold",  .method=HTTP_POST, .handler=api_fault_hold_handler}, // b522
         {.uri="/api/cal",         .method=HTTP_GET,  .handler=api_cal_handler},
@@ -18722,7 +18814,7 @@ static void zone_web_start(void)
         {.uri="/fs/upload",             .method=HTTP_POST, .handler=fs_upload_handler},
         {.uri="/fs/delete",             .method=HTTP_POST, .handler=fs_delete_handler},
     };
-    _Static_assert(sizeof(uris)/sizeof(uris[0]) <= 75,   // b529: 74 -> 75 (/api/probe GET); b525: 72 -> 74 (/api/winter GET+POST); b522: 70 -> 72 (/api/fault_hold GET+POST); b512: 68 -> 70 (/api/uart_log GET+POST); b489: 66 -> 68
+    _Static_assert(sizeof(uris)/sizeof(uris[0]) <= 76,   // b530: 75 -> 76 (/api/gpio_probe GET); b529: 74 -> 75 (/api/probe GET); b525: 72 -> 74 (/api/winter GET+POST); b522: 70 -> 72 (/api/fault_hold GET+POST); b512: 68 -> 70 (/api/uart_log GET+POST); b489: 66 -> 68
                    "uris[] exceeds cfg.max_uri_handlers -- raise it before httpd_start");
     for (size_t i = 0; i < sizeof(uris)/sizeof(uris[0]); i++)
         httpd_register_uri_handler(s_zone_server, &uris[i]);
