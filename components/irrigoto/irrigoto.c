@@ -18522,6 +18522,103 @@ static esp_err_t zone_last_water_handler(httpd_req_t *req)
     return ESP_OK;
 }
 
+
+// ── /api/probe — expander bit pulse for pump identification ──────────────────
+// GET /api/probe?bit=N&ms=200&polarity=high
+//   bit       3-7 only. Bits 0-2 drive the RGB LED and are refused.
+//   ms        pulse width, default 200, hard-capped at 500.
+//   polarity  "high" (default) or "low". SX1502 bit sense on the non-LED
+//             bits is unconfirmed, so try both.
+//
+// Reads the expander output register, flips exactly one bit, waits, then
+// restores the original byte. PCur (GPIO34 / ADC1_CH6) is sampled before and
+// during the pulse so a pump that draws through that sense chain shows up as
+// a positive delta_ma instead of relying on hearing it.
+//
+// CAVEAT: tca_led_set() writes the output register blind, with no shadow
+// copy. An LED update landing inside the pulse window will clobber the probe
+// bit. Unlikely at 200-300ms, but if a result looks inconsistent, repeat it.
+static esp_err_t api_probe_handler(httpd_req_t *req)
+{
+    char qs[64] = {0};
+    httpd_req_get_url_query_str(req, qs, sizeof(qs));
+    char bit_s[4] = {0}, ms_s[8] = {0}, pol_s[8] = {0}, mot_s[4] = {0};
+    httpd_query_key_value(qs, "bit",      bit_s, sizeof(bit_s));
+    httpd_query_key_value(qs, "ms",       ms_s,  sizeof(ms_s));
+    httpd_query_key_value(qs, "polarity", pol_s, sizeof(pol_s));
+    httpd_query_key_value(qs, "motor",    mot_s, sizeof(mot_s));
+
+    int  bit         = atoi(bit_s);
+    int  ms          = ms_s[0] ? atoi(ms_s) : 200;
+    bool active_high = !(pol_s[0] == 'l' || pol_s[0] == 'L');
+    bool want_motor  = (mot_s[0] == '1');   // pumps likely hang off the 9V motor rail
+
+    if (bit < 3 || bit > 7) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST,
+            "bit must be 3-7 (bits 0-2 are the RGB LED)");
+        return ESP_OK;
+    }
+    if (ms < 1)   ms = 1;
+    if (ms > 500) ms = 500;
+
+    if (s_web_water_mode != 0 || s_exp_running) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST,
+            "device busy (watering / experiment)");
+        return ESP_OK;
+    }
+
+    sensor_rail_on();
+    led_expander_detect();
+    // If the sensor rail was just powered, the expander is back at reset
+    // defaults (all inputs). Run the LED init path so P3-P7 are outputs.
+    if (!s_tca_outputs) tca_led_set(LED_OFF);
+
+    bool motor_was_on = s_motor_rail;
+    if (want_motor && !motor_was_on) motor_rail_on();
+
+    uint8_t reg = (s_led_expander == LED_EXP_SX1502)
+                  ? SX1502_REG_DATA : TCA6408A_REG_OUTPUT;
+
+    uint8_t orig = 0;
+    if (i2c_bus_read_reg(ADDR_TCA6408A, reg, &orig, 1) != ESP_OK) {
+        if (want_motor && !motor_was_on) motor_rail_off();
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR,
+            "expander read failed");
+        return ESP_OK;
+    }
+
+    uint32_t pcur_before = adc_mv(ADC_CH_PCUR);
+
+    uint8_t pulsed = active_high ? (uint8_t)(orig |  (1u << bit))
+                                 : (uint8_t)(orig & ~(1u << bit));
+
+    i2c_bus_write_reg(ADDR_TCA6408A, reg, &pulsed, 1);
+    vTaskDelay(pdMS_TO_TICKS(ms));
+    uint32_t pcur_during = adc_mv(ADC_CH_PCUR);
+    i2c_bus_write_reg(ADDR_TCA6408A, reg, &orig, 1);   /* restore */
+    if (want_motor && !motor_was_on) motor_rail_off();
+
+    float delta_ma = (float)((int32_t)pcur_during - (int32_t)pcur_before) * 0.2f;
+
+    httpd_resp_set_type(req, "application/json");
+    HTTP_CONN_CLOSE(req);
+    char buf[256];
+    snprintf(buf, sizeof(buf),
+        "{\"bit\":%d,\"ms\":%d,\"polarity\":\"%s\","
+        "\"expander\":\"%s\",\"reg\":\"0x%02X\","
+        "\"pcur_before_mv\":%lu,\"pcur_during_mv\":%lu,\"delta_ma\":%.1f,"
+        "\"orig\":\"0x%02X\",\"pulsed\":\"0x%02X\",\"motor\":%s}",
+        bit, ms, active_high ? "high" : "low",
+        (s_led_expander == LED_EXP_SX1502) ? "SX1502" : "TCA6408A",
+        reg, (unsigned long)pcur_before, (unsigned long)pcur_during,
+        delta_ma, orig, pulsed, (want_motor || motor_was_on) ? "true" : "false");
+    httpd_resp_sendstr(req, buf);
+    return ESP_OK;
+}
+
+
+
+
 static void zone_web_start(void)
 {
     s_zone_mutex = xSemaphoreCreateMutex();
@@ -18530,7 +18627,7 @@ static void zone_web_start(void)
     httpd_config_t cfg   = HTTPD_DEFAULT_CONFIG();
     cfg.server_port      = ZONE_WEB_PORT;
     cfg.ctrl_port        = ZONE_WEB_CTRL_PORT;
-    cfg.max_uri_handlers  = 76;  // b525: 74 -> 76 (/api/winter GET+POST); b522: 72 -> 74 (/api/fault_hold GET+POST); b512: 70 -> 72 (/api/uart_log GET+POST); b489: 68 -> 70, keeping the 2-slot margin over
+    cfg.max_uri_handlers  = 77;  // b529: 76 -> 77 (/api/probe GET); b525: 74 -> 76 (/api/winter GET+POST); b522: 72 -> 74 (/api/fault_hold GET+POST); b512: 70 -> 72 (/api/uart_log GET+POST); b489: 68 -> 70, keeping the 2-slot margin over
                                  // the _Static_assert below.
                                  // MUST be set before httpd_start (cfg is copied there);
                                  // headroom over uris[] count -- _Static_assert below guards it.
@@ -18547,7 +18644,6 @@ static void zone_web_start(void)
         ESP_LOGE(TAG, "Zone web server failed to start");
         return;
     }
-
     static const httpd_uri_t uris[] = {
         {.uri="/",           .method=HTTP_GET,  .handler=zone_root_handler},
         {.uri="/zone",       .method=HTTP_GET,  .handler=zone_page_handler},
@@ -18567,6 +18663,7 @@ static void zone_web_start(void)
         {.uri="/api/uart_log",    .method=HTTP_POST, .handler=api_uart_log_handler},   // b512
         {.uri="/api/winter",      .method=HTTP_GET,  .handler=api_winter_handler},     // b525
         {.uri="/api/winter",      .method=HTTP_POST, .handler=api_winter_handler},     // b525
+        {.uri="/api/probe",       .method=HTTP_GET,  .handler=api_probe_handler},   // probe
         {.uri="/api/fault_hold",  .method=HTTP_GET,  .handler=api_fault_hold_handler}, // b522
         {.uri="/api/fault_hold",  .method=HTTP_POST, .handler=api_fault_hold_handler}, // b522
         {.uri="/api/cal",         .method=HTTP_GET,  .handler=api_cal_handler},
@@ -18625,7 +18722,7 @@ static void zone_web_start(void)
         {.uri="/fs/upload",             .method=HTTP_POST, .handler=fs_upload_handler},
         {.uri="/fs/delete",             .method=HTTP_POST, .handler=fs_delete_handler},
     };
-    _Static_assert(sizeof(uris)/sizeof(uris[0]) <= 74,   // b525: 72 -> 74 (/api/winter GET+POST); b522: 70 -> 72 (/api/fault_hold GET+POST); b512: 68 -> 70 (/api/uart_log GET+POST); b489: 66 -> 68
+    _Static_assert(sizeof(uris)/sizeof(uris[0]) <= 75,   // b529: 74 -> 75 (/api/probe GET); b525: 72 -> 74 (/api/winter GET+POST); b522: 70 -> 72 (/api/fault_hold GET+POST); b512: 68 -> 70 (/api/uart_log GET+POST); b489: 66 -> 68
                    "uris[] exceeds cfg.max_uri_handlers -- raise it before httpd_start");
     for (size_t i = 0; i < sizeof(uris)/sizeof(uris[0]); i++)
         httpd_register_uri_handler(s_zone_server, &uris[i]);
