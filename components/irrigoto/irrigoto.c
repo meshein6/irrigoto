@@ -18766,7 +18766,8 @@ static esp_err_t api_gpio_probe_handler(httpd_req_t *req)
 //          (physical positions per HANDOFF.md, owner-confirmed 2026-09-20)
 //   ms     run length, default 2000, hard-capped at 10000
 //   duty   0-100 %, default 100. 100 drives GPIO16 as a plain level; anything
-//          lower puts LEDC PWM (20 kHz) on it -- speed-variability test.
+//          lower puts LEDC PWM on it -- speed-variability test.
+//   freq   PWM frequency in Hz, default 20000, clamped 50..40000 (b533).
 // Selector is set before the drive and cleared after; the 9V rail is held
 // on for the run. PCur is sampled every 100 ms and reported avg/min/max.
 #include "driver/ledc.h"
@@ -18779,13 +18780,17 @@ static esp_err_t api_pump_run_handler(httpd_req_t *req)
 {
     char qs[64] = {0};
     httpd_req_get_url_query_str(req, qs, sizeof(qs));
-    char pump_s[4] = {0}, ms_s[8] = {0}, duty_s[8] = {0};
+    char pump_s[4] = {0}, ms_s[8] = {0}, duty_s[8] = {0}, freq_s[8] = {0};
     httpd_query_key_value(qs, "pump", pump_s, sizeof(pump_s));
     httpd_query_key_value(qs, "ms",   ms_s,   sizeof(ms_s));
     httpd_query_key_value(qs, "duty", duty_s, sizeof(duty_s));
+    httpd_query_key_value(qs, "freq", freq_s, sizeof(freq_s));
     int pump = atoi(pump_s);
     int ms   = ms_s[0]   ? atoi(ms_s)   : 2000;
     int duty = duty_s[0] ? atoi(duty_s) : 100;
+    int freq = freq_s[0] ? atoi(freq_s) : 20000;
+    if (freq < 50)    freq = 50;
+    if (freq > 40000) freq = 40000;
     if (pump < 1 || pump > 3) {
         httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "pump must be 1, 2 or 3");
         return ESP_OK;
@@ -18817,7 +18822,7 @@ static esp_err_t api_pump_run_handler(httpd_req_t *req)
             .speed_mode      = LEDC_HIGH_SPEED_MODE,
             .duty_resolution = LEDC_TIMER_10_BIT,
             .timer_num       = PUMP_LEDC_TIMER,
-            .freq_hz         = 20000,
+            .freq_hz         = (uint32_t)freq,
             .clk_cfg         = LEDC_AUTO_CLK,
         };
         ledc_timer_config(&tc);
@@ -18865,10 +18870,10 @@ static esp_err_t api_pump_run_handler(httpd_req_t *req)
     HTTP_CONN_CLOSE(req);
     char buf[256];
     snprintf(buf, sizeof(buf),
-        "{\"pump\":%d,\"ms\":%d,\"duty\":%d,\"samples\":%d,"
+        "{\"pump\":%d,\"ms\":%d,\"duty\":%d,\"freq\":%d,\"samples\":%d,"
         "\"avg_ma\":%.1f,\"min_ma\":%.1f,\"max_ma\":%.1f,"
         "\"vbatt_before_mv\":%lu,\"vbatt_after_mv\":%lu}",
-        pump, ms, duty, n, avg_ma, min_ma, max_ma,
+        pump, ms, duty, freq, n, avg_ma, min_ma, max_ma,
         (unsigned long)vbatt_before, (unsigned long)vbatt_after);
     httpd_resp_sendstr(req, buf);
     return ESP_OK;
