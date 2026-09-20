@@ -18631,6 +18631,12 @@ static esp_err_t api_probe_handler(httpd_req_t *req)
 //   ms        pulse width, default 300, hard-capped at 500.
 //   polarity  "high" (default) or "low".
 //   motor=1   hold the 9V motor rail on for the pulse (pumps likely need it).
+//   hold=M&hold_level=0|1        (b531) drive a second allowlisted GPIO at a
+//                                level for the whole pulse, release after.
+//   hold_bit=3&hold_bit_level=0|1 (b531) same for expander bit 3 (the only
+//                                spare on the SX1501 found on this unit).
+//   Selector hunting: GPIO16 high alone runs one pump; these find the lines
+//   that pick which one.
 //
 // Reads the pin's idle level as a floating input first (an external pull tells
 // you which way a driver input rests), drives it for the pulse, samples PCur
@@ -18643,22 +18649,38 @@ static esp_err_t api_gpio_probe_handler(httpd_req_t *req)
     char qs[64] = {0};
     httpd_req_get_url_query_str(req, qs, sizeof(qs));
     char pin_s[4] = {0}, ms_s[8] = {0}, pol_s[8] = {0}, mot_s[4] = {0};
+    char hold_s[4] = {0}, hl_s[4] = {0}, hb_s[4] = {0}, hbl_s[4] = {0};
     httpd_query_key_value(qs, "pin",      pin_s, sizeof(pin_s));
     httpd_query_key_value(qs, "ms",       ms_s,  sizeof(ms_s));
     httpd_query_key_value(qs, "polarity", pol_s, sizeof(pol_s));
     httpd_query_key_value(qs, "motor",    mot_s, sizeof(mot_s));
+    httpd_query_key_value(qs, "hold",           hold_s, sizeof(hold_s));
+    httpd_query_key_value(qs, "hold_level",     hl_s,   sizeof(hl_s));
+    httpd_query_key_value(qs, "hold_bit",       hb_s,   sizeof(hb_s));
+    httpd_query_key_value(qs, "hold_bit_level", hbl_s,  sizeof(hbl_s));
 
     int  pin         = atoi(pin_s);
     int  ms          = ms_s[0] ? atoi(ms_s) : 300;
     bool active_high = !(pol_s[0] == 'l' || pol_s[0] == 'L');
     bool want_motor  = (mot_s[0] == '1');
+    int  hold        = hold_s[0] ? atoi(hold_s) : -1;
+    int  hold_level  = (hl_s[0] == '1') ? 1 : 0;
+    int  hold_bit    = hb_s[0] ? atoi(hb_s) : -1;
+    int  hold_bit_lv = (hbl_s[0] == '1') ? 1 : 0;
 
-    bool ok = false;
-    for (size_t i = 0; i < sizeof(allowed)/sizeof(allowed[0]); i++)
-        if (allowed[i] == pin) { ok = true; break; }
-    if (!ok) {
+    bool ok = false, hold_ok = (hold < 0);
+    for (size_t i = 0; i < sizeof(allowed)/sizeof(allowed[0]); i++) {
+        if (allowed[i] == pin)  ok = true;
+        if (allowed[i] == hold) hold_ok = true;
+    }
+    if (!ok || !hold_ok || hold == pin) {
         httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST,
-            "pin must be one of 2 5 12 14 15 16 19 21 33");
+            "pin/hold must be one of 2 5 12 14 15 16 19 21 33 (and differ)");
+        return ESP_OK;
+    }
+    if (hold_bit >= 0 && hold_bit != 3) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST,
+            "hold_bit must be 3 (only spare expander bit)");
         return ESP_OK;
     }
     if (ms < 1)   ms = 1;
@@ -18673,6 +18695,25 @@ static esp_err_t api_gpio_probe_handler(httpd_req_t *req)
     gpio_num_t g = (gpio_num_t)pin;
     bool motor_was_on = s_motor_rail;
     if (want_motor && !motor_was_on) motor_rail_on();
+
+    // b531: engage the held selector line(s) before the pulse
+    if (hold >= 0) {
+        gpio_set_level((gpio_num_t)hold, hold_level);
+        gpio_set_direction((gpio_num_t)hold, GPIO_MODE_OUTPUT);
+    }
+    uint8_t exp_reg = 0, exp_orig = 0; bool exp_held = false;
+    if (hold_bit >= 0) {
+        sensor_rail_on();
+        led_expander_detect();
+        if (!s_tca_outputs) tca_led_set(LED_OFF);
+        exp_reg = (s_led_expander == LED_EXP_SX1502) ? SX1502_REG_DATA : TCA6408A_REG_OUTPUT;
+        if (i2c_bus_read_reg(ADDR_TCA6408A, exp_reg, &exp_orig, 1) == ESP_OK) {
+            uint8_t v = hold_bit_lv ? (uint8_t)(exp_orig | (1u << hold_bit))
+                                    : (uint8_t)(exp_orig & ~(1u << hold_bit));
+            exp_held = (i2c_bus_write_reg(ADDR_TCA6408A, exp_reg, &v, 1) == ESP_OK);
+        }
+    }
+    vTaskDelay(pdMS_TO_TICKS(20));
 
     // Idle level as a floating input: 1 = something pulls it up, 0 = down/float.
     gpio_set_direction(g, GPIO_MODE_INPUT);
@@ -18691,18 +18732,27 @@ static esp_err_t api_gpio_probe_handler(httpd_req_t *req)
     gpio_set_direction(g, GPIO_MODE_INPUT);    /* restore: floating input */
     gpio_set_pull_mode(g, GPIO_FLOATING);
 
+    // b531: release the held line(s)
+    if (hold >= 0) {
+        gpio_set_direction((gpio_num_t)hold, GPIO_MODE_INPUT);
+        gpio_set_pull_mode((gpio_num_t)hold, GPIO_FLOATING);
+    }
+    if (exp_held) i2c_bus_write_reg(ADDR_TCA6408A, exp_reg, &exp_orig, 1);
+
     if (want_motor && !motor_was_on) motor_rail_off();
 
     float delta_ma = (float)((int32_t)pcur_during - (int32_t)pcur_before) * 0.2f;
 
     httpd_resp_set_type(req, "application/json");
     HTTP_CONN_CLOSE(req);
-    char buf[320];
+    char buf[400];
     snprintf(buf, sizeof(buf),
         "{\"pin\":%d,\"ms\":%d,\"polarity\":\"%s\",\"idle_level\":%d,"
+        "\"hold\":%d,\"hold_level\":%d,\"hold_bit\":%d,\"hold_bit_level\":%d,\"hold_bit_ok\":%s,"
         "\"pcur_before_mv\":%lu,\"pcur_during_mv\":%lu,\"delta_ma\":%.1f,"
         "\"vbatt_before_mv\":%lu,\"vbatt_during_mv\":%lu,\"motor\":%s}",
         pin, ms, active_high ? "high" : "low", idle,
+        hold, hold_level, hold_bit, hold_bit_lv, exp_held ? "true" : "false",
         (unsigned long)pcur_before, (unsigned long)pcur_during, delta_ma,
         (unsigned long)vbatt_before, (unsigned long)vbatt_during,
         (want_motor || motor_was_on) ? "true" : "false");
