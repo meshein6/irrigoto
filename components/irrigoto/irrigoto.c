@@ -16272,11 +16272,14 @@ static esp_err_t api_status_handler(httpd_req_t *req)
     int n = snprintf(buf, sizeof(buf),
         "{\"fw_build\":%u,\"wifi_rssi\":%d,"
         "\"storage_used_kb\":%u,\"storage_total_kb\":%u,"
-        "\"watering\":%s,\"water_mode\":%d,\"water_est_min\":%d,\"cleanup_pass\":%d}",
+        "\"watering\":%s,\"water_mode\":%d,\"water_est_min\":%d,\"cleanup_pass\":%d,"
+        "\"led_expander\":\"%s\"}",   // b528: which 0x20 part led_expander_detect() picked
         FW_BUILD, wifi_get_rssi(),
         (unsigned)(used/1024), (unsigned)(total/1024),
         s_web_water_mode?"true":"false", s_web_water_mode, s_water_est_min,
-        s_water_cleanup_pass);
+        s_water_cleanup_pass,
+        s_led_expander==LED_EXP_SX1502 ? "SX1502" :
+        s_led_expander==LED_EXP_TCA6408A ? "TCA6408A" : "unknown");
     httpd_resp_set_type(req, "application/json");
     httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
     httpd_resp_send(req, buf, n);
