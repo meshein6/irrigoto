@@ -115,6 +115,17 @@ section{margin-bottom:18px;}
   padding:10px 12px;}
 .mode-help.show{display:block;}
 .mode-help b{color:var(--text);}
+/* Run history rows (b535) */
+.run-row{display:flex;gap:8px;padding:7px 0;border-bottom:1px solid var(--border);
+  align-items:baseline;font-size:12px;}
+.run-row:last-child{border-bottom:none;}
+.run-when{color:var(--text-mid);font-family:'Courier New',monospace;font-size:11px;
+  width:86px;flex-shrink:0;}
+.run-what{flex:1;min-width:0;}
+.run-what small{display:block;color:var(--text-mid);font-size:11px;}
+.run-vol{font-family:'Courier New',monospace;color:var(--green);text-align:right;
+  white-space:nowrap;flex-shrink:0;}
+.run-vol.bad{color:var(--orange);}
 /* Water modal */
 #modal-bg,#wp-bg{display:none;position:fixed;inset:0;background:rgba(0,0,0,.7);
   z-index:100;align-items:flex-end;justify-content:center;}
@@ -241,6 +252,13 @@ section{margin-bottom:18px;}
       <a class="sec-btn" href="/schedule">Edit</a>
     </div>
     <div id="sched-summary" class="card"><div class="empty">No schedules configured.</div></div>
+  </section>
+  <section>
+    <div class="sec-hdr">
+      <span class="sec-title">History</span>
+      <a class="sec-btn" href="/api/runs" download="runs.csv">&#11015; CSV</a>
+    </div>
+    <div class="card" id="runs-card"><div class="empty">No runs recorded yet.</div></div>
   </section>
   <section>
     <div class="sec-hdr"><span class="sec-title">Calibration</span></div>
@@ -441,6 +459,7 @@ section{margin-bottom:18px;}
 <script>
 let selZoneId=0, selModeDat='1';
 let lastSolution=null;   // /api/all "solution" object
+let _wasWatering=false;   // b535
 let waterStartTime=0, waterEstMs=0, countdownTimer=null, lastWateringState=false, lastCleanupPass=0, lastEstMin=0;
 
 function handleZoneBtn(id){
@@ -821,6 +840,45 @@ function toggleSupplyHelp(){
             ? h.previousElementSibling.querySelector('.info-btn') : null;
   if (b) b.setAttribute('aria-expanded', on ? 'true' : 'false');
 }
+// ── Run history (b535) ──────────────────────────────────────────────────────
+// /api/runs returns raw CSV, newest first, no header. Columns must stay in
+// step with RUNS_CSV_HEADER in irrigoto.c.
+const RUN_COL = {start:0,end:1,uptime:2,dur:3,zone_id:4,zone:5,trigger:6,mode:7,
+                 depth:8,status:9,rings:10,limited:11,vol:12,depth_mm:13,
+                 cov:14,score:15,psi_min:16,psi_avg:17,psi_max:18,fw:19};
+const DEPTH_TXT = ['','1/8\u2033','1/4\u2033','3/8\u2033','1/2\u2033','5/8\u2033','3/4\u2033','7/8\u2033','1\u2033'];
+
+async function loadRuns(){
+  const el = document.getElementById('runs-card');
+  if (!el) return;
+  let txt = '';
+  try { txt = await fetch('/api/runs?limit=8', {cache:'no-store'}).then(r => r.text()); }
+  catch(e){ return; }
+  const rows = txt.split('\n').map(l => l.trim()).filter(Boolean);
+  if (!rows.length) { el.innerHTML = '<div class="empty">No runs recorded yet.</div>'; return; }
+  el.innerHTML = rows.map(line => {
+    const c = line.split(',');
+    const st = c[RUN_COL.status] || '';
+    const ok = (st === 'completed');
+    // No clock when the run started -> show uptime instead of a fake date.
+    const when = c[RUN_COL.start]
+      ? c[RUN_COL.start].replace('T',' ').slice(5,16)
+      : '+' + Math.round((+c[RUN_COL.uptime]||0)/60) + 'm up';
+    const depth = DEPTH_TXT[+c[RUN_COL.depth]] || '';
+    const vol = parseFloat(c[RUN_COL.vol]);
+    return '<div class="run-row">' +
+      '<span class="run-when">' + esc(when) + '</span>' +
+      '<span class="run-what">' + esc(c[RUN_COL.zone] || '') +
+        '<small>' + esc(c[RUN_COL.mode] || '') + (depth ? ' ' + depth : '') +
+        ' \u00b7 ' + (+c[RUN_COL.dur]||0).toFixed(0) + ' min \u00b7 ' + esc(c[RUN_COL.trigger]||'') +
+        (ok ? '' : ' \u00b7 <span style="color:var(--orange)">' + esc(st.replace(/_/g,' ')) + '</span>') +
+        '</small></span>' +
+      '<span class="run-vol' + (ok ? '' : ' bad') + '">' +
+        (isFinite(vol) ? vol.toFixed(1) + ' L' : '\u2014') + '</span>' +
+    '</div>';
+  }).join('');
+}
+function esc(t){ const d=document.createElement('div'); d.textContent=t==null?'':t; return d.innerHTML; }
 
 async function toggleDetailLog(){
   try{
@@ -880,6 +938,7 @@ async function reconnectNet(){
 updateWifiButtons();
 
 solLoadRates();
+loadRuns();   // b535: History card, once at load
 async function refresh(){
   try{
     const d=await fetch('/api/all').then(r=>r.json());
@@ -902,6 +961,9 @@ async function refresh(){
     const sup=document.getElementById('supply-cb');   // b535
     if(sup && d.supply_regulated!==undefined) sup.checked=!!d.supply_regulated;
     renderWinter(d.winter, d.winter_left_s);
+    // b535: refresh History when a run ends (watering true -> false).
+    if (_wasWatering && !d.watering) loadRuns();
+    _wasWatering = !!d.watering;
     // Update device name (skip if user is editing)
     const dni=document.getElementById('dev-name-inp');
     if(d.device_name&&dni&&!dni.matches(':focus')&&dni.value!==d.device_name){

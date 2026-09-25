@@ -54,8 +54,21 @@ esp_err_t storage_water_save(uint16_t zone_id, const water_run_t *run);
 esp_err_t storage_water_load(uint16_t zone_id, water_run_t *run);
 esp_err_t storage_water_delete(uint16_t zone_id);
 
-/* ---- Logging ---- */
-esp_err_t storage_log(const char *line);
+/* ---- Run history ---- */
+/* One CSV row per watering run in /lfs/logs/runs.csv, appended on every exit
+ * path (completed, cancelled, no-supply, fault). `header` is written only
+ * when the file is created. Rotates to runs.1.csv at ~128 KB.
+ *
+ * Replaces the old storage_log() daily-log scheme: it was never called from
+ * anywhere, so /lfs/logs was always empty. */
+#define RUNS_LINE_MAX  320    /* longest row the writer can emit, + slack */
+#define RUNS_TAIL_MAX   50    /* most rows one storage_runs_tail() can return */
+esp_err_t storage_runs_append(const char *header, const char *row);
+/* Newest first, one call per row. Streaming keeps the response off the DRAM
+ * budget -- only one RUNS_LINE_MAX line exists at a time. Returns the count. */
+typedef void (*storage_runs_row_cb)(const char *line, void *ctx);
+int       storage_runs_tail_cb(int max, storage_runs_row_cb cb, void *ctx);
+esp_err_t storage_runs_clear(void);
 
 /* ---- Usage ---- */
 esp_err_t storage_usage(size_t *used_out, size_t *total_out);
