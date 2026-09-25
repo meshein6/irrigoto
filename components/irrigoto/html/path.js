@@ -202,9 +202,12 @@
    * so an arc belongs to the lowest-index lobe it overlaps and merged rings
    * are swept exactly once, under the first section. Mirrors the firmware. */
   function orderSections(ringsIn) {
+    /* b541: lobes come from the ring with the MOST arcs, not the outermost --
+     * a zone with a waist is one arc at the outer rings and splits inward, so
+     * reading the outermost ring found a single lobe and disabled sections. */
     var lobes = null, i, j;
     for (i = 0; i < ringsIn.length; i++) {
-      if (ringsIn[i].spans.length) { lobes = ringsIn[i].spans; break; }
+      if (!lobes || ringsIn[i].spans.length > lobes.length) lobes = ringsIn[i].spans;
     }
     if (!lobes || lobes.length < 2) return null;   /* nothing to section */
     var out = [], visit = 0;

@@ -9189,13 +9189,26 @@ static int serpentine_build_pass_plan(
     float lobe_lo[WATER_MAX_ARCS_PER_RING], lobe_hi[WATER_MAX_ARCS_PER_RING];
     int   n_lobes = 1;
     if (sections) {
+        // b541: take the lobes from the ring with the MOST arcs, not the
+        // outermost. A zone can split either way: a sprinkler inside a
+        // rectangle splits at the OUTER rings and merges inward, but a zone
+        // with a waist (the measured case) is a single arc at the outer rings
+        // and splits INWARD. Reading the outermost ring found one arc there,
+        // set n_lobes = 1, and silently turned sections off -- which is why it
+        // ran identically to serpentine with no section-by-section log line.
+        float tl[WATER_MAX_ARCS_PER_RING], th[WATER_MAX_ARCS_PER_RING];
         for (int ri = 0; ri < num_rings && ri < WATER_RUN_MAX_RINGS; ri++) {
             int ring = out_to_in ? ri : (num_rings - 1 - ri);
             if (ring >= WATER_RUN_MAX_RINGS || skip[ring]) continue;
             int na0 = serpentine_arc_bounds(zone, have_zone, ring_throws[ring],
                           sector_throw, act_max_throw, zone_arc_start,
-                          zone_arc_end, zone_arc_deg, lobe_lo, lobe_hi);
-            if (na0 > 0) { n_lobes = na0; break; }
+                          zone_arc_end, zone_arc_deg, tl, th);
+            if (na0 > n_lobes) {
+                n_lobes = na0;
+                for (int L = 0; L < na0 && L < WATER_MAX_ARCS_PER_RING; L++) {
+                    lobe_lo[L] = tl[L]; lobe_hi[L] = th[L];
+                }
+            }
         }
         if (n_lobes > 1)
             INFO("Serpentine: section-by-section, %d lobe(s)", n_lobes);
@@ -9203,6 +9216,7 @@ static int serpentine_build_pass_plan(
             sections = false;   // single lobe: ring-major already never crosses
     }
 
+    int  prev_sec = -1;   // b541: which section the last emitted arc belonged to
     for (int sec = 0; sec < (sections ? n_lobes : 1); sec++) {
     if (sections && sec > 0) cw = start_cw;   // each section starts consistently
     for (int ri = 0; ri < num_rings && ri < WATER_RUN_MAX_RINGS; ri++) {
@@ -9246,6 +9260,15 @@ static int serpentine_build_pass_plan(
                     if (serp_arc_overlaps(lo[ai], hi[ai], lobe_lo[L], lobe_hi[L])) { owner = L; break; }
                 if (owner < 0) owner = 0;      // no overlap: fall to the first
                 if (owner != sec) continue;
+                // b541: the move to a NEW section crosses the whole zone.
+                // Serpentine's connector would hug the boundary with the valve
+                // OPEN -- a 30-odd waypoint traverse that waters its way across
+                // (and eats the leg budget). Across sections that is exactly
+                // the wandering this mode exists to remove, so force it dry by
+                // dropping the previous exit: the connector below then takes
+                // its "no previous sweep" path.
+                if (sec != prev_sec) { prev_exit_b = -1.0f; prev_throw = 0.0f; }
+                prev_sec = sec;
             }
             float entry = cw ? lo[ai] : hi[ai];
             float exitb = cw ? hi[ai] : lo[ai];
