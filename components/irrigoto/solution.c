@@ -10,12 +10,15 @@
 #include "freertos/task.h"
 #include "esp_log.h"
 #include "nvs.h"
+#include "storage.h"
 
 static const char *TAG = "solution";
 
 #define NVS_NS          "solution"
 #define NVS_KEY_CAL     "cal"
 #define NVS_KEY_RT      "rt"
+#define NVS_KEY_EN      "enabled"
+#define CAL_FILE        "/lfs/cal/bottle.json"
 #define CAL_MAGIC       0x534F4C31u   /* 'SOL1' */
 #define RT_MAGIC        0x534F5254u   /* 'SORT' */
 #define TASK_STACK      3072
@@ -45,6 +48,12 @@ typedef struct {
 
 static sol_cal_t s_cal;
 static sol_rt_t  s_rt;
+static bool      s_enabled;
+
+/* Built-in rates (mL/s) per speed, used for any bottle with no calibration
+ * and restored when a rate is cleared. Typical for the stock pumps and 1/8"
+ * ID feed line; calibrate per bottle for real numbers. */
+static const float DEFAULT_RATE[3] = { 0.30f, 0.23f, 0.17f };   /* 100/80/60 % */
 
 static int speed_index(uint8_t speed)
 {
@@ -74,6 +83,49 @@ static void nvs_store(const char *key, const void *blob, size_t sz)
     nvs_set_blob(h, key, blob, sz);
     nvs_commit(h);
     nvs_close(h);
+}
+
+/* Calibration lives in /lfs/cal/bottle.json next to pressure.json and
+ * speed.json, in the same shape solution_cal_json() serves. */
+static bool cal_file_save(void)
+{
+    if (!storage_ready()) return false;
+    FILE *f = fopen(CAL_FILE, "wb");
+    if (!f) { ESP_LOGE(TAG, "open %s for write failed", CAL_FILE); return false; }
+    fprintf(f, "{\n  \"speeds\": [100, 80, 60],\n  \"rates\": [\n");
+    for (int b = 0; b < SOLUTION_BOTTLES; b++)
+        fprintf(f, "    [%.3f, %.3f, %.3f]%s\n", s_cal.rate[b][0], s_cal.rate[b][1],
+                s_cal.rate[b][2], b < SOLUTION_BOTTLES - 1 ? "," : "");
+    fprintf(f, "  ]\n}\n");
+    fclose(f);
+    return true;
+}
+
+static bool cal_file_load(void)
+{
+    if (!storage_ready()) return false;
+    FILE *f = fopen(CAL_FILE, "rb");
+    if (!f) return false;
+    char buf[256]; size_t n = fread(buf, 1, sizeof(buf) - 1, f); fclose(f);
+    buf[n] = '\0';
+    const char *p = strstr(buf, "\"rates\"");
+    if (!p || !(p = strchr(p, '['))) return false;
+    p++;
+    float r[SOLUTION_BOTTLES][3];
+    for (int b = 0; b < SOLUTION_BOTTLES; b++) {
+        if (!(p = strchr(p, '[')) ||
+            sscanf(p, "[%f , %f , %f", &r[b][0], &r[b][1], &r[b][2]) != 3) return false;
+        p++;
+    }
+    memcpy(s_cal.rate, r, sizeof(r));
+    return true;
+}
+
+static void cal_apply_defaults(void)
+{
+    for (int b = 0; b < SOLUTION_BOTTLES; b++)
+        for (int i = 0; i < 3; i++)
+            if (!(s_cal.rate[b][i] > 0.0f)) s_cal.rate[b][i] = DEFAULT_RATE[i];
 }
 
 static sol_rt_entry_t *rt_find(uint32_t id, bool create)
@@ -192,9 +244,60 @@ static void arm(uint32_t entry_id, uint8_t bottle, const solution_cfg_t *cfg)
 
 void solution_init(void)
 {
-    nvs_load(NVS_KEY_CAL, &s_cal, sizeof(s_cal), CAL_MAGIC);
-    nvs_load(NVS_KEY_RT,  &s_rt,  sizeof(s_rt),  RT_MAGIC);
+    /* Calibration: file first. Units calibrated before the file existed keep
+     * their rates in the NVS blob -- copy them into the file once, then drop
+     * the blob. Anything still unset falls back to DEFAULT_RATE. */
+    bool had_nvs_cal = false;
+    memset(&s_cal, 0, sizeof(s_cal));
+    s_cal.magic = CAL_MAGIC;
+    if (!cal_file_load()) {
+        nvs_load(NVS_KEY_CAL, &s_cal, sizeof(s_cal), CAL_MAGIC);
+        for (int b = 0; b < SOLUTION_BOTTLES; b++)
+            for (int i = 0; i < 3; i++)
+                if (s_cal.rate[b][i] > 0.0f) had_nvs_cal = true;
+        cal_apply_defaults();
+        if (cal_file_save()) {
+            nvs_handle_t h;
+            if (nvs_open(NVS_NS, NVS_READWRITE, &h) == ESP_OK) {
+                nvs_erase_key(h, NVS_KEY_CAL);
+                nvs_commit(h);
+                nvs_close(h);
+            }
+            ESP_LOGI(TAG, "%s written (%s)", CAL_FILE,
+                     had_nvs_cal ? "migrated from NVS" : "defaults");
+        }
+    }
+    cal_apply_defaults();
+
+    nvs_load(NVS_KEY_RT, &s_rt, sizeof(s_rt), RT_MAGIC);
+
+    /* Enable flag. Absent = first boot with this setting: stay on for a unit
+     * that was already calibrated (it is clearly in use), otherwise off so
+     * units without pumps show no bottle UI. */
+    uint8_t en = 0xFF;
+    nvs_handle_t h;
+    if (nvs_open(NVS_NS, NVS_READONLY, &h) == ESP_OK) {
+        nvs_get_u8(h, NVS_KEY_EN, &en);
+        nvs_close(h);
+    }
+    if (en == 0xFF) solution_set_enabled(had_nvs_cal);
+    else            s_enabled = (en != 0);
+
     memset(&s_run, 0, sizeof(s_run));
+}
+
+bool solution_enabled(void) { return s_enabled; }
+
+void solution_set_enabled(bool on)
+{
+    s_enabled = on;
+    nvs_handle_t h;
+    if (nvs_open(NVS_NS, NVS_READWRITE, &h) == ESP_OK) {
+        nvs_set_u8(h, NVS_KEY_EN, on ? 1 : 0);
+        nvs_commit(h);
+        nvs_close(h);
+    }
+    if (!on) solution_on_run_end();   /* a dose in progress stops now */
 }
 
 float solution_rate(uint8_t bottle, uint8_t speed)
@@ -209,9 +312,8 @@ bool solution_set_rate(uint8_t bottle, uint8_t speed, float ml_s)
     int si = speed_index(speed);
     if (bottle < 1 || bottle > SOLUTION_BOTTLES || si < 0) return false;
     if (!(ml_s >= 0.0f) || ml_s > 100.0f) return false;
-    s_cal.rate[bottle - 1][si] = ml_s;
-    nvs_store(NVS_KEY_CAL, &s_cal, sizeof(s_cal));
-    return true;
+    s_cal.rate[bottle - 1][si] = (ml_s > 0.0f) ? ml_s : DEFAULT_RATE[si];   /* 0 = back to default */
+    return cal_file_save();
 }
 
 int solution_cal_json(char *buf, size_t len)
@@ -221,7 +323,9 @@ int solution_cal_json(char *buf, size_t len)
         n += snprintf(buf + n, len - n, "%s[%.3f,%.3f,%.3f]", b ? "," : "",
                       s_cal.rate[b][0], s_cal.rate[b][1], s_cal.rate[b][2]);
     }
-    n += snprintf(buf + n, len - n, "]}");
+    n += snprintf(buf + n, len - n, "],\"defaults\":[%.3f,%.3f,%.3f],\"enabled\":%s}",
+                  DEFAULT_RATE[0], DEFAULT_RATE[1], DEFAULT_RATE[2],
+                  s_enabled ? "true" : "false");
     return n;
 }
 
@@ -279,7 +383,7 @@ int solution_entry_json(const schedule_entry_t *e, char *buf, size_t len)
 void solution_arm_entry(const schedule_entry_t *e)
 {
     solution_on_run_end();
-    if (!e || !e->solution_enabled) return;
+    if (!s_enabled || !e || !e->solution_enabled) return;
 
     sol_rt_entry_t *rt = rt_find(e->id, true);
     if (e->solution_when == SOLUTION_WHEN_NTH) {
@@ -303,7 +407,7 @@ void solution_arm_entry(const schedule_entry_t *e)
 void solution_arm_manual(uint8_t bottle, const solution_cfg_t *cfg)
 {
     solution_on_run_end();
-    if (bottle < 1 || bottle > SOLUTION_BOTTLES || !cfg) return;
+    if (!s_enabled || bottle < 1 || bottle > SOLUTION_BOTTLES || !cfg) return;
     solution_cfg_t c = *cfg;
     c.bottles = (uint8_t)(1u << (bottle - 1));
     c.speed   = pump_clamp_speed(c.speed);
@@ -363,8 +467,9 @@ int solution_status_json(char *buf, size_t len)
     static const char *PH[] = { "idle", "waiting", "delay", "dosing", "done" };
     float rate = s_run.armed ? solution_rate(s_run.bottle, s_run.cfg.speed) : 0.0f;
     return snprintf(buf, len,
-        "{\"armed\":%s,\"phase\":\"%s\",\"bottle\":%u,\"speed\":%u,\"pulse\":%u,"
+        "{\"enabled\":%s,\"armed\":%s,\"phase\":\"%s\",\"bottle\":%u,\"speed\":%u,\"pulse\":%u,"
         "\"pump_s\":%lu,\"ml\":%.1f}",
+        s_enabled ? "true" : "false",
         s_run.armed ? "true" : "false", PH[s_run.phase],
         solution_bottle(), s_run.armed ? s_run.cfg.speed : 0,
         s_run.armed ? s_run.cfg.pulse : 0,

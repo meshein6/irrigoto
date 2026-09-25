@@ -3,11 +3,13 @@
  * solution.h -- "Apply solution": dose a watering run from one of three
  * bottles using the peristaltic pumps (pump.h).
  *
- * Owns three things, each in its own NVS blob so upstream snapshots and HA
- * schedule pushes can never disturb them:
+ * Owns three things, kept out of the schedule store so upstream snapshots and
+ * HA schedule pushes can never disturb them:
  *   - calibration  : mL/s per bottle per pump speed, entered on the Bottle
- *                    calibration page. Used ONLY for the "~X mL per run"
- *                    estimate; the device cannot measure flow.
+ *                    calibration page, stored in /lfs/cal/bottle.json with
+ *                    built-in defaults (0.30 / 0.23 / 0.17 mL/s). Used ONLY
+ *                    for the "~X mL per run" estimate; the device cannot
+ *                    measure flow.
  *   - run counters : per schedule-entry id, "runs since last dose" (Every
  *                    Nth run) and the bottle rotation pointer.
  *   - the live run : armed config for the watering run in progress, the
@@ -53,12 +55,21 @@ typedef struct {
     uint16_t off_s;
 } solution_cfg_t;
 
-void  solution_init(void);        /* load NVS blobs; call after pump_init() */
+void  solution_init(void);        /* load cal file + NVS; call after pump_init() and storage_init() */
+
+/* ── Enable ("Bottles" device setting) ──
+ * Off: no dose is ever armed (manual or scheduled) and the pages hide every
+ * bottle control. Entry settings are kept, so turning it back on restores
+ * them. Persisted in NVS; first boot defaults to on only if the unit already
+ * had a bottle calibration. */
+bool  solution_enabled(void);
+void  solution_set_enabled(bool on);
 
 /* ── Calibration ── */
-float solution_rate(uint8_t bottle, uint8_t speed);                 /* mL/s, 0 = not set */
-bool  solution_set_rate(uint8_t bottle, uint8_t speed, float ml_s);  /* persists; false = bad args */
-/* JSON: {"rates":[[full,med,low],[..],[..]]} (bottle 1..3 x speed 100/80/60) */
+float solution_rate(uint8_t bottle, uint8_t speed);                 /* mL/s (calibrated or default); 0 = bad args */
+bool  solution_set_rate(uint8_t bottle, uint8_t speed, float ml_s);  /* persists to /lfs/cal/bottle.json; 0 = back to default; false = bad args */
+/* JSON: {"speeds":[100,80,60],"rates":[[full,med,low],[..],[..]],
+ *        "defaults":[full,med,low],"enabled":b} (bottle 1..3 x speed 100/80/60) */
 int   solution_cal_json(char *buf, size_t len);
 
 /* ── Schedule entry helpers ── */
@@ -83,6 +94,6 @@ bool     solution_armed(void);      /* this run will / is dosing */
 bool     solution_pumping(void);    /* pump currently on for a dose */
 uint8_t  solution_bottle(void);     /* bottle chosen for this run, 0 = none */
 uint32_t solution_pump_seconds(void);   /* accumulated pump-on time this run */
-/* JSON object: {"armed":b,"phase":"idle|waiting|delay|dosing|done","bottle":n,
+/* JSON object: {"enabled":b,"armed":b,"phase":"idle|waiting|delay|dosing|done","bottle":n,
  *               "speed":n,"pulse":b,"pump_s":n,"est_ml":x} */
 int   solution_status_json(char *buf, size_t len);

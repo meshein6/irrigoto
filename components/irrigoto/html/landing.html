@@ -221,7 +221,7 @@ section{margin-bottom:18px;}
       <div class="zone-actions">
         <a class="btn" href="/cal">&#128200; Pressure cal</a>
         <a class="btn" href="/cal#speed">&#9992; Speed cal</a>
-        <a class="btn" href="/bottle_cal">&#129514; Bottle cal</a>
+        <a class="btn" href="/bottle_cal" id="bottle-cal-link" style="display:none">&#129514; Bottle cal</a>
       </div>
     </div>
   </section>
@@ -241,6 +241,13 @@ section{margin-bottom:18px;}
         <span class="dev-label">Theme (light)</span>
         <label class="theme-switch">
           <input type="checkbox" id="theme-cb" onchange="setTheme(this.checked?'light':'dark')">
+          <span class="theme-slider"></span>
+        </label>
+      </div>
+      <div class="dev-row" title="Turn on if this unit has the three solution pumps and bottles fitted. Adds Apply solution to manual runs and schedule entries, and the Bottle cal page. Off hides all of it and no solution is ever pumped; saved entry settings are kept.">
+        <span class="dev-label">Bottles (solution pumps)</span>
+        <label class="theme-switch">
+          <input type="checkbox" id="bottles-cb" onchange="setBottles(this.checked)">
           <span class="theme-slider"></span>
         </label>
       </div>
@@ -507,9 +514,25 @@ function selMode(btn){
 // mode digit maps to a schedule (mode, depth) pair for the run-length estimate.
 const SOL_KEY='irrigoto_solution';
 const SOL_MODE_MAP={'1':[0,1],'2':[0,2],'3':[0,2],'5':[1,1],'6':[1,2],'7':[2,1],'8':[3,1]};
-let solRates=null, solEstMin=0, solEstReq=0;
+let solRates=null, solEstMin=0, solEstReq=0, solEnabled=false;
 function solLoadRates(){
-  fetch('/api/solution_cal',{cache:'no-store'}).then(r=>r.json()).then(d=>{solRates=d.rates||null; solEst();}).catch(()=>{});
+  fetch('/api/solution_cal',{cache:'no-store'}).then(r=>r.json()).then(d=>{
+    solRates=d.rates||null; applyBottles(!!d.enabled); solEst();
+  }).catch(()=>{});
+}
+// "Bottles" device setting: off hides every bottle control on this page.
+function applyBottles(on){
+  solEnabled=on;
+  document.getElementById('bottles-cb').checked=on;
+  document.getElementById('bottle-cal-link').style.display=on?'':'none';
+  if(!on) document.getElementById('sol-block').style.display='none';
+}
+async function setBottles(on){
+  try{
+    const r=await fetch('/api/solution_cal',{method:'POST',body:'enabled='+(on?1:0),
+      headers:{'Content-Type':'application/x-www-form-urlencoded'}});
+    const d=await r.json(); solRates=d.rates||solRates; applyBottles(!!d.enabled);
+  }catch(e){ applyBottles(!on); }
 }
 function solRestore(){
   let s={}; try{ s=JSON.parse(localStorage.getItem(SOL_KEY)||'{}'); }catch(e){}
@@ -545,7 +568,7 @@ function solToggle(){
   solEst(); solSave();
 }
 function solModeChanged(){
-  const applicable = !!SOL_MODE_MAP[selModeDat];
+  const applicable = solEnabled && !!SOL_MODE_MAP[selModeDat];
   document.getElementById('sol-block').style.display = applicable ? '' : 'none';
   if(!applicable) return;
   const [m,d]=SOL_MODE_MAP[selModeDat];
@@ -575,7 +598,7 @@ async function startWater(){
     body += '&duration=' + d;
   }
   const sol=solState();
-  if (sol.enabled && SOL_MODE_MAP[selModeDat]) {
+  if (solEnabled && sol.enabled && SOL_MODE_MAP[selModeDat]) {
     solSave();
     body += '&solution_enabled=1&solution_bottle='+sol.bottle+'&solution_speed='+sol.speed+
             '&solution_pulse='+(sol.pulse?1:0)+'&solution_pulse_on_s='+sol.on+'&solution_pulse_off_s='+sol.off;
@@ -691,6 +714,8 @@ async function refresh(){
     }
     renderZones(d.zones);
     lastSolution = d.solution || null;
+    if (lastSolution && typeof lastSolution.enabled === 'boolean' && lastSolution.enabled !== solEnabled)
+      applyBottles(lastSolution.enabled);
     updateWateringState(d.watering, d.water_mode, d.water_est_min, d.water_zone_id, d.cleanup_pass||0);
   }catch(e){ dot(false); }
 }
