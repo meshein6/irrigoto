@@ -11307,6 +11307,11 @@ static void phase_water_zone(void)
     // --- Load zone perimeter ---
     zone_perimeter_t zone = {0};
     bool have_zone = (zone_load_primary(s_water_zone_id, &zone) == ESP_OK && zone.num_points >= 2);
+    // b535: per-zone ring order. Sequential walks the rings outer -> inner in
+    // order for every mode, which for Smooth means bypassing its deficit/pump
+    // scheduler. 0 / missing = auto, i.e. each mode's existing order.
+    const bool seq_ring_order = (zone.ring_order == ZONE_RING_ORDER_SEQUENTIAL);
+    if (seq_ring_order) INFO("Ring order: sequential (per-zone setting)");
     if (have_zone) zone_sort_walk_order(&zone);
     INFO("Firmware build: %d", FW_BUILD);
     if (have_zone) INFO("Zone perimeter: %d points.", zone.num_points);
@@ -12206,7 +12211,12 @@ static void phase_water_zone(void)
         // no benefit, and pulse uses a completely different loop above.
         int ring;
         bool was_trigger_fire = false;   // b502: for post-fire futility check
-        if (smooth_mode) {
+        // b535: a zone set to "One ring at a time" bypasses smooth's
+        // deficit/pump scheduler and walks the rings in order, like gentle
+        // and pulse. Satisfied rings are still skipped by the adaptive checks
+        // below; what is given up is pump-peak timing, which only matters on
+        // a well/tank supply.
+        if (smooth_mode && !seq_ring_order) {
             // b499: throw-recovery endgame -- trigger-aware peak hunting.
             // When every remaining eligible ring is throw-driven (depth met,
             // throw short), firing order should follow the pump, not the
@@ -14555,13 +14565,14 @@ static int zone_build_json(char *buf, int maxlen)
         "\"at_min\":%s,\"at_max\":%s,\"points\":%s,"
         "\"act_max_throw\":%.0f,\"fw_build\":%d,"
         "\"actual_throw_mm\":%.0f,\"act_min_throw\":%.0f,"
-        "\"name\":\"%s\"}",
+        "\"ring_order\":%u,\"name\":\"%s\"}",
         nozzle_deg, throw_mm, throw_ft, s_web_pres_pct,
         s_web_water ? "true" : "false",
         at_min ? "true" : "false",
         at_max ? "true" : "false",
         pts, act_max_throw_mm, FW_BUILD,
         actual_throw_mm, act_min_throw_mm,
+        (unsigned)s_web_zone.ring_order,   // b535
         s_web_zone_name);
 }
 
@@ -14844,6 +14855,11 @@ static esp_err_t zone_act_handler(httpd_req_t *req)
         httpd_query_key_value(query, "name", name_param, sizeof(name_param));
         url_decode(name_param, sizeof(name_param));
         if (name_param[0]) strncpy(s_web_zone_name, name_param, sizeof(s_web_zone_name)-1);
+        // b535: per-zone ring order rides along on the save.
+        char ro_param[8] = {0};
+        if (httpd_query_key_value(query, "ring_order", ro_param, sizeof(ro_param)) == ESP_OK)
+            s_web_zone.ring_order = (atoi(ro_param) == ZONE_RING_ORDER_SEQUENTIAL)
+                                    ? ZONE_RING_ORDER_SEQUENTIAL : ZONE_RING_ORDER_AUTO;
         esp_err_t _save_err = zone_save_primary(s_web_zone_id, s_web_zone_name, &s_web_zone);
         if (_save_err != ESP_OK) {
             ESP_LOGE(TAG, "Zone %u save FAILED: %s", s_web_zone_id, esp_err_to_name(_save_err));
