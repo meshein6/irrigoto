@@ -89,6 +89,26 @@ watching the pumps and using `PCur` (GPIO34) as the electrical witness.
   - a jog button for priming
   - live pump current while jogging
   - rates only feed the estimate; the device can't measure flow
+  - stored as **`/lfs/cal/bottle.json`**, next to `pressure.json` and
+    `speed.json`, so it shows on `/fs` and can be backed up
+  - **built-in default rates** for any uncalibrated bottle, and a **Defaults**
+    button on the page:
+
+    | Speed | Default rate |
+    |---|---|
+    | Full (100 %) | 0.30 mL/s |
+    | Medium (80 %) | 0.23 mL/s |
+    | Low (60 %) | 0.17 mL/s |
+
+    Posting `rate=0` restores the default.
+- **"Bottles" device setting** (landing page Device card, with an ⓘ):
+  - **Off:** the Bottle cal link and every Apply solution block (Water modal,
+    schedule entries) are hidden, and the firmware never arms a dose, manual or
+    scheduled. Saved entry settings are kept, so turning it back on restores
+    them.
+  - **Default:** off on units that were never calibrated, so pump-less units
+    show no bottle UI. A unit that already had a bottle calibration comes up
+    **on**.
 - **Runtime:**
   - the pump starts **10 s after water is confirmed flowing**, then holds or
     pulses until the run ends
@@ -107,8 +127,11 @@ New modules, kept separate so they re-apply cleanly on upstream snapshots:
   `pump_start(pump, speed%)`, `pump_stop`, `pump_running`, `pump_active`,
   `pump_speed`, `pump_elapsed_ms`, `pump_read_ma`, `pump_clamp_speed`.
 - **`components/irrigoto/solution.c/.h`**: dosing logic.
-  - Calibration (mL/s per bottle × speed) and per-entry run counters (every-Nth
-    count, rotation pointer) live in their **own NVS namespace, `solution`**, so
+  - Calibration (mL/s per bottle × speed) is the file `/lfs/cal/bottle.json`.
+    Rates saved in NVS by earlier dosing builds are copied into the file once on
+    boot, then the NVS key is erased.
+  - The per-entry run counters (every-Nth count, rotation pointer) and the
+    Bottles on/off flag live in their **own NVS namespace, `solution`**, so
     HA schedule pushes can never disturb them.
   - A small task on PRO_CPU runs the per-run state machine: armed → waiting for
     flow → 10 s delay → dosing → done.
@@ -122,7 +145,7 @@ New modules, kept separate so they re-apply cleanly on upstream snapshots:
     - first flow in the ring loop
     - first flow in the serpentine glide
   - `/api/all` carries a `"solution"` status object:
-    `armed, phase, bottle, speed, pulse, pump_s, est_ml`.
+    `enabled, armed, phase, bottle, speed, pulse, pump_s, ml`.
   - The landing page's watering bar shows the dose next to the countdown.
 - **`irrigoto_types.h`**: schedule entries widen **20 → 32 bytes, schema 3 → 4**.
   The new fields are:
@@ -148,8 +171,9 @@ New modules, kept separate so they re-apply cleanly on upstream snapshots:
 - **New endpoints** (`max_uri_handlers` 76 → 82, the `uris[]` static assert
   74 → 80):
   - `GET /bottle_cal`: page
-  - `GET/POST /api/solution_cal`: `{"speeds":[100,80,60],"rates":[[…]×3]}`;
-    POST `bottle=&speed=&rate=` (0 clears)
+  - `GET/POST /api/solution_cal`: `{"speeds":[100,80,60],"rates":[[…]×3],
+    "defaults":[…],"enabled":b}`; POST `bottle=&speed=&rate=` (0 = back to
+    default) or `enabled=0|1` (the Bottles setting)
   - `GET/POST /api/pump_jog`: POST `pump=1..3&speed=60..100&s=1..120` or
     `stop=1`; GET returns `running, pump, speed, elapsed_ms, ma`
   - `GET /api/solution_est?zone=&mode=&depth=`: `{"est_min":n}`
@@ -168,7 +192,8 @@ are recorded above and in the README.
 
 ## Compatibility
 
-- Units without pumps: no behaviour change unless a run requests a dose.
+- Units without pumps: no behaviour change. The Bottles setting defaults to off,
+  so no bottle UI shows and nothing can dose.
 - The schedule NVS migrates automatically, forward only. Downgrading to
   firmware without this change would not read the 32-byte entries.
 - HA packages need no changes. HA doesn't show or edit the solution block
@@ -178,6 +203,10 @@ are recorded above and in the README.
 
 - Built and flashed over the air on a pump-equipped unit (no rollback).
 - All three pages driven end to end against a mock of the device API.
+- The calibration file, default rates and Bottles setting were added after that
+  hardware test. `solution.c` passes a strict syntax check, but those three
+  additions still need an on-device run: an upgrade from NVS rates, a fresh unit,
+  and toggling Bottles off and on.
 - Resources: RAM 95.6 %, flash 82.1 %.
 
 ## Known gaps / notes for the maintainer
@@ -190,5 +219,4 @@ are recorded above and in the README.
   meantime, renumber this one when re-applying. The migration keys off the old
   blob size (644 B), so only the constant changes.
 - Only the calibration estimate needs mL/s. The device can't meter volume.
-- Follow-ups: `feature/solution-dosing-improvements` (calibration as a file,
-  default rates, enable toggle), and bottle columns in `feature/run-history`.
+- Follow-up: bottle columns in `feature/run-history`.

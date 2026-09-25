@@ -43,8 +43,6 @@ number (see CONTRIBUTING.md). So fork branches must not claim build numbers:
 | Branch | Type | Status | Description |
 |---|---|---|---|
 | `feature/solution-dosing` | feature | **done**, in `combined` | [Three-bottle pump dosing](feature-solution-dosing.md) |
-| `feature/solution-dosing-improvements` | feature | planned (cut from `feature/solution-dosing`) | [Dosing cal file, default rates, enable toggle](feature-solution-dosing-improvements.md) |
-| `fix/pulse-ring-swing` | fix | planned | [Valve left open during ring-change swing](fix-pulse-ring-swing.md) |
 | `feature/supply-regulated` | feature | planned | ["Supply regulated" setting to skip the 12 s pressure check](feature-supply-regulated.md) |
 | `feature/manual-mode-depth` | feature | planned | [Manual run: pick mode and depth separately, mode tooltips](feature-manual-mode-depth.md) |
 | `fix/throw-cal-units` | fix | planned | [Say mm / feet on the throw calibration steps](fix-throw-cal-units.md) |
@@ -52,19 +50,21 @@ number (see CONTRIBUTING.md). So fork branches must not claim build numbers:
 | `feature/zone-map-zoom` | feature | planned | [Zoom the Zone Setup map to the zone](feature-zone-map-zoom.md) |
 | `feature/mode-path-preview` | feature | planned | [Path preview per mode (manual + schedule)](feature-mode-path-preview.md) |
 | `feature/run-history` | feature | planned | [Per-run history log file + History card](feature-run-history.md) |
-| `fix/rain-delay-feedback` | fix | planned, low priority | [Rain delay: clock-unset error and inline status](fix-rain-delay-feedback.md) |
+
+Dropped (not worth doing now / not an issue): `fix/pulse-ring-swing`,
+`fix/rain-delay-feedback`, and `feature/solution-dosing-improvements` (folded
+into `feature/solution-dosing`).
 
 ## Suggested order and dependencies
 
-1. `fix/pulse-ring-swing`: real bug; `feature/ring-order` changes the same loop.
-2. `feature/supply-regulated`, `fix/throw-cal-units`, `feature/zone-map-zoom`:
+1. `feature/supply-regulated`, `fix/throw-cal-units`, `feature/zone-map-zoom`:
    independent of everything else.
-3. `feature/manual-mode-depth`: after `feature/solution-dosing` if both go
+2. `feature/manual-mode-depth`: after `feature/solution-dosing` if both go
    upstream, because both edit the landing page's Water modal.
-4. `feature/ring-order`: after the swing fix.
-5. `feature/mode-path-preview`: after manual-mode-depth, ring-order and zoom.
-6. `feature/run-history`: any time. Its bottle columns need solution dosing.
-7. `feature/solution-dosing-improvements`: on top of `feature/solution-dosing`.
+3. `feature/ring-order`. Its "one ring at a time" option also removes the
+   open-valve swing back between rings.
+4. `feature/mode-path-preview`: after manual-mode-depth, ring-order and zoom.
+5. `feature/run-history`: any time. Its bottle columns need solution dosing.
 
 For larger or behaviour-changing work (solution dosing, ring order, supply
 regulated), open an upstream issue first to check the maintainer wants it.
