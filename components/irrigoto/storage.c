@@ -310,6 +310,10 @@ esp_err_t storage_zone_load(uint16_t id, char *name_out, size_t name_len,
         int np = 0;
         json_get_int(json, "num_points", &np);
         zone_out->num_points = (uint8_t)np;
+        /* b535: absent -> 0 = auto, so pre-b535 zone files are unchanged. */
+        int ro = 0;
+        json_get_int(json, "ring_order", &ro);
+        zone_out->ring_order = (ro == ZONE_RING_ORDER_SEQUENTIAL) ? (uint8_t)ro : 0;
 
         /* Points array: "points":[{...},{...},...] */
         const char *pp = strstr(json, "\"points\":");
@@ -378,6 +382,9 @@ esp_err_t storage_zone_parse_json(const char *json, int *out_id,
     memset(zone_out, 0, sizeof(*zone_out));
     int np = 0;
     json_get_int(json, "num_points", &np);
+    int _ro = 0;
+    json_get_int(json, "ring_order", &_ro);           /* b535 */
+    zone_out->ring_order = (_ro == ZONE_RING_ORDER_SEQUENTIAL) ? (uint8_t)_ro : 0;
     if (np < 0) np = 0;
     if (np > ZONE_MAX_PERIM_POINTS) np = ZONE_MAX_PERIM_POINTS;
 
@@ -434,6 +441,7 @@ esp_err_t storage_zone_save(uint16_t id, const char *name, const zone_perimeter_
     fprintf(f, "  \"id\": %u,\n", id);
     fprintf(f, "  \"name\": \"%s\",\n", name ? name : "Zone");
     fprintf(f, "  \"num_points\": %u,\n", zone->num_points);
+    fprintf(f, "  \"ring_order\": %u,\n", zone->ring_order);   /* b535 */
     fprintf(f, "  \"points\": [\n");
     for (int i = 0; i < zone->num_points; i++) {
         const perimeter_point_t *p = &zone->points[i];
