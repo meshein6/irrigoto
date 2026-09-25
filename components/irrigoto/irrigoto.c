@@ -16328,6 +16328,9 @@ static esp_err_t api_supply_regulated_handler(httpd_req_t *req)
     int n = snprintf(resp, sizeof(resp), "{\"supply_regulated\":%s}",
                      s_supply_regulated ? "true" : "false");
     httpd_resp_send(req, resp, n);
+    return ESP_OK;
+}
+
 static void runs_send_row(const char *line, void *ctx)
 {
     httpd_req_t *req = (httpd_req_t *)ctx;
@@ -19081,7 +19084,7 @@ static void zone_web_start(void)
         {.uri="/fs/upload",             .method=HTTP_POST, .handler=fs_upload_handler},
         {.uri="/fs/delete",             .method=HTTP_POST, .handler=fs_delete_handler},
     };
-    cfg.max_uri_handlers  = 87;  // b535: 86 -> 87 (/api/runs GET); 84 -> 86 (/api/supply_regulated GET+POST); wifi & power modal: 82 -> 84 (/api/wifi_power GET+POST); solution dosing: 76 -> 82 (/bottle_cal, /api/solution_cal x2, /api/pump_jog x2, /api/solution_est); b525: 74 -> 76 (/api/winter GET+POST); b522: 72 -> 74 (/api/fault_hold GET+POST); b512: 70 -> 72 (/api/uart_log GET+POST); b489: 68 -> 70, keeping the 2-slot margin over
+    _Static_assert(sizeof(uris)/sizeof(uris[0]) <= 85,   // b535: 84 -> 85 (/api/runs GET); 82 -> 84 (/api/supply_regulated GET+POST); wifi & power modal: 80 -> 82 (/api/wifi_power GET+POST); solution dosing: 74 -> 80 (see max_uri_handlers); b525: 72 -> 74 (/api/winter GET+POST); b522: 70 -> 72 (/api/fault_hold GET+POST); b512: 68 -> 70 (/api/uart_log GET+POST); b489: 66 -> 68
                    "uris[] exceeds cfg.max_uri_handlers -- raise it before httpd_start");
     for (size_t i = 0; i < sizeof(uris)/sizeof(uris[0]); i++)
         httpd_register_uri_handler(s_zone_server, &uris[i]);
