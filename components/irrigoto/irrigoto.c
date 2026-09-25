@@ -11406,6 +11406,11 @@ static void phase_water_zone(void)
     // --- Load zone perimeter ---
     zone_perimeter_t zone = {0};
     bool have_zone = (zone_load_primary(s_water_zone_id, &zone) == ESP_OK && zone.num_points >= 2);
+    // b535: per-zone ring order. Sequential walks the rings outer -> inner in
+    // order for every mode, which for Smooth means bypassing its deficit/pump
+    // scheduler. 0 / missing = auto, i.e. each mode's existing order.
+    const bool seq_ring_order = (zone.ring_order == ZONE_RING_ORDER_SEQUENTIAL);
+    if (seq_ring_order) INFO("Ring order: sequential (per-zone setting)");
     if (have_zone) zone_sort_walk_order(&zone);
     INFO("Firmware build: %d", FW_BUILD);
     if (have_zone) INFO("Zone perimeter: %d points.", zone.num_points);
@@ -12316,7 +12321,12 @@ static void phase_water_zone(void)
         // no benefit, and pulse uses a completely different loop above.
         int ring;
         bool was_trigger_fire = false;   // b502: for post-fire futility check
-        if (smooth_mode) {
+        // b535: a zone set to "One ring at a time" bypasses smooth's
+        // deficit/pump scheduler and walks the rings in order, like gentle
+        // and pulse. Satisfied rings are still skipped by the adaptive checks
+        // below; what is given up is pump-peak timing, which only matters on
+        // a well/tank supply.
+        if (smooth_mode && !seq_ring_order) {
             // b499: throw-recovery endgame -- trigger-aware peak hunting.
             // When every remaining eligible ring is throw-driven (depth met,
             // throw short), firing order should follow the pump, not the
@@ -14591,6 +14601,13 @@ static const char s_bottle_cal_html[] =
 #include "bottle_cal_html.h"
 ;
 
+// b535: shared browser code, served as its own file so zone_setup, landing
+// and schedule all use ONE copy of the path geometry instead of embedding a
+// duplicate each. Cached hard -- it only changes with a firmware update.
+static const char s_path_js[] =
+#include "path_js.h"
+;
+
 // Open-loop valve move using calibration table
 #define ZONE_VALVE_OPEN_LOOP() do { \
     if (s_web_water) { \
@@ -14700,13 +14717,14 @@ static int zone_build_json(char *buf, int maxlen)
         "\"at_min\":%s,\"at_max\":%s,\"points\":%s,"
         "\"act_max_throw\":%.0f,\"fw_build\":%d,"
         "\"actual_throw_mm\":%.0f,\"act_min_throw\":%.0f,"
-        "\"name\":\"%s\"}",
+        "\"ring_order\":%u,\"name\":\"%s\"}",
         nozzle_deg, throw_mm, throw_ft, s_web_pres_pct,
         s_web_water ? "true" : "false",
         at_min ? "true" : "false",
         at_max ? "true" : "false",
         pts, act_max_throw_mm, FW_BUILD,
         actual_throw_mm, act_min_throw_mm,
+        (unsigned)s_web_zone.ring_order,   // b535
         s_web_zone_name);
 }
 
@@ -14989,6 +15007,11 @@ static esp_err_t zone_act_handler(httpd_req_t *req)
         httpd_query_key_value(query, "name", name_param, sizeof(name_param));
         url_decode(name_param, sizeof(name_param));
         if (name_param[0]) strncpy(s_web_zone_name, name_param, sizeof(s_web_zone_name)-1);
+        // b535: per-zone ring order rides along on the save.
+        char ro_param[8] = {0};
+        if (httpd_query_key_value(query, "ring_order", ro_param, sizeof(ro_param)) == ESP_OK)
+            s_web_zone.ring_order = (atoi(ro_param) == ZONE_RING_ORDER_SEQUENTIAL)
+                                    ? ZONE_RING_ORDER_SEQUENTIAL : ZONE_RING_ORDER_AUTO;
         esp_err_t _save_err = zone_save_primary(s_web_zone_id, s_web_zone_name, &s_web_zone);
         if (_save_err != ESP_OK) {
             ESP_LOGE(TAG, "Zone %u save FAILED: %s", s_web_zone_id, esp_err_to_name(_save_err));
@@ -16363,6 +16386,14 @@ static esp_err_t api_runs_handler(httpd_req_t *req)
     // The DRAM segment is ~95 % full; a static buffer here cost 3.8 KB.
     storage_runs_tail_cb(limit, runs_send_row, req);
     httpd_resp_send_chunk(req, NULL, 0);
+    return ESP_OK;
+}
+
+static esp_err_t path_js_handler(httpd_req_t *req)
+{
+    httpd_resp_set_type(req, "application/javascript");
+    httpd_resp_set_hdr(req, "Cache-Control", "public, max-age=86400");
+    httpd_resp_sendstr(req, s_path_js);
     return ESP_OK;
 }
 
@@ -18979,7 +19010,7 @@ static void zone_web_start(void)
     httpd_config_t cfg   = HTTPD_DEFAULT_CONFIG();
     cfg.server_port      = ZONE_WEB_PORT;
     cfg.ctrl_port        = ZONE_WEB_CTRL_PORT;
-    cfg.max_uri_handlers  = 87;  // b535: 86 -> 87 (/api/runs GET); 84 -> 86 (/api/supply_regulated GET+POST); wifi & power modal: 82 -> 84 (/api/wifi_power GET+POST); solution dosing: 76 -> 82 (/bottle_cal, /api/solution_cal x2, /api/pump_jog x2, /api/solution_est); b525: 74 -> 76 (/api/winter GET+POST); b522: 72 -> 74 (/api/fault_hold GET+POST); b512: 70 -> 72 (/api/uart_log GET+POST); b489: 68 -> 70, keeping the 2-slot margin over
+    cfg.max_uri_handlers  = 88;  // b535: 87 -> 88 (/path.js GET); 86 -> 87 (/api/runs GET); 84 -> 86 (/api/supply_regulated GET+POST); wifi & power modal: 82 -> 84 (/api/wifi_power GET+POST); solution dosing: 76 -> 82 (/bottle_cal, /api/solution_cal x2, /api/pump_jog x2, /api/solution_est); b525: 74 -> 76 (/api/winter GET+POST); b522: 72 -> 74 (/api/fault_hold GET+POST); b512: 70 -> 72 (/api/uart_log GET+POST); b489: 68 -> 70, keeping the 2-slot margin over
                                  // the _Static_assert below.
                                  // MUST be set before httpd_start (cfg is copied there);
                                  // headroom over uris[] count -- _Static_assert below guards it.
@@ -19012,6 +19043,7 @@ static void zone_web_start(void)
         {.uri="/api/auto_sleep",  .method=HTTP_POST, .handler=api_auto_sleep_handler},  // b447
         {.uri="/api/wifi_power",  .method=HTTP_GET,  .handler=api_wifi_power_handler},  // wifi & power modal
         {.uri="/api/wifi_power",  .method=HTTP_POST, .handler=api_wifi_power_handler},  // wifi & power modal
+        {.uri="/path.js",         .method=HTTP_GET,  .handler=path_js_handler},   // b535
         {.uri="/api/detail_log",  .method=HTTP_GET,  .handler=api_detail_log_handler},
         {.uri="/api/supply_regulated", .method=HTTP_GET,  .handler=api_supply_regulated_handler},  // b535
         {.uri="/api/supply_regulated", .method=HTTP_POST, .handler=api_supply_regulated_handler},  // b535
@@ -19084,7 +19116,7 @@ static void zone_web_start(void)
         {.uri="/fs/upload",             .method=HTTP_POST, .handler=fs_upload_handler},
         {.uri="/fs/delete",             .method=HTTP_POST, .handler=fs_delete_handler},
     };
-    _Static_assert(sizeof(uris)/sizeof(uris[0]) <= 85,   // b535: 84 -> 85 (/api/runs GET); 82 -> 84 (/api/supply_regulated GET+POST); wifi & power modal: 80 -> 82 (/api/wifi_power GET+POST); solution dosing: 74 -> 80 (see max_uri_handlers); b525: 72 -> 74 (/api/winter GET+POST); b522: 70 -> 72 (/api/fault_hold GET+POST); b512: 68 -> 70 (/api/uart_log GET+POST); b489: 66 -> 68
+    _Static_assert(sizeof(uris)/sizeof(uris[0]) <= 86,   // b535: 85 -> 86 (/path.js GET); 84 -> 85 (/api/runs GET); 82 -> 84 (/api/supply_regulated GET+POST); wifi & power modal: 80 -> 82 (/api/wifi_power GET+POST); solution dosing: 74 -> 80 (see max_uri_handlers); b525: 72 -> 74 (/api/winter GET+POST); b522: 70 -> 72 (/api/fault_hold GET+POST); b512: 68 -> 70 (/api/uart_log GET+POST); b489: 66 -> 68
                    "uris[] exceeds cfg.max_uri_handlers -- raise it before httpd_start");
     for (size_t i = 0; i < sizeof(uris)/sizeof(uris[0]); i++)
         httpd_register_uri_handler(s_zone_server, &uris[i]);

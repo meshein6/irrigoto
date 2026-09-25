@@ -38,8 +38,15 @@ typedef struct {
     uint8_t walk_idx;
 } perimeter_point_t;
 
+// b535: per-zone ring order. 0 = auto (each mode's own order, unchanged),
+// 1 = sequential (outer -> inner in order; Smooth bypasses its deficit
+// scheduler). Missing from a zone file reads as 0, so old zones behave
+// exactly as before.
+#define ZONE_RING_ORDER_AUTO       0
+#define ZONE_RING_ORDER_SEQUENTIAL 1
 typedef struct {
     uint8_t           num_points;
+    uint8_t           ring_order;
     perimeter_point_t points[ZONE_MAX_PERIM_POINTS];
 } zone_perimeter_t;
 

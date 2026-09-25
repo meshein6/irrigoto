@@ -67,11 +67,26 @@ def main() -> int:
         for err in js_syntax_check(html):
             print(f"JS SYNTAX ERROR -- {err}")
             fail = True
+    # b535: standalone .js files get the same check (node --check directly).
+    if shutil.which("node"):
+        for js in sorted(HERE.glob("*.js")):
+            r = subprocess.run(["node", "--check", str(js)],
+                               capture_output=True, text=True)
+            if r.returncode != 0:
+                print(f"JS SYNTAX ERROR -- {js.name}:{chr(10)}"
+                      + chr(10).join(r.stderr.strip().splitlines()[:4]))
+                fail = True
     if fail:
         print("Refusing to regenerate: fix the JavaScript first.")
         return 1
-    for h in sorted(OUT.glob("*_html.h")):
-        html = HERE / h.name.replace("_html.h", ".html")
+    # b535: *_js.h <- *.js alongside *_html.h <- *.html. Shared browser code
+    # (path.js) is served as its own file, so all three pages can use one copy
+    # instead of each embedding a duplicate.
+    pairs = [(h, HERE / h.name.replace("_html.h", ".html"))
+             for h in sorted(OUT.glob("*_html.h"))]
+    pairs += [(h, HERE / h.name.replace("_js.h", ".js"))
+              for h in sorted(OUT.glob("*_js.h"))]
+    for h, html in pairs:
         raw = h.read_bytes().decode("utf-8")
         m = WRAP.search(raw)
         if not m:

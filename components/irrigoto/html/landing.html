@@ -4,6 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no">
 <title>irrigoto</title>
+<script src="/path.js"></script>
 <script>
 // Apply theme before body renders to avoid flash. localStorage = instant
 // cache; /api/theme = source of truth (NVS-backed).
@@ -106,26 +107,6 @@ section{margin-bottom:18px;}
 .dev-label{color:var(--text-mid);}
 .dev-val{color:var(--text);font-family:'Courier New',monospace;font-size:12px;}
 .cal-desc{font-size:12px;color:var(--text-mid);margin-bottom:10px;line-height:1.5;}
-.info-btn{background:none;border:1px solid var(--border);color:var(--text-mid);
-  width:16px;height:16px;line-height:1;border-radius:50%;font-size:10px;
-  cursor:pointer;font-family:inherit;padding:0;margin-left:4px;}
-.info-btn:active{color:var(--green);border-color:var(--green);}
-.mode-help{display:none;font-size:12px;color:var(--text-mid);line-height:1.5;
-  background:var(--btn);border:1px solid var(--border);border-radius:var(--radius-sm);
-  padding:10px 12px;}
-.mode-help.show{display:block;}
-.mode-help b{color:var(--text);}
-/* Run history rows (b535) */
-.run-row{display:flex;gap:8px;padding:7px 0;border-bottom:1px solid var(--border);
-  align-items:baseline;font-size:12px;}
-.run-row:last-child{border-bottom:none;}
-.run-when{color:var(--text-mid);font-family:'Courier New',monospace;font-size:11px;
-  width:86px;flex-shrink:0;}
-.run-what{flex:1;min-width:0;}
-.run-what small{display:block;color:var(--text-mid);font-size:11px;}
-.run-vol{font-family:'Courier New',monospace;color:var(--green);text-align:right;
-  white-space:nowrap;flex-shrink:0;}
-.run-vol.bad{color:var(--orange);}
 /* Water modal */
 #modal-bg,#wp-bg{display:none;position:fixed;inset:0;background:rgba(0,0,0,.7);
   z-index:100;align-items:flex-end;justify-content:center;}
@@ -190,6 +171,51 @@ section{margin-bottom:18px;}
 .est b{color:var(--green);font-family:'Courier New',monospace;font-size:13px;font-weight:700;}
 .est b.unset{color:var(--orange);font-weight:400;font-size:11px;}
 .hint{font-size:11px;color:var(--text-mid);margin-top:4px;line-height:1.4;}
+/* Mode + Depth pickers (b535) -- any mode at any depth, like the schedule. */
+.pick-lbl{display:flex;align-items:center;gap:6px;font-size:10px;letter-spacing:.12em;
+  text-transform:uppercase;color:var(--text-mid);margin:0 0 6px;}
+.pick-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:6px;margin-bottom:14px;}
+.pick-grid.depth{grid-template-columns:repeat(4,1fr);}
+.pick{padding:9px 4px;border-radius:var(--radius-sm);border:1px solid var(--border);
+  background:var(--btn);color:var(--text);font-size:12px;cursor:pointer;
+  text-align:center;font-family:inherit;}
+.pick.sel{border-color:var(--green);background:var(--green-dim);color:var(--green);}
+.info-btn{background:none;border:1px solid var(--border);color:var(--text-mid);
+  width:16px;height:16px;line-height:1;border-radius:50%;font-size:10px;
+  cursor:pointer;font-family:inherit;padding:0;margin-left:4px;}
+.info-btn:active{color:var(--green);border-color:var(--green);}
+.mode-help{display:none;font-size:12px;color:var(--text-mid);line-height:1.5;
+  background:var(--btn);border:1px solid var(--border);border-radius:var(--radius-sm);
+  padding:10px 12px;margin:-8px 0 14px;}
+.mode-help.show{display:block;}
+.mode-help b{color:var(--text);}
+/* Run history (b535) */
+.run-row{display:flex;gap:8px;padding:7px 0;border-bottom:1px solid var(--border);
+  align-items:baseline;font-size:12px;}
+.run-row:last-child{border-bottom:none;}
+.run-when{color:var(--text-mid);font-family:'Courier New',monospace;font-size:11px;
+  width:86px;flex-shrink:0;}
+.run-what{flex:1;min-width:0;}
+.run-what small{display:block;color:var(--text-mid);font-size:11px;}
+.run-vol{font-family:'Courier New',monospace;color:var(--green);text-align:right;
+  white-space:nowrap;flex-shrink:0;}
+.run-vol.bad{color:var(--orange);}
+/* Path preview (b535) */
+#path-row{display:flex;gap:12px;align-items:center;margin:0 0 14px;}
+#path-thumb{flex-shrink:0;cursor:pointer;border-radius:50%;}
+.path-note{flex:1;min-width:0;font-size:11px;color:var(--text-mid);line-height:1.5;}
+.path-note b{display:block;color:var(--text);font-size:12px;margin-bottom:2px;}
+.path-note .pick{margin-top:6px;padding:5px 10px;font-size:11px;display:inline-block;width:auto;}
+#path-full{display:none;position:fixed;inset:0;background:rgba(0,0,0,.88);z-index:200;
+  align-items:center;justify-content:center;flex-direction:column;gap:12px;}
+#path-full.open{display:flex;}
+#path-full canvas{max-width:92vw;max-height:70vh;border-radius:50%;}
+#path-full .pf-bar{display:flex;gap:8px;align-items:center;color:var(--text-mid);font-size:12px;}
+#path-full .pick{width:auto;padding:7px 12px;}
+.pf-scrub{display:flex;gap:10px;align-items:center;width:min(92vw,620px);}
+.pf-scrub input[type=range]{flex:1;}
+#pf-at{font-family:'Courier New',monospace;font-size:11px;color:var(--text-mid);
+  min-width:96px;text-align:right;}
 .modal-actions .btn{flex:1;justify-content:center;}
 #modal-status{font-size:12px;color:var(--text-mid);text-align:center;
   margin-top:10px;min-height:18px;}
@@ -313,9 +339,8 @@ section{margin-bottom:18px;}
         run, so the sprinkler skips the 12-second full-power pressure check at the
         start of each run &mdash; which can spray past the edge of small zones &mdash;
         and trusts the pressure calibration. Leave off for a well pump or pressure
-        tank, where pressure rises and falls as the pump cycles; there the check
-        measures today's supply so the run can adjust. If runs start landing short or
-        long after turning this on, recalibrate pressure or turn it back off.
+        tank, where pressure rises and falls as the pump cycles. If runs start landing
+        short or long after turning this on, recalibrate pressure or turn it back off.
       </div>
       <div class="dev-row" title="Off-season hibernation: deep sleep with no wake timer">
         <span class="dev-label">Winter sleep</span><span class="dev-val" id="d-winter">Off</span>
@@ -375,35 +400,32 @@ section{margin-bottom:18px;}
 <div id="modal-bg" onclick="if(event.target===this)closeModal()">
   <div id="modal">
     <div class="modal-title" id="modal-zone-name">Water Zone</div>
-    <div class="modal-sub">Select depth and start watering</div>
-    <div class="mode-grid">
-      <button class="mode-btn sel" data-mode="1" onclick="selMode(this)">
-        1/8&Prime; <span>1 pass &middot; ~13 min</span>
-      </button>
-      <button class="mode-btn" data-mode="2" onclick="selMode(this)">
-        1/4&Prime; <span>1 pass &middot; ~26 min</span>
-      </button>
-      <button class="mode-btn" data-mode="3" onclick="selMode(this)">
-        1/8&Prime; &times;2 <span>2 passes &middot; ~26 min</span>
-      </button>
-      <button class="mode-btn" data-mode="5" onclick="selMode(this)">
-        Gentle 1/8&Prime; <span>seed-safe &middot; 5 passes</span>
-      </button>
-      <button class="mode-btn" data-mode="6" onclick="selMode(this)">
-        Gentle 1/4&Prime; <span>seed-safe &middot; 10 passes</span>
-      </button>
-      <button class="mode-btn" data-mode="7" onclick="selMode(this)">
-        Smooth 1/8&Prime; <span>open-loop &middot; multipass</span>
-      </button>
-      <button class="mode-btn" data-mode="8" onclick="selMode(this)">
-        Serpentine 1/8&Prime; <span>continuous glide &middot; multipass</span>
-      </button>
-      <button class="mode-btn" data-mode="d" onclick="selMode(this)">
-        Demo <span>max speed</span>
-      </button>
-      <button class="mode-btn" data-mode="c" onclick="selMode(this)">
-        &#128054; Chase <span>play mode &middot; 1-10 min</span>
-      </button>
+    <div class="modal-sub">Choose a mode and depth, then start watering</div>
+    <div class="pick-lbl">Mode
+      <button class="info-btn" id="mode-info-btn" onclick="toggleModeHelp()"
+              aria-expanded="false" aria-controls="mode-help" aria-label="What the modes do">i</button>
+    </div>
+    <div class="pick-grid" id="mode-pick">
+      <button class="pick sel" data-mode="1" onclick="selMode(this)">Pulse</button>
+      <button class="pick" data-mode="5" onclick="selMode(this)">Gentle</button>
+      <button class="pick" data-mode="7" onclick="selMode(this)">Smooth</button>
+      <button class="pick" data-mode="8" onclick="selMode(this)">Serpentine</button>
+      <button class="pick" data-mode="c" onclick="selMode(this)">&#128054; Chase</button>
+      <button class="pick" data-mode="d" onclick="selMode(this)">Demo</button>
+    </div>
+    <div class="mode-help" id="mode-help" role="region" aria-label="Mode descriptions"></div>
+    <div id="depth-block">
+      <div class="pick-lbl">Depth</div>
+      <div class="pick-grid depth" id="depth-pick"></div>
+    </div>
+    <div id="path-row">
+      <canvas id="path-thumb" width="128" height="128" onclick="openPathFull()"
+              title="Tap for a bigger view"></canvas>
+      <div class="path-note">
+        <b id="path-mode">Path</b>
+        <span id="path-desc"></span>
+        <button class="pick" onclick="openPathFull()">View</button>
+      </div>
     </div>
     <div id="chase-row" style="display:none;margin:-6px 0 18px;padding:10px 12px;border:1px solid var(--border);border-radius:var(--radius-sm);background:var(--btn);font-size:12px;">
       <label for="chase-dur" style="display:block;color:var(--text-mid);margin-bottom:6px;">
@@ -458,8 +480,8 @@ section{margin-bottom:18px;}
 
 <script>
 let selZoneId=0, selModeDat='1';
-let lastSolution=null;   // /api/all "solution" object
 let _wasWatering=false;   // b535
+let lastSolution=null;   // /api/all "solution" object
 let waterStartTime=0, waterEstMs=0, countdownTimer=null, lastWateringState=false, lastCleanupPass=0, lastEstMin=0;
 
 function handleZoneBtn(id){
@@ -595,14 +617,14 @@ function renderZones(zones){
 
 // ── Water modal ───────────────────────────────────────────────────────────────
 function openModal(id, name){
-  selZoneId=id; selModeDat='1';
+  selZoneId=id;
   document.getElementById('modal-zone-name').textContent='Water: '+name;
   document.getElementById('modal-status').textContent='';
   document.getElementById('start-btn').disabled=false;
   document.getElementById('start-btn').textContent='\u25B6 Start';
-  document.querySelectorAll('.mode-btn').forEach(b=>b.classList.remove('sel'));
-  document.querySelector('.mode-btn[data-mode="1"]').classList.add('sel');
-  document.getElementById('chase-row').style.display='none';
+  pathZone = (_zoneCache && _zoneCache[id]) || null;   // b535
+  restoreModePrefs();                                  // b535: last mode/depth
+  document.getElementById('mode-help').classList.remove('show');
   solRestore(); solModeChanged();
   document.getElementById('modal-bg').classList.add('open');
 }
@@ -695,19 +717,79 @@ async function wpSaveNet(){
   }catch(e){ st.style.color='#f87171'; st.textContent='Save failed: '+e.message; wpEl('wp-net-btn').disabled=false; }
 }
 function selMode(btn){
-  document.querySelectorAll('.mode-btn').forEach(b=>b.classList.remove('sel'));
+  document.querySelectorAll('#mode-pick .pick').forEach(b=>b.classList.remove('sel'));
   btn.classList.add('sel'); selModeDat=btn.dataset.mode;
-  // Chase mode shows a duration slider; other modes hide it.
-  document.getElementById('chase-row').style.display =
-    (selModeDat === 'c') ? 'block' : 'none';
+  applyModeVisibility();
+  saveModePrefs();
   solModeChanged();
+}
+
+// ── Mode + Depth pickers (b535) ──────────────────────────────────────────────
+// Web mode digits, unchanged: Pulse=1, Gentle=5, Smooth=7, Serpentine=8,
+// Demo=d, Chase=c. Depth rides along as eighths of an inch (1..8), which
+// POST /zone/water has always accepted. Demo and Chase carry no depth.
+const DEPTH_LABELS = ['\u2014','1/8\u2033','1/4\u2033','3/8\u2033','1/2\u2033','5/8\u2033','3/4\u2033','7/8\u2033','1\u2033'];
+const MODE_HELP = {
+  '1': '<b>Pulse.</b> Steps ring by ring, outer to inner, stopping to fine-tune pressure at each step. Most precise placement, but stop-start and slower.',
+  '5': '<b>Gentle.</b> Low pressure over many light passes. Safe for seed and bare soil.',
+  '7': '<b>Smooth.</b> Continuous sweep, then re-waters only the rings that are still short, timed to the pump cycle. Good default.',
+  '8': '<b>Serpentine.</b> One continuous back-and-forth glide that never stops. Smoothest, with no start-of-row bursts, but less precise at edges and near the sprinkler.',
+  'c': '<b>Chase.</b> Play mode for dogs, 1-10 min. Not tracked as watering.',
+  'd': '<b>Demo.</b> Max-speed sweep. Not tracked as watering.',
+};
+let selDepth = 1;
+function buildDepthPicker(){
+  const g = document.getElementById('depth-pick');
+  if (!g || g.children.length) return;
+  g.innerHTML = [1,2,3,4,5,6,7,8].map(v =>
+    '<button class="pick' + (v === selDepth ? ' sel' : '') + '" data-depth="' + v + '" ' +
+    'onclick="selDepthBtn(this)">' + DEPTH_LABELS[v] + '</button>').join('');
+}
+function selDepthBtn(btn){
+  selDepth = +btn.dataset.depth;
+  document.querySelectorAll('#depth-pick .pick').forEach(b => b.classList.toggle('sel', b === btn));
+  saveModePrefs();
+  solModeChanged();   // depth changes the run length, so the mL estimate moves
+  renderPathThumb();
+}
+// Chase shows its duration slider; Chase and Demo have no depth.
+function applyModeVisibility(){
+  const chase = (selModeDat === 'c'), demo = (selModeDat === 'd');
+  document.getElementById('chase-row').style.display = chase ? 'block' : 'none';
+  document.getElementById('depth-block').style.display = (chase || demo) ? 'none' : '';
+  const help = document.getElementById('mode-help');
+  if (help && help.classList.contains('show')) help.innerHTML = MODE_HELP[selModeDat] || '';
+  renderPathThumb();
+}
+function toggleModeHelp(){
+  const help = document.getElementById('mode-help');
+  const btn  = document.getElementById('mode-info-btn');
+  const on = !help.classList.contains('show');
+  help.classList.toggle('show', on);
+  help.innerHTML = on ? (MODE_HELP[selModeDat] || '') : '';
+  if (btn) btn.setAttribute('aria-expanded', on ? 'true' : 'false');
+}
+function saveModePrefs(){
+  try { localStorage.setItem('irrigoto_mode', JSON.stringify({mode:selModeDat, depth:selDepth})); } catch(_){}
+}
+function restoreModePrefs(){
+  let p = {};
+  try { p = JSON.parse(localStorage.getItem('irrigoto_mode') || '{}'); } catch(_){}
+  if (MODE_HELP[p.mode]) selModeDat = p.mode;
+  if (p.depth >= 1 && p.depth <= 8) selDepth = p.depth;
+  buildDepthPicker();
+  document.querySelectorAll('#mode-pick .pick').forEach(b => b.classList.toggle('sel', b.dataset.mode === selModeDat));
+  document.querySelectorAll('#depth-pick .pick').forEach(b => b.classList.toggle('sel', +b.dataset.depth === selDepth));
+  applyModeVisibility();
 }
 
 // ── Apply solution on a manual run ────────────────────────────────────
 // Settings live in the browser (localStorage), not on the device. The modal
 // mode digit maps to a schedule (mode, depth) pair for the run-length estimate.
 const SOL_KEY='irrigoto_solution';
-const SOL_MODE_MAP={'1':[0,1],'2':[0,2],'3':[0,2],'5':[1,1],'6':[1,2],'7':[2,1],'8':[3,1]};
+// b535: with Mode and Depth picked separately, this maps the web mode digit
+// to the schedule mode number the estimator wants; depth comes from selDepth.
+const SOL_MODE_MAP={'1':0,'5':1,'7':2,'8':3};
 let solRates=null, solEstMin=0, solEstReq=0, solEnabled=false;
 function solLoadRates(){
   fetch('/api/solution_cal',{cache:'no-store'}).then(r=>r.json()).then(d=>{
@@ -765,7 +847,7 @@ function solModeChanged(){
   const applicable = solEnabled && !!SOL_MODE_MAP[selModeDat];
   document.getElementById('sol-block').style.display = applicable ? '' : 'none';
   if(!applicable) return;
-  const [m,d]=SOL_MODE_MAP[selModeDat];
+  const m = SOL_MODE_MAP[selModeDat], d = selDepth;
   const req=++solEstReq; solEstMin=0; solEst();
   fetch('/api/solution_est?zone='+selZoneId+'&mode='+m+'&depth='+d,{cache:'no-store'})
     .then(r=>r.json()).then(j=>{ if(req===solEstReq){ solEstMin=+j.est_min||0; solEst(); } }).catch(()=>{});
@@ -790,6 +872,8 @@ async function startWater(){
   if (selModeDat === 'c') {
     const d=parseInt(document.getElementById('chase-dur').value, 10) || 3;
     body += '&duration=' + d;
+  } else if (selModeDat !== 'd') {
+    body += '&depth=' + selDepth;   // b535: eighths; Demo/Chase send none
   }
   const sol=solState();
   if (solEnabled && sol.enabled && SOL_MODE_MAP[selModeDat]) {
@@ -822,7 +906,7 @@ function rssiLabel(rssi){
   return `<span style="color:${col};font-size:11px">${label} (${rssi}dBm)</span> `+barHtml;
 }
 
-// b535: regulated-supply switch. Skips the start-of-run pressure check.
+// ── Supply regulated (b535) ─────────────────────────────────────────────────
 async function setSupplyRegulated(on){
   try {
     const d = await fetch('/api/supply_regulated', {method:'POST',
@@ -836,18 +920,15 @@ function toggleSupplyHelp(){
   const h = document.getElementById('supply-help');
   const on = !h.classList.contains('show');
   h.classList.toggle('show', on);
-  const b = document.querySelector('#supply-cb') && h.previousElementSibling
-            ? h.previousElementSibling.querySelector('.info-btn') : null;
-  if (b) b.setAttribute('aria-expanded', on ? 'true' : 'false');
 }
+
 // ── Run history (b535) ──────────────────────────────────────────────────────
-// /api/runs returns raw CSV, newest first, no header. Columns must stay in
-// step with RUNS_CSV_HEADER in irrigoto.c.
+// /api/runs returns raw CSV, newest first, no header. Column order must stay
+// in step with RUNS_CSV_HEADER in irrigoto.c.
 const RUN_COL = {start:0,end:1,uptime:2,dur:3,zone_id:4,zone:5,trigger:6,mode:7,
                  depth:8,status:9,rings:10,limited:11,vol:12,depth_mm:13,
                  cov:14,score:15,psi_min:16,psi_avg:17,psi_max:18,fw:19};
-const DEPTH_TXT = ['','1/8\u2033','1/4\u2033','3/8\u2033','1/2\u2033','5/8\u2033','3/4\u2033','7/8\u2033','1\u2033'];
-
+function escHtml(t){ const d=document.createElement('div'); d.textContent=t==null?'':t; return d.innerHTML; }
 async function loadRuns(){
   const el = document.getElementById('runs-card');
   if (!el) return;
@@ -858,27 +939,99 @@ async function loadRuns(){
   if (!rows.length) { el.innerHTML = '<div class="empty">No runs recorded yet.</div>'; return; }
   el.innerHTML = rows.map(line => {
     const c = line.split(',');
-    const st = c[RUN_COL.status] || '';
-    const ok = (st === 'completed');
+    const st = c[RUN_COL.status] || '', ok = (st === 'completed');
     // No clock when the run started -> show uptime instead of a fake date.
     const when = c[RUN_COL.start]
       ? c[RUN_COL.start].replace('T',' ').slice(5,16)
       : '+' + Math.round((+c[RUN_COL.uptime]||0)/60) + 'm up';
-    const depth = DEPTH_TXT[+c[RUN_COL.depth]] || '';
+    const depth = DEPTH_LABELS[+c[RUN_COL.depth]] || '';
     const vol = parseFloat(c[RUN_COL.vol]);
     return '<div class="run-row">' +
-      '<span class="run-when">' + esc(when) + '</span>' +
-      '<span class="run-what">' + esc(c[RUN_COL.zone] || '') +
-        '<small>' + esc(c[RUN_COL.mode] || '') + (depth ? ' ' + depth : '') +
-        ' \u00b7 ' + (+c[RUN_COL.dur]||0).toFixed(0) + ' min \u00b7 ' + esc(c[RUN_COL.trigger]||'') +
-        (ok ? '' : ' \u00b7 <span style="color:var(--orange)">' + esc(st.replace(/_/g,' ')) + '</span>') +
+      '<span class="run-when">' + escHtml(when) + '</span>' +
+      '<span class="run-what">' + escHtml(c[RUN_COL.zone] || '') +
+        '<small>' + escHtml(c[RUN_COL.mode] || '') + (depth ? ' ' + depth : '') +
+        ' \u00b7 ' + (+c[RUN_COL.dur]||0).toFixed(0) + ' min \u00b7 ' + escHtml(c[RUN_COL.trigger]||'') +
+        (ok ? '' : ' \u00b7 <span style="color:var(--orange)">' + escHtml(st.replace(/_/g,' ')) + '</span>') +
         '</small></span>' +
       '<span class="run-vol' + (ok ? '' : ' bad') + '">' +
         (isFinite(vol) ? vol.toFixed(1) + ' L' : '\u2014') + '</span>' +
     '</div>';
   }).join('');
 }
-function esc(t){ const d=document.createElement('div'); d.textContent=t==null?'':t; return d.innerHTML; }
+
+// ── Path preview (b535) ─────────────────────────────────────────────────────
+const PATH_DESC = {
+  pulse:      'Outer ring inward, one ring at a time, always the same way round. Dashed lines are the dry swing back to the next ring.',
+  gentle:     'Outer ring inward, one direction per pass, flipping each pass. Many light passes.',
+  smooth:     'Drawn outer to inner, but the real order is chosen during the run from how much each ring still needs.',
+  serpentine: 'Out and back without stopping: direction flips every ring, and passes alternate inward and outward.',
+  chase:      'No watering path -- the nozzle chases within the zone.',
+  demo:       'Max-speed sweep, not tracked as watering.'
+};
+let pathZone = null, pfPassIdx = 0, pfT = 0, pfTimer = null;
+let _zoneCache = {};
+function zonePathOpts(pass){
+  return { mode: selModeDat, pass: pass|0,
+           act_max_throw: (pathZone && pathZone.act_max_throw) || 10058,
+           act_min_throw: (pathZone && pathZone.act_min_throw) || 0,
+           sequential: !!(pathZone && +pathZone.ring_order === 1) };
+}
+function renderPathThumb(){
+  const row = document.getElementById('path-row');
+  if (!row || typeof IrrigotoPath === 'undefined') return;
+  const pts = pathZone && pathZone.points;
+  if (!pts || pts.length < 2) { row.style.display = 'none'; return; }
+  row.style.display = 'flex';
+  const o = zonePathOpts(0); o.thumb = true;
+  IrrigotoPath.thumb(document.getElementById('path-thumb'), pts, o);
+  const g = IrrigotoPath.build(pts, o);
+  document.getElementById('path-mode').textContent =
+    (IrrigotoPath.MODES[selModeDat] || {label:'Path'}).label + ' path'
+    + (g && g.rings.length ? ' \u00b7 ' + g.rings.length + ' rings' : '');
+  document.getElementById('path-desc').textContent = PATH_DESC[g ? g.modeKey : 'pulse'] || '';
+}
+function openPathFull(){
+  if (!pathZone || !pathZone.points || pathZone.points.length < 2) return;
+  pfPassIdx = 0; pfT = 0;
+  const sl = document.getElementById('pf-scrub'); if (sl) sl.value = 0;
+  document.getElementById('path-full').classList.add('open');
+  renderPathFull();
+}
+function closePathFull(){
+  if (pfTimer) { clearInterval(pfTimer); pfTimer = null; }
+  const b = document.getElementById('pf-play'); if (b) b.innerHTML = '&#9654;';
+  document.getElementById('path-full').classList.remove('open');
+}
+function pfPass(d){ pfPassIdx = Math.max(0, Math.min(9, pfPassIdx + d)); renderPathFull(); }
+function pfScrub(t){ pfT = t; renderPathFull(); }
+function pfPlay(){
+  const btn = document.getElementById('pf-play');
+  if (pfTimer) { clearInterval(pfTimer); pfTimer = null; btn.innerHTML = '&#9654;'; return; }
+  btn.innerHTML = '&#9632;';
+  pfTimer = setInterval(() => {          // ~8 s per pass, slow enough to follow
+    pfT += 1 / 240;
+    if (pfT >= 1) { pfT = 1; clearInterval(pfTimer); pfTimer = null; btn.innerHTML = '&#9654;'; }
+    const sl = document.getElementById('pf-scrub');
+    if (sl) sl.value = Math.round(pfT * 1000);
+    renderPathFull();
+  }, 33);
+}
+function renderPathFull(){
+  const cv = document.getElementById('path-full-cv');
+  if (!cv || typeof IrrigotoPath === 'undefined' || !pathZone) return;
+  const o = zonePathOpts(pfPassIdx); o.scrub = pfT;
+  const at = IrrigotoPath.thumb(cv, pathZone.points, o);
+  document.getElementById('pf-title').textContent =
+    (IrrigotoPath.MODES[selModeDat] || {label:''}).label + ' \u00b7 pass ' + (pfPassIdx + 1);
+  const lbl = document.getElementById('pf-at');
+  if (lbl) {
+    if (at && at.r_mm !== undefined)
+      lbl.textContent = at.dry ? 'moving \u00b7 dry'
+        : 'ring ' + (at.ring + 1) + ' \u00b7 ' + (at.r_mm / 304.8).toFixed(1) + "'";
+    else lbl.textContent = pfT <= 0 ? 'start' : '';
+  }
+}
+document.addEventListener('keydown', e => { if (e.key === 'Escape') closePathFull(); });
 
 async function toggleDetailLog(){
   try{
@@ -938,7 +1091,7 @@ async function reconnectNet(){
 updateWifiButtons();
 
 solLoadRates();
-loadRuns();   // b535: History card, once at load
+loadRuns();   // b535
 async function refresh(){
   try{
     const d=await fetch('/api/all').then(r=>r.json());
@@ -958,19 +1111,19 @@ async function refresh(){
     const dlEl=document.getElementById('d-detail');
     dlEl.textContent=d.detail_log?'On':'Off';
     dlEl.style.color=d.detail_log?'var(--green)':'var(--text-mid)';
-    const sup=document.getElementById('supply-cb');   // b535
-    if(sup && d.supply_regulated!==undefined) sup.checked=!!d.supply_regulated;
     renderWinter(d.winter, d.winter_left_s);
-    // b535: refresh History when a run ends (watering true -> false).
-    if (_wasWatering && !d.watering) loadRuns();
-    _wasWatering = !!d.watering;
     // Update device name (skip if user is editing)
     const dni=document.getElementById('dev-name-inp');
     if(d.device_name&&dni&&!dni.matches(':focus')&&dni.value!==d.device_name){
       dni.value=d.device_name;
       document.title=d.device_name;
     }
+    (d.zones||[]).forEach(z => { _zoneCache[z.id] = z; });   // b535
     renderZones(d.zones);
+    const sup=document.getElementById('supply-cb');            // b535
+    if(sup && d.supply_regulated!==undefined) sup.checked=!!d.supply_regulated;
+    if(_wasWatering && !d.watering) loadRuns();                // b535
+    _wasWatering = !!d.watering;
     lastSolution = d.solution || null;
     if (lastSolution && typeof lastSolution.enabled === 'boolean' && lastSolution.enabled !== solEnabled)
       applyBottles(lastSolution.enabled);
@@ -1264,5 +1417,21 @@ async function refreshSchedule(){
 }
 refreshSchedule(); setInterval(refreshSchedule, 30000);
 </script>
+<div id="path-full" onclick="if(event.target===this)closePathFull()">
+  <div class="pf-bar">
+    <button class="pick" onclick="pfPass(-1)">&#8249;</button>
+    <span id="pf-title">Pass 1</span>
+    <button class="pick" onclick="pfPass(1)">&#8250;</button>
+    <button class="pick" onclick="closePathFull()">&#10005;</button>
+  </div>
+  <canvas id="path-full-cv" width="620" height="620"></canvas>
+  <div class="pf-scrub">
+    <button class="pick" id="pf-play" onclick="pfPlay()" aria-label="Play or pause">&#9654;</button>
+    <input type="range" id="pf-scrub" min="0" max="1000" step="1" value="0"
+           oninput="pfScrub(+this.value/1000)" aria-label="Position along the path">
+    <span id="pf-at">start</span>
+  </div>
+</div>
+
 </body>
 </html>
