@@ -16,28 +16,33 @@ headers) and the storage it reads and writes (`components/irrigoto/storage.c`).
 
 ## Branches (fork: meshein6/irrigoto)
 
+Only two long-lived branches; every change gets its own `fix/` or `feature/` branch.
+
 | Branch | What | Rule |
 |---|---|---|
 | `main` | Exact copy of upstream (rob-farrellrobotics/irrigoto) | Never commit. "Sync fork" after each upstream release. |
-| `feature/<name>` | One standalone change, cut from `main` | Only that change. This is what gets offered upstream. |
-| `combined` | `main` + every `feature/*` not yet upstream + `plan` | What the device runs (`ref: combined`). Rebuild from `main` rather than patching. |
-| `plan` | This file | Planning only. Never offered upstream. |
+| `combined` | `main` + every `fix/*` / `feature/*` not yet upstream | What the device runs (`ref: combined`). Changes arrive only by PR/merge from a fix/feature branch. |
+| `fix/<name>` | One bug fix, cut from `main` | Only that fix. Offered upstream on its own. |
+| `feature/<name>` | One feature, cut from `main` | Only that feature. Offered upstream on its own. |
 
-Feature branch names for the PR plan:
+PRs inside the fork go **`fix/*` or `feature/*` → `combined`** (never → `main`).
+PRs to upstream go **`fix/*` or `feature/*` → rob-farrellrobotics/irrigoto `main`**.
+Feature branches never bump `FW_BUILD` (upstream's numbering). Describe changes by name.
 
-| PR | Branch |
-|---|---|
-| 1 | `feature/pulse-ring-swing-fix` |
-| 2 | `feature/supply-regulated` |
-| 3 | `feature/manual-mode-depth` |
-| 4 | `feature/throw-cal-units` |
-| 5 | `feature/ring-order` |
-| 6 | `feature/zone-map-zoom` |
-| 7 | `feature/mode-path-preview` |
-| 8 | `feature/run-history` |
-| 9 | `feature/solution-dosing-improvements` (cut from `feature/solution-dosing`) |
-| 10 | `feature/rain-delay-hardening` |
-| — | `feature/solution-dosing` (existing dosing work) |
+| PR | Branch | Status |
+|---|---|---|
+| — | `feature/solution-dosing` | done, in `combined` |
+| — | `feature/pr-plan` (this file) | planning doc, in `combined`, never offered upstream |
+| 1 | `fix/pulse-ring-swing` | not started |
+| 2 | `feature/supply-regulated` | not started |
+| 3 | `feature/manual-mode-depth` | not started |
+| 4 | `fix/throw-cal-units` | not started |
+| 5 | `feature/ring-order` | not started |
+| 6 | `feature/zone-map-zoom` | not started |
+| 7 | `feature/mode-path-preview` | not started |
+| 8 | `feature/run-history` | not started |
+| 9 | `feature/solution-dosing-improvements` (cut from `feature/solution-dosing`) | not started |
+| 10 | `fix/rain-delay-feedback` | not started |
 
 ---
 
