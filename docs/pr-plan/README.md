@@ -1,0 +1,80 @@
+# PR plan: fork changes proposed for upstream
+
+This folder holds one description per change in the fork
+(`meshein6/irrigoto`). Each one can be pasted as the body of an upstream
+issue or PR and read without the others. It says what the change is, why it's
+needed, exactly what it touches, and how it was (or should be) tested.
+
+This folder is planning material. It lives on `feature/pr-plan` and in the
+fork's `combined` branch, and is **not** part of any upstream PR.
+
+## Branches
+
+| Branch | What it is |
+|---|---|
+| `main` | Exact copy of upstream `rob-farrellrobotics/irrigoto` `main`. Never committed to. |
+| `combined` | `main` + every `fix/*` and `feature/*` branch not yet upstream. This is what the fork's devices run. Changes arrive only by merging a fix/feature branch. |
+| `fix/<name>` | One bug fix, cut from `main`. |
+| `feature/<name>` | One feature, cut from `main` (unless noted). |
+
+- Fork-internal PRs: `fix/*` or `feature/*` → **`combined`**, never `main`.
+- Upstream PRs: `fix/*` or `feature/*` → `rob-farrellrobotics/irrigoto` **`main`**.
+
+## Versioning rules
+
+Upstream `main` is a snapshot branch. The maintainer re-applies accepted
+changes on a private branch and releases them under the next `FW_BUILD`
+number (see CONTRIBUTING.md). So fork branches must not claim build numbers:
+
+- **Never bump `FW_BUILD`** in `components/irrigoto/fw_version.h`. It stays at
+  the upstream base the branch was cut from.
+- **Never write fork build labels** (`bNNN`, "Build NNN") in code comments,
+  docs, commit titles or UI text. Upstream's comments use `bNNN` to mean
+  *upstream* builds, and a fork label would point at the wrong upstream build
+  once the maintainer's numbering catches up. Refer to changes by feature name
+  instead (e.g. "solution dosing").
+- Existing upstream `bNNN` references in code (e.g. `b428`, `b466`) are
+  upstream's own history and are cited as-is in these descriptions.
+- Line numbers below are approximate for upstream build 527. Function names are
+  the reliable anchor.
+
+## Changes
+
+| Branch | Type | Status | Description |
+|---|---|---|---|
+| `feature/solution-dosing` | feature | **done**, in `combined` | [Three-bottle pump dosing](feature-solution-dosing.md) |
+| `feature/solution-dosing-improvements` | feature | planned (cut from `feature/solution-dosing`) | [Dosing cal file, default rates, enable toggle](feature-solution-dosing-improvements.md) |
+| `fix/pulse-ring-swing` | fix | planned | [Valve left open during ring-change swing](fix-pulse-ring-swing.md) |
+| `feature/supply-regulated` | feature | planned | ["Supply regulated" setting to skip the 12 s pressure check](feature-supply-regulated.md) |
+| `feature/manual-mode-depth` | feature | planned | [Manual run: pick mode and depth separately, mode tooltips](feature-manual-mode-depth.md) |
+| `fix/throw-cal-units` | fix | planned | [Say mm / feet on the throw calibration steps](fix-throw-cal-units.md) |
+| `feature/ring-order` | feature | planned | [Per-zone ring order](feature-ring-order.md) |
+| `feature/zone-map-zoom` | feature | planned | [Zoom the Zone Setup map to the zone](feature-zone-map-zoom.md) |
+| `feature/mode-path-preview` | feature | planned | [Path preview per mode (manual + schedule)](feature-mode-path-preview.md) |
+| `feature/run-history` | feature | planned | [Per-run history log file + History card](feature-run-history.md) |
+| `fix/rain-delay-feedback` | fix | planned, low priority | [Rain delay: clock-unset error and inline status](fix-rain-delay-feedback.md) |
+
+## Suggested order and dependencies
+
+1. `fix/pulse-ring-swing`: real bug; `feature/ring-order` changes the same loop.
+2. `feature/supply-regulated`, `fix/throw-cal-units`, `feature/zone-map-zoom`:
+   independent of everything else.
+3. `feature/manual-mode-depth`: after `feature/solution-dosing` if both go
+   upstream, because both edit the landing page's Water modal.
+4. `feature/ring-order`: after the swing fix.
+5. `feature/mode-path-preview`: after manual-mode-depth, ring-order and zoom.
+6. `feature/run-history`: any time. Its bottle columns need solution dosing.
+7. `feature/solution-dosing-improvements`: on top of `feature/solution-dosing`.
+
+For larger or behaviour-changing work (solution dosing, ring order, supply
+regulated), open an upstream issue first to check the maintainer wants it.
+
+## Checks for every branch
+
+- Edit only `components/irrigoto/html/*.html` for pages, then run
+  `python components/irrigoto/html/regen.py` and commit the regenerated
+  `*_html.h` too. `regen.py --check` must pass.
+- Firmware must compile: `python -m esphome compile esphome/irrigoto.yaml`.
+- Motion changes: rehearse dry first (serpentine `dry=1`, or valve held closed)
+  before any wet run, as `docs/adding_a_watering_mode.md` asks.
+- New settings default to today's behaviour.
