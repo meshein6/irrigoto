@@ -1,6 +1,6 @@
 # Fix: say mm / feet on the throw calibration steps
 
-**Branch:** `fix/throw-cal-units` · **Type:** fix · **Status:** planned. One
+**Branch:** `fix/throw-cal-units` · **Type:** fix · **Status:** built, merged into `combined` and flashed to hardware (b535). One
 page, text only.
 
 ## Summary

@@ -1,6 +1,10 @@
 # Per-zone ring order: auto / one ring at a time / section by section
 
-**Branch:** `feature/ring-order` · **Type:** feature · **Status:** planned.
+**Branch:** `feature/ring-order` · **Type:** feature · **Status:** PARTIALLY built and merged into `combined` (b535): `auto` and
+`sequential` are implemented, `sections` is NOT. The lobe merge-tree and the
+depth-first rewrite of the ring/arc loop can only be validated by a wet run,
+so it was left out rather than shipped unverified. The stored field is a
+plain enum, so adding value 2 later needs no migration.
 Suggest an upstream issue first: it touches the core ring loop.
 
 ## Summary

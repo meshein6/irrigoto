@@ -1,7 +1,7 @@
 # Manual run: pick mode and depth separately, with mode tooltips
 
 **Branch:** `feature/manual-mode-depth` · **Type:** feature · **Status:**
-planned. Page-only change; no firmware changes.
+built, merged into `combined` and flashed to hardware (b535). Page-only change; no firmware changes.
 
 ## Summary
 

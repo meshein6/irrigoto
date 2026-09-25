@@ -1,8 +1,9 @@
 # Path preview per mode, for manual runs and schedule entries
 
 **Branch:** `feature/mode-path-preview` · **Type:** feature · **Status:**
-planned. Builds on `feature/manual-mode-depth`, `feature/ring-order` and
-`feature/zone-map-zoom`.
+built, merged into `combined` and flashed to hardware (b535). Builds on `feature/manual-mode-depth`,
+`feature/ring-order` and `feature/zone-map-zoom`, and adds a scrub slider
+(not in the original plan) that walks a dot along the path.
 
 ## Summary
 

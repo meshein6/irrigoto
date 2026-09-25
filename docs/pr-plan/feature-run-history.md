@@ -1,6 +1,8 @@
 # Per-run history log file + History card
 
-**Branch:** `feature/run-history` · **Type:** feature · **Status:** planned.
+**Branch:** `feature/run-history` · **Type:** feature · **Status:** built, merged into `combined` and flashed to hardware (b535).
+storage_log() and its unused daily rotation were removed, as the doc
+proposed.
 
 ## Summary
 

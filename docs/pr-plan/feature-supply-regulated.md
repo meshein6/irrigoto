@@ -1,6 +1,6 @@
 # "Supply regulated" setting: skip the start-of-run pressure check
 
-**Branch:** `feature/supply-regulated` · **Type:** feature · **Status:** planned.
+**Branch:** `feature/supply-regulated` · **Type:** feature · **Status:** built, merged into `combined` and flashed to hardware (b535).
 
 ## Summary
 

@@ -1,6 +1,6 @@
 # Zoom the Zone Setup map to the zone
 
-**Branch:** `feature/zone-map-zoom` · **Type:** feature · **Status:** planned.
+**Branch:** `feature/zone-map-zoom` · **Type:** feature · **Status:** built, merged into `combined` and flashed to hardware (b535).
 Page-only change (`zone_setup.html`).
 
 ## Summary
