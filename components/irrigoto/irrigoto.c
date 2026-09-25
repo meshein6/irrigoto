@@ -422,6 +422,10 @@ static bool          s_water_detail_log = false; // when true: write per-pass ro
 // calibration. Persisted in NVS as "supply_reg". Default off -- well pump and
 // pressure-tank supplies cycle, so a fresh reading matters there.
 static bool          s_supply_regulated = false;
+// b535/b536: the running zone's ring-order setting. Held at run scope because
+// the serpentine pass runner is a separate function from phase_water_zone,
+// where the zone is loaded.
+static uint8_t       s_ring_order = ZONE_RING_ORDER_AUTO;
 // b288: in smooth-aggregate mode the wbin file is created at run-END, not at start,
 // so the file is never held open during the loop (avoids LittleFS metadata-relocation
 // races against WiFi PHY work that caused the b285-b287 mid-run crashes).
@@ -9120,6 +9124,24 @@ static float serpentine_ring_dps(float ring_throw, float inner_throw,
 // in the loop), then swept to its far bound, direction alternating per
 // ring. The valve closes only when a connector crosses a true exclusion
 // (polygon extent below the waterable floor). Returns the leg count.
+// b536: do two circular bearing ranges overlap? Both are [lo, hi] swept CW,
+// so a range may wrap through 0. Used to decide which section (lobe) an arc
+// on an inner ring belongs to.
+static bool serp_arc_overlaps(float alo, float ahi, float blo, float bhi)
+{
+    float aspan = fmodf(ahi - alo + 360.0f, 360.0f);
+    float bspan = fmodf(bhi - blo + 360.0f, 360.0f);
+    if (aspan <= 0.0f) aspan = 360.0f;
+    if (bspan <= 0.0f) bspan = 360.0f;
+    // Walk A in small steps and test containment in B -- robust across wrap,
+    // and an arc is at most a few tens of degrees here.
+    for (float t = 0.0f; t <= aspan; t += 2.0f) {
+        float off = fmodf(fmodf(alo + t, 360.0f) - blo + 360.0f, 360.0f);
+        if (off <= bspan) return true;
+    }
+    return false;
+}
+
 static int serpentine_build_pass_plan(
     const zone_perimeter_t *zone, bool have_zone,
     const float *sector_throw,
@@ -9132,7 +9154,8 @@ static int serpentine_build_pass_plan(
     const speed_map_t *spd, bool have_spd,
     float serpentine_dps,            // > 0 = manual override; 0 = flow-solved (b429)
     float depth_mm,             // b429: per-pass deposit target for the solver
-    const float *valve_corr)    // b429: per-ring lookup-throw multiplier
+    const float *valve_corr,    // b429: per-ring lookup-throw multiplier
+    bool  sections)             // b536: finish one lobe before crossing to the next
 {
     int  n     = 0;
     bool cw    = start_cw;
@@ -9154,6 +9177,35 @@ static int serpentine_build_pass_plan(
             .ring_throw=(_throw), .leg_throw=(_throw) };                      \
     } while (0)
 
+    // b536: section-by-section. Without it the plan is ring-major: sweep the
+    // left arc of a ring, hop across the zone with the valve shut to the right
+    // arc, step inward, cross back -- every ring, both ways. Sections make it
+    // lobe-major instead: finish one side outer -> inner, then ONE hop to the
+    // next. Jumps drop from (lobes-1) x rings to (lobes-1).
+    //
+    // Lobes are defined by the OUTERMOST waterable ring's arcs. Going inward
+    // the lobes merge (a smaller ring's arc spans both); such an arc is
+    // assigned to the lowest-index lobe it overlaps, so the merged rings are
+    // swept exactly once, under the first section.
+    float lobe_lo[WATER_MAX_ARCS_PER_RING], lobe_hi[WATER_MAX_ARCS_PER_RING];
+    int   n_lobes = 1;
+    if (sections) {
+        for (int ri = 0; ri < num_rings && ri < WATER_RUN_MAX_RINGS; ri++) {
+            int ring = out_to_in ? ri : (num_rings - 1 - ri);
+            if (ring >= WATER_RUN_MAX_RINGS || skip[ring]) continue;
+            int na0 = serpentine_arc_bounds(zone, have_zone, ring_throws[ring],
+                          sector_throw, act_max_throw, zone_arc_start,
+                          zone_arc_end, zone_arc_deg, lobe_lo, lobe_hi);
+            if (na0 > 0) { n_lobes = na0; break; }
+        }
+        if (n_lobes > 1)
+            INFO("Serpentine: section-by-section, %d lobe(s)", n_lobes);
+        else
+            sections = false;   // single lobe: ring-major already never crosses
+    }
+
+    for (int sec = 0; sec < (sections ? n_lobes : 1); sec++) {
+    if (sections && sec > 0) cw = start_cw;   // each section starts consistently
     for (int ri = 0; ri < num_rings && ri < WATER_RUN_MAX_RINGS; ri++) {
         int ring = out_to_in ? ri : (num_rings - 1 - ri);
         if (ring >= WATER_RUN_MAX_RINGS || skip[ring]) continue;
@@ -9188,6 +9240,14 @@ static int serpentine_build_pass_plan(
         // Arcs in physical sweep order for this ring's direction.
         for (int k = 0; k < na; k++) {
             int   ai    = cw ? k : (na - 1 - k);
+            // b536: in section mode sweep only the arcs of the current lobe.
+            if (sections) {
+                int owner = -1;
+                for (int L = 0; L < n_lobes; L++)
+                    if (serp_arc_overlaps(lo[ai], hi[ai], lobe_lo[L], lobe_hi[L])) { owner = L; break; }
+                if (owner < 0) owner = 0;      // no overlap: fall to the first
+                if (owner != sec) continue;
+            }
             float entry = cw ? lo[ai] : hi[ai];
             float exitb = cw ? hi[ai] : lo[ai];
 
@@ -9272,6 +9332,7 @@ static int serpentine_build_pass_plan(
         }
         cw = !cw;
     }
+    }   // b536: section loop
 #undef SERPENTINE_EMIT
     return n;
 }
@@ -10220,7 +10281,8 @@ static void water_serpentine_passes(
                                       zone_arc_start, zone_arc_end, zone_arc_deg,
                                       act_max_throw, have_throw_cal,
                                       pressure_scale, psi_min, psi_max,
-                                      spd, have_spd, serpentine_dps, depth_mm, corr);
+                                      spd, have_spd, serpentine_dps, depth_mm, corr,
+                                      /*sections=*/(s_ring_order == ZONE_RING_ORDER_SECTIONS));  // b536
         if (n == 0) {
             // b434: the only rings left are polygon-clipped to zero width
             // (e.g. the outermost ring on a spike-shaped zone) -- they can
@@ -11410,7 +11472,15 @@ static void phase_water_zone(void)
     // order for every mode, which for Smooth means bypassing its deficit/pump
     // scheduler. 0 / missing = auto, i.e. each mode's existing order.
     const bool seq_ring_order = (zone.ring_order == ZONE_RING_ORDER_SEQUENTIAL);
+    // b536: section-by-section -- finish one lobe outer->inner before crossing
+    // to the next, instead of crossing the zone on every ring. Implemented for
+    // serpentine (its planner emits an ordered leg list, so the order can be
+    // changed without touching the shared ring loop's depth accounting).
+    s_ring_order = zone.ring_order;
+    const bool sec_ring_order = (zone.ring_order == ZONE_RING_ORDER_SECTIONS);
+    (void)sec_ring_order;
     if (seq_ring_order) INFO("Ring order: sequential (per-zone setting)");
+    if (sec_ring_order) INFO("Ring order: section by section (per-zone setting)");
     if (have_zone) zone_sort_walk_order(&zone);
     INFO("Firmware build: %d", FW_BUILD);
     if (have_zone) INFO("Zone perimeter: %d points.", zone.num_points);
@@ -11809,18 +11879,26 @@ static void phase_water_zone(void)
     float pressure_scale = 1.0f;
     // b424: serpentine dry rehearsal must not open the valve -- skip the 12s
     // full-open supply check (pressure_scale stays 1.0; no water flows).
-    // b535: a regulated supply doesn't vary run to run, so the check buys
-    // nothing and costs 12 s of full-throw spray -- which on a small zone
+    // b535: a regulated supply doesn't vary run to run, so the 12 s SAMPLE
+    // buys nothing and costs 12 s of full-throw spray -- which on a small zone
     // lands well past the edge. pressure_scale stays 1.0, so Smooth's first
     // pass uses the calibration as-is (later passes still self-correct) and
     // the estimate uses calibrated flow. No-supply detection moves to the
     // first ring instead (see s_supply_regulated below).
-    if (s_supply_regulated && !demo_mode && !serpentine_dry) {
-        INFO("Supply check skipped (regulated)");
-    }
-    if (!s_supply_regulated && !demo_mode && !serpentine_dry && psi_max > 0.5f) {
+    //
+    // b536 FIX: this block does TWO things -- it opens the valve and then
+    // samples. b535 skipped the whole block, so with the setting on the valve
+    // was never opened and NO RUN EVER WATERED (it planned, started, and
+    // stopped within ~130 ms with no flow). Only the sampling may be skipped;
+    // the valve open and its settle must always happen.
+    if (!demo_mode && !serpentine_dry && psi_max > 0.5f) {
         valve_goto(VALVE_OPEN_DEG, 1.0f, 8000, false);
         vTaskDelay(pdMS_TO_TICKS(1500));   // settle after valve open
+    }
+    if (s_supply_regulated && !demo_mode && !serpentine_dry) {
+        INFO("Supply sample skipped (regulated) -- valve open, using calibration");
+    }
+    if (!s_supply_regulated && !demo_mode && !serpentine_dry && psi_max > 0.5f) {
 
         // b365: spin up the waggle motor. NOZZLE_DUTY=90 matches chase mode --
         // smooth at typical loads, low enough that reversals are quick. Setup
@@ -15010,8 +15088,9 @@ static esp_err_t zone_act_handler(httpd_req_t *req)
         // b535: per-zone ring order rides along on the save.
         char ro_param[8] = {0};
         if (httpd_query_key_value(query, "ring_order", ro_param, sizeof(ro_param)) == ESP_OK)
-            s_web_zone.ring_order = (atoi(ro_param) == ZONE_RING_ORDER_SEQUENTIAL)
-                                    ? ZONE_RING_ORDER_SEQUENTIAL : ZONE_RING_ORDER_AUTO;
+            { int _ro = atoi(ro_param);
+              s_web_zone.ring_order = (_ro >= 1 && _ro <= ZONE_RING_ORDER_SECTIONS)
+                                      ? (uint8_t)_ro : ZONE_RING_ORDER_AUTO; }
         esp_err_t _save_err = zone_save_primary(s_web_zone_id, s_web_zone_name, &s_web_zone);
         if (_save_err != ESP_OK) {
             ESP_LOGE(TAG, "Zone %u save FAILED: %s", s_web_zone_id, esp_err_to_name(_save_err));

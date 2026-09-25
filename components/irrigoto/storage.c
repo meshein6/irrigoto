@@ -315,7 +315,7 @@ esp_err_t storage_zone_load(uint16_t id, char *name_out, size_t name_len,
         /* b535: absent -> 0 = auto, so pre-b535 zone files are unchanged. */
         int ro = 0;
         json_get_int(json, "ring_order", &ro);
-        zone_out->ring_order = (ro == ZONE_RING_ORDER_SEQUENTIAL) ? (uint8_t)ro : 0;
+        zone_out->ring_order = (ro >= 1 && ro <= ZONE_RING_ORDER_SECTIONS) ? (uint8_t)ro : 0;
 
         /* Points array: "points":[{...},{...},...] */
         const char *pp = strstr(json, "\"points\":");
@@ -386,7 +386,7 @@ esp_err_t storage_zone_parse_json(const char *json, int *out_id,
     json_get_int(json, "num_points", &np);
     int _ro = 0;
     json_get_int(json, "ring_order", &_ro);           /* b535 */
-    zone_out->ring_order = (_ro == ZONE_RING_ORDER_SEQUENTIAL) ? (uint8_t)_ro : 0;
+    zone_out->ring_order = (_ro >= 1 && _ro <= ZONE_RING_ORDER_SECTIONS) ? (uint8_t)_ro : 0;
     if (np < 0) np = 0;
     if (np > ZONE_MAX_PERIM_POINTS) np = ZONE_MAX_PERIM_POINTS;
 
