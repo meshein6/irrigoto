@@ -417,6 +417,11 @@ static TickType_t    s_water_vol_t0     = 0;     // b506: run start tick for the
 static FILE         *s_water_csv_f    = NULL; // watering CSV log (/lfs/water/water_000.csv)
 static uint8_t       s_csv_pass_type  = 1;    // 1=initial pass, 2+=cleanup pass
 static bool          s_water_detail_log = false; // when true: write per-pass rows (disables smooth aggregate)
+// b535: regulated supply (city mains / behind a regulator). When set, a run
+// skips the ~12 s full-open supply pressure check and trusts the pressure
+// calibration. Persisted in NVS as "supply_reg". Default off -- well pump and
+// pressure-tank supplies cycle, so a fresh reading matters there.
+static bool          s_supply_regulated = false;
 // b288: in smooth-aggregate mode the wbin file is created at run-END, not at start,
 // so the file is never held open during the loop (avoids LittleFS metadata-relocation
 // races against WiFi PHY work that caused the b285-b287 mid-run crashes).
@@ -11726,7 +11731,16 @@ static void phase_water_zone(void)
     float pressure_scale = 1.0f;
     // b424: serpentine dry rehearsal must not open the valve -- skip the 12s
     // full-open supply check (pressure_scale stays 1.0; no water flows).
-    if (!demo_mode && !serpentine_dry && psi_max > 0.5f) {
+    // b535: a regulated supply doesn't vary run to run, so the check buys
+    // nothing and costs 12 s of full-throw spray -- which on a small zone
+    // lands well past the edge. pressure_scale stays 1.0, so Smooth's first
+    // pass uses the calibration as-is (later passes still self-correct) and
+    // the estimate uses calibrated flow. No-supply detection moves to the
+    // first ring instead (see s_supply_regulated below).
+    if (s_supply_regulated && !demo_mode && !serpentine_dry) {
+        INFO("Supply check skipped (regulated)");
+    }
+    if (!s_supply_regulated && !demo_mode && !serpentine_dry && psi_max > 0.5f) {
         valve_goto(VALVE_OPEN_DEG, 1.0f, 8000, false);
         vTaskDelay(pdMS_TO_TICKS(1500));   // settle after valve open
 
@@ -12931,6 +12945,35 @@ static void phase_water_zone(void)
                 if (smooth_mode || gentle_mode)
                     vTaskDelay(pdMS_TO_TICKS(200));
                 mprls_read_quiet(&_nf);  // also stamps s_last_flow_tick if >= floor
+                // b535: with the start-of-run supply check skipped, a run
+                // started with the water off would skip ring after ring --
+                // the low reading counts as "transient" because no flow has
+                // been seen yet, so the b468 water-loss streak never trips
+                // and the run grinds on dry. Give the supply ~10 s (one
+                // retry) to appear before the first wetted ring; if it never
+                // does, there is no water. Only runs in the regulated case,
+                // where the 12 s full-open check did this job before.
+                if (s_supply_regulated && !s_water_run_had_flow
+                        && _nf < WATER_MIN_FLOW_PSI && !s_water_abort) {
+                    for (int _r = 0; _r < 2 && _nf < WATER_MIN_FLOW_PSI
+                                     && !s_water_abort; _r++) {
+                        INFO("Ring %d: no flow yet (%.3f < %.2f) -- waiting 5s "
+                             "for supply (regulated, try %d/2)",
+                             ring+1, _nf, WATER_MIN_FLOW_PSI, _r+1);
+                        vTaskDelay(pdMS_TO_TICKS(5000));
+                        mprls_read_quiet(&_nf);
+                    }
+                    if (_nf < WATER_MIN_FLOW_PSI) {
+                        INFO("NO water supply: %.3f PSI after ~10s with the "
+                             "valve open (regulated -- start-of-run check "
+                             "skipped) -- aborting", _nf);
+                        valve_goto_ex(VALVE_CLOSED_DEG, 2.0f, 8000, false, -1);
+                        s_valve_last_dir = -1;
+                        water_set_status(WATER_STATUS_NO_SUPPLY);
+                        ring_no_flow = true;
+                        break;   // break arc loop; run unwinds via s_water_abort
+                    }
+                }
                 if (_nf < WATER_MIN_FLOW_PSI) {
                     // b468: a lone low reading is NOT water-loss on a variable
                     // (shared-well) supply -- it can be a contention dip or an
@@ -15780,7 +15823,7 @@ static esp_err_t api_all_handler(httpd_req_t *req)
         "\"storage_used_kb\":%u,\"storage_total_kb\":%u,"
         "\"watering\":%s,\"water_mode\":%d,\"water_est_min\":%d,"
         "\"water_zone_id\":%u,\"cleanup_pass\":%d,"
-        "\"detail_log\":%s,"
+        "\"detail_log\":%s,\"supply_regulated\":%s,"
         "\"valve_open\":%d,\"uptime_s\":%lu,\"last_sleep_reason\":\"%s\","
         "\"sleep_dur_s\":%lu,\"inact_s\":%lu,"   // b472: expose cadence params
         "\"frame_suspect\":%s,\"frame_calibrated\":%s,"   // b480: closure-verify state
@@ -15795,6 +15838,7 @@ static esp_err_t api_all_handler(httpd_req_t *req)
         s_web_water_mode?"true":"false",s_web_water_mode,s_water_est_min,
         (unsigned)s_water_zone_id, s_water_cleanup_pass,
         s_water_detail_log?"true":"false",
+        s_supply_regulated?"true":"false",   // b535
         irrigoto_valve_is_open(),
         (unsigned long)(esp_timer_get_time()/1000000ULL),
         sleep_buf,
@@ -16185,6 +16229,28 @@ static esp_err_t api_detail_log_handler(httpd_req_t *req)
     snprintf(resp, sizeof(resp), "{\"detail_log\":%s}", s_water_detail_log?"true":"false");
     httpd_resp_set_type(req, "application/json");
     httpd_resp_sendstr(req, resp);
+    return ESP_OK;
+}
+
+// b535: GET /api/supply_regulated -> {"supply_regulated":bool}; POST on=0|1
+// sets it. Persisted, so it survives the deep-sleep cycle.
+static esp_err_t api_supply_regulated_handler(httpd_req_t *req)
+{
+    HTTP_CONN_CLOSE(req);
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
+    if (req->method == HTTP_POST) {
+        char b[24] = {0}; int n = httpd_req_recv(req, b, sizeof(b) - 1); char v[6] = {0};
+        if (n > 0 && httpd_query_key_value(b, "on", v, sizeof(v)) == ESP_OK) {
+            s_supply_regulated = (atoi(v) != 0);
+            pm_nvs_save_u8("supply_reg", s_supply_regulated ? 1 : 0);
+            INFO("Supply regulated %s (persisted)", s_supply_regulated ? "ON" : "off");
+        }
+    }
+    char resp[48];
+    int n = snprintf(resp, sizeof(resp), "{\"supply_regulated\":%s}",
+                     s_supply_regulated ? "true" : "false");
+    httpd_resp_send(req, resp, n);
     return ESP_OK;
 }
 
@@ -18801,7 +18867,7 @@ static void zone_web_start(void)
     httpd_config_t cfg   = HTTPD_DEFAULT_CONFIG();
     cfg.server_port      = ZONE_WEB_PORT;
     cfg.ctrl_port        = ZONE_WEB_CTRL_PORT;
-    cfg.max_uri_handlers  = 84;  // wifi & power modal: 82 -> 84 (/api/wifi_power GET+POST); solution dosing: 76 -> 82 (/bottle_cal, /api/solution_cal x2, /api/pump_jog x2, /api/solution_est); b525: 74 -> 76 (/api/winter GET+POST); b522: 72 -> 74 (/api/fault_hold GET+POST); b512: 70 -> 72 (/api/uart_log GET+POST); b489: 68 -> 70, keeping the 2-slot margin over
+    cfg.max_uri_handlers  = 86;  // b535: 84 -> 86 (/api/supply_regulated GET+POST); wifi & power modal: 82 -> 84 (/api/wifi_power GET+POST); solution dosing: 76 -> 82 (/bottle_cal, /api/solution_cal x2, /api/pump_jog x2, /api/solution_est); b525: 74 -> 76 (/api/winter GET+POST); b522: 72 -> 74 (/api/fault_hold GET+POST); b512: 70 -> 72 (/api/uart_log GET+POST); b489: 68 -> 70, keeping the 2-slot margin over
                                  // the _Static_assert below.
                                  // MUST be set before httpd_start (cfg is copied there);
                                  // headroom over uris[] count -- _Static_assert below guards it.
@@ -18835,6 +18901,8 @@ static void zone_web_start(void)
         {.uri="/api/wifi_power",  .method=HTTP_GET,  .handler=api_wifi_power_handler},  // wifi & power modal
         {.uri="/api/wifi_power",  .method=HTTP_POST, .handler=api_wifi_power_handler},  // wifi & power modal
         {.uri="/api/detail_log",  .method=HTTP_GET,  .handler=api_detail_log_handler},
+        {.uri="/api/supply_regulated", .method=HTTP_GET,  .handler=api_supply_regulated_handler},  // b535
+        {.uri="/api/supply_regulated", .method=HTTP_POST, .handler=api_supply_regulated_handler},  // b535
         {.uri="/api/uart_log",    .method=HTTP_GET,  .handler=api_uart_log_handler},   // b512
         {.uri="/api/uart_log",    .method=HTTP_POST, .handler=api_uart_log_handler},   // b512
         {.uri="/api/winter",      .method=HTTP_GET,  .handler=api_winter_handler},     // b525
@@ -18903,7 +18971,7 @@ static void zone_web_start(void)
         {.uri="/fs/upload",             .method=HTTP_POST, .handler=fs_upload_handler},
         {.uri="/fs/delete",             .method=HTTP_POST, .handler=fs_delete_handler},
     };
-    _Static_assert(sizeof(uris)/sizeof(uris[0]) <= 82,   // wifi & power modal: 80 -> 82 (/api/wifi_power GET+POST); solution dosing: 74 -> 80 (see max_uri_handlers); b525: 72 -> 74 (/api/winter GET+POST); b522: 70 -> 72 (/api/fault_hold GET+POST); b512: 68 -> 70 (/api/uart_log GET+POST); b489: 66 -> 68
+    _Static_assert(sizeof(uris)/sizeof(uris[0]) <= 84,   // b535: 82 -> 84 (/api/supply_regulated GET+POST); wifi & power modal: 80 -> 82 (/api/wifi_power GET+POST); solution dosing: 74 -> 80 (see max_uri_handlers); b525: 72 -> 74 (/api/winter GET+POST); b522: 70 -> 72 (/api/fault_hold GET+POST); b512: 68 -> 70 (/api/uart_log GET+POST); b489: 66 -> 68
                    "uris[] exceeds cfg.max_uri_handlers -- raise it before httpd_start");
     for (size_t i = 0; i < sizeof(uris)/sizeof(uris[0]); i++)
         httpd_register_uri_handler(s_zone_server, &uris[i]);
@@ -21241,7 +21309,7 @@ static void log_wake_cause(void)
 
 // ── Power-management persistence (NVS namespace "OtO") ─────────────────────
 // Keys: pm_disable (u8), pm_inact_s (u32), pm_dur_s (u32), pm_reason (str),
-//       pm_winter (u8, b525)
+//       pm_winter (u8, b525), supply_reg (u8, b535)
 
 static void pm_nvs_load(void)
 {
@@ -21265,6 +21333,8 @@ static void pm_nvs_load(void)
     if (nvs_get_u8(h, "ui_theme", &th) == ESP_OK) s_theme_dark = (th != 0);
     uint8_t win = 0;
     if (nvs_get_u8(h, "pm_winter", &win) == ESP_OK) s_winter_sleep = (win != 0);  // b525
+    uint8_t sreg = 0;
+    if (nvs_get_u8(h, "supply_reg", &sreg) == ESP_OK) s_supply_regulated = (sreg != 0);  // b535
     nvs_close(h);
 }
 

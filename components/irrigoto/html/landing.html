@@ -106,6 +106,15 @@ section{margin-bottom:18px;}
 .dev-label{color:var(--text-mid);}
 .dev-val{color:var(--text);font-family:'Courier New',monospace;font-size:12px;}
 .cal-desc{font-size:12px;color:var(--text-mid);margin-bottom:10px;line-height:1.5;}
+.info-btn{background:none;border:1px solid var(--border);color:var(--text-mid);
+  width:16px;height:16px;line-height:1;border-radius:50%;font-size:10px;
+  cursor:pointer;font-family:inherit;padding:0;margin-left:4px;}
+.info-btn:active{color:var(--green);border-color:var(--green);}
+.mode-help{display:none;font-size:12px;color:var(--text-mid);line-height:1.5;
+  background:var(--btn);border:1px solid var(--border);border-radius:var(--radius-sm);
+  padding:10px 12px;}
+.mode-help.show{display:block;}
+.mode-help b{color:var(--text);}
 /* Water modal */
 #modal-bg,#wp-bg{display:none;position:fixed;inset:0;background:rgba(0,0,0,.7);
   z-index:100;align-items:flex-end;justify-content:center;}
@@ -269,6 +278,26 @@ section{margin-bottom:18px;}
           <input type="checkbox" id="bottles-cb" onchange="setBottles(this.checked)">
           <span class="theme-slider"></span>
         </label>
+      </div>
+      <div class="dev-row" title="Skip the start-of-run pressure check on a regulated supply">
+        <span class="dev-label">Supply regulated
+          <button class="info-btn" onclick="toggleSupplyHelp()" aria-expanded="false"
+                  aria-controls="supply-help" aria-label="What Supply regulated does">i</button>
+        </span>
+        <label class="theme-switch">
+          <input type="checkbox" id="supply-cb" onchange="setSupplyRegulated(this.checked)">
+          <span class="theme-slider"></span>
+        </label>
+      </div>
+      <div class="mode-help" id="supply-help" style="margin:0 0 10px">
+        <b>Supply regulated.</b> Turn on if your water comes from city mains or goes
+        through a pressure regulator. Pressure then stays about the same from run to
+        run, so the sprinkler skips the 12-second full-power pressure check at the
+        start of each run &mdash; which can spray past the edge of small zones &mdash;
+        and trusts the pressure calibration. Leave off for a well pump or pressure
+        tank, where pressure rises and falls as the pump cycles; there the check
+        measures today's supply so the run can adjust. If runs start landing short or
+        long after turning this on, recalibrate pressure or turn it back off.
       </div>
       <div class="dev-row" title="Off-season hibernation: deep sleep with no wake timer">
         <span class="dev-label">Winter sleep</span><span class="dev-val" id="d-winter">Off</span>
@@ -774,6 +803,25 @@ function rssiLabel(rssi){
   return `<span style="color:${col};font-size:11px">${label} (${rssi}dBm)</span> `+barHtml;
 }
 
+// b535: regulated-supply switch. Skips the start-of-run pressure check.
+async function setSupplyRegulated(on){
+  try {
+    const d = await fetch('/api/supply_regulated', {method:'POST',
+      headers:{'Content-Type':'application/x-www-form-urlencoded'},
+      body:'on=' + (on ? 1 : 0)}).then(r => r.json());
+    const cb = document.getElementById('supply-cb');
+    if (cb) cb.checked = !!d.supply_regulated;
+  } catch(e){}
+}
+function toggleSupplyHelp(){
+  const h = document.getElementById('supply-help');
+  const on = !h.classList.contains('show');
+  h.classList.toggle('show', on);
+  const b = document.querySelector('#supply-cb') && h.previousElementSibling
+            ? h.previousElementSibling.querySelector('.info-btn') : null;
+  if (b) b.setAttribute('aria-expanded', on ? 'true' : 'false');
+}
+
 async function toggleDetailLog(){
   try{
     const d=await fetch('/api/detail_log').then(r=>r.json());
@@ -851,6 +899,8 @@ async function refresh(){
     const dlEl=document.getElementById('d-detail');
     dlEl.textContent=d.detail_log?'On':'Off';
     dlEl.style.color=d.detail_log?'var(--green)':'var(--text-mid)';
+    const sup=document.getElementById('supply-cb');   // b535
+    if(sup && d.supply_regulated!==undefined) sup.checked=!!d.supply_regulated;
     renderWinter(d.winter, d.winter_left_s);
     // Update device name (skip if user is editing)
     const dni=document.getElementById('dev-name-inp');
