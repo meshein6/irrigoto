@@ -77,6 +77,16 @@ tr:last-child td{border-bottom:none;}
   border-radius:var(--radius-sm);color:var(--text);font-size:15px;padding:9px 12px;
   font-family:'Courier New',monospace;}
 .throw-inp:focus{outline:1px solid var(--green);}
+/* Unit suffix inside the field, plus a live conversion under it, so a value
+   typed in the wrong unit is obvious before it is saved (a bare "13" reads as
+   13 mm, not 13 ft). */
+.throw-wrap{position:relative;flex:1;display:flex;}
+.throw-wrap .throw-inp{flex:1;padding-right:38px;}
+.throw-wrap u{position:absolute;right:12px;top:50%;transform:translateY(-50%);
+  font-size:12px;color:var(--text-mid);text-decoration:none;pointer-events:none;}
+.throw-conv{font-size:12px;color:var(--text-mid);margin-top:6px;min-height:15px;
+  font-family:'Courier New',monospace;}
+.throw-conv.warn{color:var(--orange);}
 /* Encoder */
 .enc-grid{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-top:10px;}
 .enc-box{background:var(--bg3);border-radius:var(--radius-sm);padding:10px 12px;border:1px solid var(--border);}
@@ -118,26 +128,28 @@ tr:last-child td{border-bottom:none;}
     <div class="status-msg" id="pres-msg"></div>
     <!-- Low throw entry (shown after scan, step 1 of 2) -->
     <div class="throw-input-block" id="throw-low-block">
-      <div class="throw-label">&#128167; Step 1 of 2: Valve is open a little (short throw). Go measure the distance to the outer edge of this short spray ellipse, then enter it below.</div>
+      <div class="throw-label">&#128167; Step 1 of 2: Valve is open a little (short throw). Go measure the distance to the outer edge of this short spray ellipse, then enter it below. Enter the distance in <b>millimetres</b>, or in feet with an <b>f</b> on the end (e.g. <b>4.0f</b>).</div>
       <div class="throw-row">
-        <input class="throw-inp" id="throw-low-inp" type="text" placeholder="e.g. 1200 or 4.0f" inputmode="decimal">
+        <span class="throw-wrap"><input class="throw-inp" id="throw-low-inp" type="text" placeholder="e.g. 1200 or 4.0f" inputmode="decimal" oninput="throwConv(this,'throw-low-conv')"><u>mm</u></span>
         <button class="btn btn-green" id="throw-low-save-btn" onclick="submitThrowLow()">Save short throw</button>
       </div>
+      <div class="throw-conv" id="throw-low-conv"></div>
       <div class="status-msg" id="throw-low-msg" style="margin-top:6px"></div>
     </div>
     <!-- Max throw entry (shown after low throw, step 2 of 2) -->
     <div class="throw-input-block" id="throw-block">
-      <div class="throw-label">&#127775; Step 2 of 2: Valve is now open at full pressure. Go measure the distance to the outer edge of the spray ellipse, then enter it below.</div>
+      <div class="throw-label">&#127775; Step 2 of 2: Valve is now open at full pressure. Go measure the distance to the outer edge of the spray ellipse, then enter it below. Enter the distance in <b>millimetres</b>, or in feet with an <b>f</b> on the end (e.g. <b>20.3f</b>).</div>
       <div class="throw-row">
-        <input class="throw-inp" id="throw-inp" type="text" placeholder="e.g. 6200 or 20.3f" inputmode="decimal">
+        <span class="throw-wrap"><input class="throw-inp" id="throw-inp" type="text" placeholder="e.g. 6200 or 20.3f" inputmode="decimal" oninput="throwConv(this,'throw-conv')"><u>mm</u></span>
         <button class="btn btn-green" id="throw-save-btn" onclick="submitThrow()">Save max throw</button>
       </div>
+      <div class="throw-conv" id="throw-conv"></div>
       <div class="status-msg" id="throw-msg" style="margin-top:6px"></div>
     </div>
     <!-- Results table -->
     <div id="pres-table-wrap" style="display:none">
       <table>
-        <thead><tr><th>#</th><th>Valve (deg)</th><th>PSI</th><th>Throw</th><th></th></tr></thead>
+        <thead><tr><th>#</th><th>Valve (deg)</th><th>PSI</th><th>Throw (mm)</th><th></th></tr></thead>
         <tbody id="pres-tbody"></tbody>
       </table>
     </div>
@@ -236,6 +248,26 @@ async function presCancel(){
 // feedback -- otherwise an impatient second click lands after the device has
 // advanced and returns "not awaiting throw". On error we restart the poll so
 // the UI reconciles to the device's real state instead of stranding the block.
+// Live unit conversion under the throw inputs. Mirrors the firmware parse
+// (irrigoto.c ~2821): a plain number is millimetres, a trailing f/F is feet
+// x 304.8. The common mistake is typing feet with no 'f', which saves a throw
+// ~300x too short -- so anything under 100 mm is called out.
+function throwConv(inp, outId){
+  const out = document.getElementById(outId);
+  if (!out) return;
+  const raw = (inp.value || '').trim();
+  if (!raw) { out.textContent = ''; out.classList.remove('warn'); return; }
+  const feet = /[fF]\s*$/.test(raw);
+  const n = parseFloat(raw.replace(/[fF]\s*$/, ''));
+  if (!isFinite(n) || n <= 0) { out.textContent = ''; out.classList.remove('warn'); return; }
+  const mm = feet ? n * 304.8 : n;
+  out.textContent = '= ' + (mm / 1000).toFixed(2) + ' m / ' + (mm / 304.8).toFixed(1) + ' ft';
+  // Under 100 mm is 4 inches of throw -- almost certainly feet without the 'f'.
+  const suspect = !feet && n < 100;
+  out.classList.toggle('warn', suspect);
+  if (suspect) out.textContent += '  \u2190 did you mean ' + n + 'f (feet)?';
+}
+
 async function submitThrowLow(){
   const val=document.getElementById('throw-low-inp').value.trim();
   if(!val){return;}
