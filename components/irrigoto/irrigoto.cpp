@@ -504,6 +504,18 @@ void IrrigotoComponent::set_inactivity_minutes(uint32_t m) {
     irrigoto_set_inactivity_minutes(m);
 }
 
+// b542: seconds accessors. The minutes pair truncates (90 s reads back as
+// 1 min), and both write the same NVS key as the WiFi & power modal, so a
+// write-back of the displayed value silently rounded the setting down.
+uint32_t IrrigotoComponent::get_inactivity_s() {
+    return irrigoto_get_inactivity_s();
+}
+
+void IrrigotoComponent::set_inactivity_s(uint32_t s) {
+    ESP_LOGI(TAG, "HA set_inactivity_s: %u", (unsigned)s);
+    irrigoto_set_inactivity_s(s);
+}
+
 uint32_t IrrigotoComponent::get_sleep_duration_s() {
     return irrigoto_get_sleep_duration_s();
 }

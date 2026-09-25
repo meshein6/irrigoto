@@ -653,22 +653,34 @@ switch:
       - lambda: id(irrigoto_hw).set_auto_sleep(false);
 
 number:
-  # Inactivity threshold (minutes) before auto-sleep fires.
-  # Setter persists to NVS so the value survives reboots.
+  # Awake time before auto-sleep fires. In SECONDS, matching both the NVS
+  # key (pm_inact_s) and the WiFi & power modal.
+  #
+  # b542: this was in MINUTES while the modal sets seconds, and both write
+  # pm_inact_s. get_inactivity_minutes() truncates (90 s reported as 1 min),
+  # so any write-back of the displayed value silently rounded the setting
+  # down -- and 300 s is exactly 5 min, which is where a stale whole-minute
+  # value lands. Seconds on both sides makes the round-trip lossless.
+  #
+  # NOTE: a template number with a state lambda cannot take restore_value --
+  # ESPHome rejects the combination -- which also means it never restores a
+  # stale value on boot. So ESPHome is NOT the thing that was resetting these;
+  # whatever writes them comes from outside (an HA push, or the minutes setter
+  # being called with a truncated value).
   - platform: template
-    name: "${friendly_name} Inactivity Timeout"
-    id: irr_inactivity_min
+    name: "${friendly_name} Awake Time"
+    id: irr_inactivity_s
     icon: "mdi:timer-sand"
-    min_value: 1
-    max_value: 60
-    step: 1
-    unit_of_measurement: min
+    min_value: 30
+    max_value: 3600
+    step: 30
+    unit_of_measurement: s
     optimistic: false
     update_interval: 30s
     lambda: |-
-      return (float)id(irrigoto_hw).get_inactivity_minutes();
+      return (float)id(irrigoto_hw).get_inactivity_s();
     set_action:
-      - lambda: id(irrigoto_hw).set_inactivity_minutes((uint32_t)x);
+      - lambda: id(irrigoto_hw).set_inactivity_s((uint32_t)x);
   # Sleep duration (seconds) — how long the device sleeps before
   # waking to reconnect to HA.
   - platform: template

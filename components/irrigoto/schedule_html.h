@@ -474,7 +474,7 @@ function openEntryPreview(idx){
   if (!e || !z || !z.points || z.points.length < 2 || typeof IrrigotoPath === 'undefined') return;
   IrrigotoPath.openPreview({
     points: z.points, act_max_throw: z.act_max_throw, act_min_throw: z.act_min_throw,
-    mode: String(SCHED_MODE_DIGIT[e.mode] || '1'), lockMode: true,
+    mode: String(SCHED_MODE_DIGIT[e.mode] || '1'), lockMode: true, depth8: e.depth,
     title: z.name || ('Zone ' + e.zone),
   });
 }

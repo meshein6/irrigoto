@@ -465,7 +465,7 @@ function openPathPreview(){
   IrrigotoPath.openPreview({
     points: ST.points,
     act_max_throw: ST.act_max_throw, act_min_throw: ST.act_min_throw,
-    mode: pathMode, lockMode: false,
+    mode: pathMode, lockMode: false, depth8: 1,
     title: document.getElementById('zone-name').value || 'Zone',
   });
 }

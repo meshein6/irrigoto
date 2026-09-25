@@ -93,6 +93,11 @@ class IrrigotoComponent : public Component, public api::CustomAPIDevice {
 
   uint32_t get_inactivity_minutes();
   void     set_inactivity_minutes(uint32_t m);
+  // b542: seconds accessors, matching the NVS key's actual unit and the
+  // WiFi & power modal. The minutes pair is kept for anything still using it,
+  // but it truncates, so prefer these.
+  uint32_t get_inactivity_s();
+  void     set_inactivity_s(uint32_t s);
   uint32_t get_sleep_duration_s();
   void     set_sleep_duration_s(uint32_t s);
   uint32_t get_dwell_timeout_s();

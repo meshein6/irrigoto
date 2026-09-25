@@ -536,13 +536,14 @@
       play: el.querySelector('.ipo-play'),
       range: el.querySelector('input'),
       at: el.querySelector('.ipo-at'),
-      opts: null, mode: '7', passIdx: 0, t: 0, timer: null
+      opts: null, mode: '7', passIdx: 0, t: 0, timer: null,
+      passes: 1, passesExact: true
     };
     el.addEventListener('click', function (e) { if (e.target === el) ovClose(); });
     ov.el.querySelector('.ipo-x').addEventListener('click', ovClose);
     ov.pass.addEventListener('click', function () {
-      ov.passIdx = (ov.passIdx + 1) % 4;
-      ov.pass.textContent = 'Pass ' + (ov.passIdx + 1);
+      ov.passIdx = (ov.passIdx + 1) % Math.max(1, ov.passes);
+      ovPassLabel();
       ovDraw();
     });
     ov.range.addEventListener('input', function () { ov.t = +ov.range.value / 1000; ovDraw(); });
@@ -560,6 +561,27 @@
       ov.range.value = Math.round(ov.t * 1000);
       ovDraw();
     }, 33);
+  }
+
+  /* b542: the stepper used to run 1..4, which is no mode's pass count. Pulse
+   * does exactly depth8 identical passes; Gentle caps at 20 and Smooth,
+   * Serpentine and Sections at 30, all exiting early once the rings meet
+   * target. So Pulse is exact and the rest are an upper bound -- say which,
+   * rather than implying a plan the run will not follow. It matters beyond
+   * labelling: serpentine and sections alternate sweep DIRECTION by pass, so
+   * a pass index the run never reaches draws the sweep the wrong way. */
+  function modePasses(modeKey, depth8) {
+    var d = (depth8 >= 1 && depth8 <= 8) ? depth8 : 1;
+    if (modeKey === 'pulse')  return { n: d,  exact: true };
+    if (modeKey === 'gentle') return { n: 20, exact: false };
+    if (modeKey === 'chase' || modeKey === 'demo') return { n: 1, exact: true };
+    return { n: 30, exact: false };      /* smooth, serpentine, sections */
+  }
+
+  function ovPassLabel() {
+    ov.pass.textContent = ov.passesExact
+      ? 'Pass ' + (ov.passIdx + 1) + ' of ' + ov.passes
+      : 'Pass ' + (ov.passIdx + 1) + ' of up to ' + ov.passes;
   }
 
   function ovClose() {
@@ -591,7 +613,13 @@
     ov.opts.points = pts;
     ov.mode = MODES[opts.mode] ? opts.mode : '7';
     ov.passIdx = 0; ov.t = 0; ov.range.value = 0;
-    ov.pass.textContent = 'Pass 1';
+    var mk = (MODES[ov.mode] || MODES['1']).key;
+    var mp = modePasses(mk, opts.depth8);
+    ov.passes = mp.n; ov.passesExact = mp.exact;
+    /* One pass means nothing to step through -- hide the control rather than
+     * offer a stepper that cannot move. */
+    ov.pass.style.display = (ov.passes > 1) ? '' : 'none';
+    ovPassLabel();
     /* Locked: the caller already chose the mode, so show it as a static chip
      * rather than letting the preview disagree with the run that will happen. */
     ov.modes.innerHTML = '';
@@ -608,6 +636,12 @@
         b.textContent = (MODES[m] || {}).label || m;
         b.addEventListener('click', function () {
           ov.mode = m;
+          var k = (MODES[m] || MODES['1']).key;
+          var q = modePasses(k, ov.opts.depth8);
+          ov.passes = q.n; ov.passesExact = q.exact;
+          if (ov.passIdx >= ov.passes) ov.passIdx = 0;
+          ov.pass.style.display = (ov.passes > 1) ? '' : 'none';
+          ovPassLabel();
           ov.modes.querySelectorAll('.ipo-btn').forEach(function (x) { x.classList.toggle('sel', x === b); });
           ovDraw();
         });

@@ -995,7 +995,7 @@ function openPathFull(){
   IrrigotoPath.openPreview({
     points: pathZone.points,
     act_max_throw: pathZone.act_max_throw, act_min_throw: pathZone.act_min_throw,
-    mode: selModeDat, lockMode: true,
+    mode: selModeDat, lockMode: true, depth8: selDepth,
     title: pathZone.name || 'Zone',
   });
 }
