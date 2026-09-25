@@ -187,6 +187,52 @@ R"PATHJS(
     return { idx: idx, cw: cw, dryReturn: dryReturn, orderVaries: (modeKey === 'smooth' && !sequential) };
   }
 
+  /* Do two circular bearing ranges overlap? Mirrors serp_arc_overlaps() in
+   * irrigoto.c so the preview groups arcs into lobes the same way the
+   * firmware's plan builder does. */
+  function spanOverlaps(a, b) {
+    var step = 2.0;
+    for (var t = 0; t <= a.span; t += step) {
+      var off = (((a.lo + t) % 360) - b.lo + 360) % 360;
+      if (off <= b.span) return true;
+    }
+    return false;
+  }
+
+  /* Lobe-major ordering for Sections: finish one side of the zone outer ->
+   * inner, then ONE hop to the next, instead of crossing on every ring.
+   * Lobes are the outermost waterable ring's arcs; going inward they merge,
+   * so an arc belongs to the lowest-index lobe it overlaps and merged rings
+   * are swept exactly once, under the first section. Mirrors the firmware. */
+  function orderSections(ringsIn) {
+    var lobes = null, i, j;
+    for (i = 0; i < ringsIn.length; i++) {
+      if (ringsIn[i].spans.length) { lobes = ringsIn[i].spans; break; }
+    }
+    if (!lobes || lobes.length < 2) return null;   /* nothing to section */
+    var out = [], visit = 0;
+    for (var L = 0; L < lobes.length; L++) {
+      for (i = 0; i < ringsIn.length; i++) {
+        var R = ringsIn[i], sub = [];
+        for (j = 0; j < R.spans.length; j++) {
+          var owner = -1;
+          for (var k = 0; k < lobes.length; k++)
+            if (spanOverlaps(R.spans[j], lobes[k])) { owner = k; break; }
+          if (owner < 0) owner = 0;
+          if (owner === L) sub.push(R.spans[j]);
+        }
+        if (!sub.length) continue;
+        out.push({ ring: R.ring, visit: visit++, throw_mm: R.throw_mm,
+                   cw: (out.length % 2) === 0, lobe: L, spans: sub });
+      }
+    }
+    /* A hop is dry whenever the next visit is a different ring or lobe. */
+    for (i = 0; i < out.length; i++)
+      out[i].dryReturn = (i > 0) && (out[i].lobe !== out[i - 1].lobe ||
+                                     out[i].cw === out[i - 1].cw);
+    return out.length ? out : null;
+  }
+
   /* Build everything needed to draw. `points` is [{deg, throw_mm}, ...]. */
   function build(points, opts) {
     opts = opts || {};
@@ -214,10 +260,17 @@ R"PATHJS(
         spans: ringSpans(points, arc, thr[ri])
       });
     }
+    /* b540: Sections reorders the visits lobe-major. Without this the preview
+     * drew Sections and Serpentine identically -- it claimed a behaviour the
+     * firmware has but the preview never modelled. */
+    var sectioned = (modeKey === 'sections') ? orderSections(rings) : null;
+    if (sectioned) rings = sectioned;
+
     return {
       modeKey: modeKey,
       modeLabel: (MODES[opts.mode] || MODES['1']).label,
       arc: arc,
+      lobes: sectioned ? (sectioned[sectioned.length - 1].lobe + 1) : 1,
       rings: rings,
       scale_mm: opts.scale_mm || (actMax + 914),
       orderVaries: plan.orderVaries,
