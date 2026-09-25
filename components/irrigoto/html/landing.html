@@ -123,6 +123,34 @@ section{margin-bottom:18px;}
 .mode-btn span{display:block;font-size:11px;color:var(--text-mid);margin-top:3px;}
 .mode-btn.sel span{color:rgba(0,232,122,.6);}
 .modal-actions{display:flex;gap:10px;}
+/* Apply solution block (b534) -- chips/toggles match the schedule page */
+#sol-block{border-top:1px solid var(--border);margin:-6px 0 14px;padding-top:12px;}
+.toggle-row{display:flex;justify-content:space-between;align-items:center;}
+.toggle-row .toggle-lbl{font-size:13px;color:var(--text);}
+.sol-lbl{display:block;font-size:10px;letter-spacing:.12em;text-transform:uppercase;
+  color:var(--text-mid);margin:10px 0 4px;}
+.days{display:flex;gap:6px;justify-content:space-between;}
+.day{flex:1;text-align:center;font-size:11px;font-weight:600;padding:8px 0;
+  border-radius:var(--radius-sm);border:1px solid var(--border);background:var(--btn);
+  color:var(--text-mid);cursor:pointer;font-family:inherit;letter-spacing:.04em;}
+.day.sel{background:var(--green-dim);border-color:#1a5035;color:var(--green);}
+.sub{display:none;margin-top:8px;}
+.sub.on{display:block;}
+.num{position:relative;flex:1;}
+.num label{display:block;font-size:10px;letter-spacing:.12em;text-transform:uppercase;
+  color:var(--text-mid);margin-bottom:4px;}
+.num input{background:var(--bg3);border:1px solid var(--border);border-radius:var(--radius-sm);
+  color:var(--text);font-size:14px;padding:8px 26px 8px 10px;width:100%;font-family:inherit;
+  -moz-appearance:textfield;}
+.num input:focus{outline:1px solid var(--green);}
+.num input::-webkit-outer-spin-button,.num input::-webkit-inner-spin-button{-webkit-appearance:none;margin:0;}
+.num u{position:absolute;right:10px;bottom:10px;font-size:12px;color:var(--text-mid);text-decoration:none;}
+.est{display:flex;justify-content:space-between;align-items:baseline;margin-top:10px;
+  padding:8px 10px;border:1px solid var(--border);border-radius:var(--radius-sm);
+  background:var(--btn);font-size:12px;color:var(--text-mid);}
+.est b{color:var(--green);font-family:'Courier New',monospace;font-size:13px;font-weight:700;}
+.est b.unset{color:var(--orange);font-weight:400;font-size:11px;}
+.hint{font-size:11px;color:var(--text-mid);margin-top:4px;line-height:1.4;}
 .modal-actions .btn{flex:1;justify-content:center;}
 #modal-status{font-size:12px;color:var(--text-mid);text-align:center;
   margin-top:10px;min-height:18px;}
@@ -189,10 +217,11 @@ section{margin-bottom:18px;}
   <section>
     <div class="sec-hdr"><span class="sec-title">Calibration</span></div>
     <div class="card">
-      <div class="cal-desc">Device-level: pressure &rarr; throw mapping and nozzle speed. Run after hardware changes or if watering accuracy degrades.</div>
+      <div class="cal-desc">Device-level: pressure &rarr; throw mapping, nozzle speed, and solution pump rates. Run after hardware changes, if watering accuracy degrades, or when you change solution products.</div>
       <div class="zone-actions">
         <a class="btn" href="/cal">&#128200; Pressure cal</a>
         <a class="btn" href="/cal#speed">&#9992; Speed cal</a>
+        <a class="btn" href="/bottle_cal">&#129514; Bottle cal</a>
       </div>
     </div>
   </section>
@@ -274,6 +303,38 @@ section{margin-bottom:18px;}
         <span id="chase-dur-val" style="min-width:48px;text-align:right;color:var(--text);font-weight:600;">3 min</span>
       </div>
     </div>
+    <!-- b534: Apply solution (manual run). Hidden for chase/demo. -->
+    <div id="sol-block">
+      <div class="toggle-row">
+        <span class="toggle-lbl">Apply solution</span>
+        <label class="theme-switch"><input type="checkbox" id="sol-en" onchange="solToggle()"><span class="theme-slider"></span></label>
+      </div>
+      <div id="sol-body" style="display:none">
+        <span class="sol-lbl">Bottle</span>
+        <div class="days" id="sol-bottle">
+          <button class="day sel" data-v="1" onclick="solPick('sol-bottle',this)">Bottle 1</button>
+          <button class="day" data-v="2" onclick="solPick('sol-bottle',this)">Bottle 2</button>
+          <button class="day" data-v="3" onclick="solPick('sol-bottle',this)">Bottle 3</button>
+        </div>
+        <span class="sol-lbl">Pump speed</span>
+        <div class="days" id="sol-speed">
+          <button class="day" data-v="60" onclick="solPick('sol-speed',this)">Low</button>
+          <button class="day" data-v="80" onclick="solPick('sol-speed',this)">Medium</button>
+          <button class="day sel" data-v="100" onclick="solPick('sol-speed',this)">Full</button>
+        </div>
+        <div class="toggle-row" style="margin-top:12px">
+          <span class="toggle-lbl">Pulse solution</span>
+          <label class="theme-switch"><input type="checkbox" id="sol-pulse" onchange="solToggle()"><span class="theme-slider"></span></label>
+        </div>
+        <div class="sub" id="sol-pulse-body">
+          <div style="display:flex;gap:8px">
+            <div class="num"><label>On</label><input type="number" id="sol-on" min="1" max="600" step="1" inputmode="numeric" value="2" oninput="solEst()" onblur="solClamp(this)"><u>s</u></div>
+            <div class="num"><label>Off</label><input type="number" id="sol-off" min="1" max="600" step="1" inputmode="numeric" value="4" oninput="solEst()" onblur="solClamp(this)"><u>s</u></div>
+          </div>
+        </div>
+        <div class="est"><span id="sol-est-l"></span><b id="sol-est-v"></b></div>
+      </div>
+    </div>
     <div class="modal-actions">
       <button class="btn" onclick="closeModal()">Cancel</button>
       <button class="btn btn-primary" id="start-btn" onclick="startWater()">&#9654; Start</button>
@@ -284,6 +345,7 @@ section{margin-bottom:18px;}
 
 <script>
 let selZoneId=0, selModeDat='1';
+let lastSolution=null;   // b534: /api/all "solution" object
 let waterStartTime=0, waterEstMs=0, countdownTimer=null, lastWateringState=false, lastCleanupPass=0, lastEstMin=0;
 
 function handleZoneBtn(id){
@@ -427,6 +489,7 @@ function openModal(id, name){
   document.querySelectorAll('.mode-btn').forEach(b=>b.classList.remove('sel'));
   document.querySelector('.mode-btn[data-mode="1"]').classList.add('sel');
   document.getElementById('chase-row').style.display='none';
+  solRestore(); solModeChanged();
   document.getElementById('modal-bg').classList.add('open');
 }
 function closeModal(){ document.getElementById('modal-bg').classList.remove('open'); }
@@ -436,6 +499,71 @@ function selMode(btn){
   // Chase mode shows a duration slider; other modes hide it.
   document.getElementById('chase-row').style.display =
     (selModeDat === 'c') ? 'block' : 'none';
+  solModeChanged();
+}
+
+// ── Apply solution on a manual run (b534) ────────────────────────────────────
+// Settings live in the browser (localStorage), not on the device. The modal
+// mode digit maps to a schedule (mode, depth) pair for the run-length estimate.
+const SOL_KEY='irrigoto_solution';
+const SOL_MODE_MAP={'1':[0,1],'2':[0,2],'3':[0,2],'5':[1,1],'6':[1,2],'7':[2,1],'8':[3,1]};
+let solRates=null, solEstMin=0, solEstReq=0;
+function solLoadRates(){
+  fetch('/api/solution_cal',{cache:'no-store'}).then(r=>r.json()).then(d=>{solRates=d.rates||null; solEst();}).catch(()=>{});
+}
+function solRestore(){
+  let s={}; try{ s=JSON.parse(localStorage.getItem(SOL_KEY)||'{}'); }catch(e){}
+  document.getElementById('sol-en').checked=!!s.enabled;
+  document.getElementById('sol-pulse').checked=!!s.pulse;
+  document.getElementById('sol-on').value=s.on||2;
+  document.getElementById('sol-off').value=s.off||4;
+  document.querySelectorAll('#sol-bottle .day').forEach(b=>b.classList.toggle('sel',+b.dataset.v===(s.bottle||1)));
+  document.querySelectorAll('#sol-speed .day').forEach(b=>b.classList.toggle('sel',+b.dataset.v===(s.speed||100)));
+  solToggle();
+}
+function solState(){
+  return {
+    enabled: document.getElementById('sol-en').checked,
+    bottle: +document.querySelector('#sol-bottle .sel').dataset.v,
+    speed: +document.querySelector('#sol-speed .sel').dataset.v,
+    pulse: document.getElementById('sol-pulse').checked,
+    on: solVal(document.getElementById('sol-on')),
+    off: solVal(document.getElementById('sol-off')),
+  };
+}
+function solSave(){ try{ localStorage.setItem(SOL_KEY, JSON.stringify(solState())); }catch(e){} }
+function solVal(el){ let v=parseInt(el.value,10); if(!(v>=1)) v=1; if(v>600) v=600; return v; }   // read only
+function solClamp(el){ el.value=solVal(el); solEst(); solSave(); return +el.value; }                  // blur
+function solPick(groupId, btn){
+  document.querySelectorAll('#'+groupId+' .day').forEach(b=>b.classList.toggle('sel', b===btn));
+  solEst(); solSave();
+}
+function solToggle(){
+  const s=solState();
+  document.getElementById('sol-body').style.display=s.enabled?'':'none';
+  document.getElementById('sol-pulse-body').classList.toggle('on', s.pulse);
+  solEst(); solSave();
+}
+function solModeChanged(){
+  const applicable = !!SOL_MODE_MAP[selModeDat];
+  document.getElementById('sol-block').style.display = applicable ? '' : 'none';
+  if(!applicable) return;
+  const [m,d]=SOL_MODE_MAP[selModeDat];
+  const req=++solEstReq; solEstMin=0; solEst();
+  fetch('/api/solution_est?zone='+selZoneId+'&mode='+m+'&depth='+d,{cache:'no-store'})
+    .then(r=>r.json()).then(j=>{ if(req===solEstReq){ solEstMin=+j.est_min||0; solEst(); } }).catch(()=>{});
+}
+function solEst(){
+  const s=solState(), l=document.getElementById('sol-est-l'), v=document.getElementById('sol-est-v');
+  if(!solEstMin){ l.textContent='Estimating run length\u2026'; v.textContent='\u2014'; v.classList.add('unset'); return; }
+  let pumpS=Math.max(0, solEstMin*60-10);
+  if(s.pulse) pumpS*=s.on/(s.on+s.off);
+  const m=Math.floor(pumpS/60), r=Math.round(pumpS%60);
+  l.textContent='~'+solEstMin+' min run \u00b7 pump on '+(m?m+' min'+(r?' '+r+' s':''):r+' s');
+  const rate = solRates ? (+solRates[s.bottle-1][{100:0,80:1,60:2}[s.speed]]||0) : 0;
+  if(rate<=0){ v.textContent='calibrate bottle '+s.bottle; v.classList.add('unset'); return; }
+  const ml=pumpS*rate;
+  v.textContent='~'+(ml<50?Math.round(ml):Math.round(ml/5)*5)+' mL'; v.classList.remove('unset');
 }
 async function startWater(){
   const btn=document.getElementById('start-btn');
@@ -445,6 +573,12 @@ async function startWater(){
   if (selModeDat === 'c') {
     const d=parseInt(document.getElementById('chase-dur').value, 10) || 3;
     body += '&duration=' + d;
+  }
+  const sol=solState();
+  if (sol.enabled && SOL_MODE_MAP[selModeDat]) {
+    solSave();
+    body += '&solution_enabled=1&solution_bottle='+sol.bottle+'&solution_speed='+sol.speed+
+            '&solution_pulse='+(sol.pulse?1:0)+'&solution_pulse_on_s='+sol.on+'&solution_pulse_off_s='+sol.off;
   }
   try{
     const r=await fetch('/zone/water',{method:'POST',
@@ -528,6 +662,7 @@ async function reconnectNet(){
 }
 updateWifiButtons();
 
+solLoadRates();
 async function refresh(){
   try{
     const d=await fetch('/api/all').then(r=>r.json());
@@ -555,6 +690,7 @@ async function refresh(){
       document.title=d.device_name;
     }
     renderZones(d.zones);
+    lastSolution = d.solution || null;   // b534
     updateWateringState(d.watering, d.water_mode, d.water_est_min, d.water_zone_id, d.cleanup_pass||0);
   }catch(e){ dot(false); }
 }
@@ -663,8 +799,14 @@ function tickCountdown(){
   const remMin=Math.floor(rem/60000);
   const remSec=Math.floor((rem%60000)/1000);
   const prefix = (lastWaterMode === 50) ? '🐶 Chase · ' : '';
+  // b534: show the dose alongside the countdown once it is armed.
+  const sol = lastSolution && lastSolution.armed
+    ? ' · Bottle ' + lastSolution.bottle + (lastSolution.phase === 'dosing'
+        ? (lastSolution.ml > 0 ? ' ' + Math.round(lastSolution.ml) + ' mL' : ' on')
+        : ' waiting')
+    : '';
   lbl.textContent=rem>0
-    ? prefix + remMin+':'+String(remSec).padStart(2,'0')+' remaining'
+    ? prefix + remMin+':'+String(remSec).padStart(2,'0')+' remaining' + sol
     : 'finishing…';
 }
 

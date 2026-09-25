@@ -49,7 +49,7 @@ Bus: I2C_NUM_0, 400kHz, powered by 3V3Sen rail (GPIO4).
 | GPIO36 | 4 | CH0 | VBattRaw | Battery voltage (÷2 divider) | ~4.1V full charge |
 | GPIO39 | 5 | CH3 | Charge | Solar/charge current (placeholder) | Reads idle baseline — BQ25504 uses internal GPIO38 |
 | GPIO32 | 8 | CH4 | VCur | Valve motor current sense | INA4180A3, 50mΩ, gain 100 |
-| GPIO34 | 6 | CH6 | PCur | Pump current sense (unused) | Pump not populated |
+| GPIO34 | 6 | CH6 | PCur | Pump current sense | Wired on pump-equipped units; 142 mV zero, 0.2 mA/mV (b534) |
 | GPIO35 | 7 | CH7 | NCur | Nozzle motor current sense | INA4180A3, 50mΩ, gain 100 |
 
 Current conversion: I(mA) = V(mV) × 0.2
@@ -120,13 +120,13 @@ Access note: the J2 cable is accessible from the underside of the sprinkler unit
 GND       │  1              38  │ GND
 3V3       │  2              37  │ GPIO23  SCL / Hall wake
 EN        │  3              36  │ GPIO22  vFwd (valve fwd)
-GPIO36 VP │  4              35  │ GPIO21  (unused)
+GPIO36 VP │  4              35  │ GPIO21  pump 2 select (b534)
 GPIO39 VN │  5              34  │ GPIO20  (unused)
-GPIO34    │  6              33  │ GPIO19  (unused)
+GPIO34    │  6              33  │ GPIO19  pump 3 select (b534)
 GPIO35    │  7              32  │ GPIO18  9V_EN
 GPIO32    │  8              31  │ GPIO5   (unused)
 GPIO33    │  9              30  │ GPIO17  SDA
-GPIO25    │ 10              29  │ GPIO16  (unused)
+GPIO25    │ 10              29  │ GPIO16  pump drive, 20 kHz PWM (b534)
 GPIO26    │ 11              28  │ GPIO4   3V3Sen
 GPIO27    │ 12              27  │ GPIO0   (boot)
 GPIO14    │ 13              26  │ GPIO2   (unused)
