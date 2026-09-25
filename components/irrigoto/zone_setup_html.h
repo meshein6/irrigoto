@@ -80,19 +80,6 @@ header{
 .info-btn{background:none;border:1px solid var(--border);color:var(--text-mid);
   width:16px;height:16px;line-height:1;border-radius:50%;font-size:10px;
   cursor:pointer;font-family:inherit;padding:0;margin-left:4px;}
-#ring-order-row{padding:0 14px 10px;}
-#ring-order-row label{font-size:10px;letter-spacing:.12em;text-transform:uppercase;
-  color:var(--text-mid);display:block;margin-bottom:5px;}
-.ro-pick{display:flex;gap:6px;}
-.ro{flex:1;padding:8px 6px;border-radius:6px;border:1px solid var(--border);
-  background:var(--bg3);color:var(--text-mid);font-size:11px;font-weight:600;
-  cursor:pointer;font-family:inherit;}
-.ro.sel{background:var(--green-dim);border-color:var(--green);color:var(--green);}
-.ring-help{display:none;font-size:11px;color:var(--text-mid);line-height:1.5;
-  margin-top:6px;padding:8px 10px;background:var(--bg3);border:1px solid var(--border);
-  border-radius:6px;}
-.ring-help.show{display:block;}
-.ring-help b{color:var(--text);}
 #name-row{
   flex-shrink:0;display:flex;align-items:center;gap:10px;
   padding:6px 16px 4px;border-top:1px solid var(--border);
@@ -310,6 +297,7 @@ header{
   <div id="path-ctl">
     <button class="vbtn" id="btn-path-mode" onclick="cyclePathMode()" title="Which mode's path to draw">Smooth</button>
     <button class="vbtn" id="btn-path-pass" onclick="cyclePathPass()" title="Which pass">Pass 1</button>
+    <button class="vbtn" onclick="openPathPreview()" title="Bigger view">&#9974;</button>
     <input type="range" id="zs-scrub" min="0" max="1000" step="1" value="0"
            oninput="zsScrub(+this.value/1000)" aria-label="Position along the path">
     <span id="zs-at">start</span>
@@ -368,30 +356,6 @@ header{
   <input id="zone-name" type="text" maxlength="31" placeholder="Zone name" autocomplete="off" autocorrect="off" spellcheck="false">
 </div>
 
-<!-- b535: per-zone ring order, saved with the zone -->
-<div id="ring-order-row">
-  <label>Ring order
-    <button class="info-btn" onclick="toggleRingHelp()" aria-expanded="false"
-            aria-controls="ring-help" aria-label="What ring order does">i</button>
-  </label>
-  <div class="ro-pick">
-    <button class="ro sel" data-ro="0" onclick="selRingOrder(this)">Auto</button>
-    <button class="ro" data-ro="1" onclick="selRingOrder(this)">One ring at a time</button>
-    <button class="ro" data-ro="2" onclick="selRingOrder(this)">Section by section</button>
-  </div>
-  <div class="ring-help" id="ring-help">
-    <b>Auto</b> lets each mode use its own order. Smooth jumps between rings by
-    how much water each still needs, timed to a well pump's cycle.<br>
-    <b>One ring at a time</b> waters outer to inner in order for every mode, which
-    is steadier to watch and more predictable. On a well or pressure tank you give
-    up Smooth's pump-peak timing; on mains it costs nothing.<br>
-    <b>Section by section</b> finishes one side of the zone from the outside in
-    before crossing to the next, instead of crossing back and forth on every ring.
-    Use this if the sprinkler jumps around a lot. Serpentine only for now; other
-    modes treat it as One ring at a time.
-  </div>
-</div>
-
 <div id="footer">
   <button id="btn-cancel" onclick="doAct('cancel')">Cancel</button>
   <button id="btn-save" id="btn-save" onclick="doAct('save')" disabled>Save Zone</button>
@@ -441,26 +405,9 @@ const TRAIL_MAX = 120;
 let waterTrail = [];
 let lastWaterBearing = null;
 let showPath = false;
-let ringOrder = 0;   // b535: 0 auto, 1 sequential -- saved with the zone
-let ringOrderEdited = false;   // b536: user touched it; poll must not clobber
 let pathMode = '7';  // b535: which mode the Path view draws (web digit)
 let pathPass = 0;    // b535: which pass (serpentine/gentle alternate by pass)
 let pathT = 0;       // b535: scrub position, 0..1 along the path
-function selRingOrder(btn){
-  ringOrder = +btn.dataset.ro;
-  ringOrderEdited = true;   // b536: stop the poll from reverting it
-  paintRingOrder();
-}
-function paintRingOrder(){
-  document.querySelectorAll('.ro').forEach(b => b.classList.toggle('sel', +b.dataset.ro === ringOrder));
-}
-function toggleRingHelp(){
-  const h = document.getElementById('ring-help');
-  const on = !h.classList.contains('show');
-  h.classList.toggle('show', on);
-  const b = document.querySelector('#ring-order-row .info-btn');
-  if (b) b.setAttribute('aria-expanded', on ? 'true' : 'false');
-}
 let heatPasses = 0;
 let lastRun = null;
 let waterCSVRows = null;
@@ -502,7 +449,7 @@ function togglePath(){
 }
 // b535: which mode's path to draw, and which pass.
 function cyclePathMode(){
-  const order = ['1','5','7','8'];
+  const order = ['1','5','7','8','9'];
   pathMode = order[(order.indexOf(pathMode) + 1) % order.length];
   document.getElementById('btn-path-mode').textContent =
     (IrrigotoPath.MODES[pathMode] || {label:'Path'}).label;
@@ -514,6 +461,19 @@ function cyclePathPass(){
   draw();
 }
 function zsScrub(t){ pathT = t; draw(); }
+// b536: the shared overlay, UNLOCKED here -- Zone Setup is where you compare
+// a zone across modes, so the mode chips stay live.
+function openPathPreview(){
+  if (typeof IrrigotoPath === 'undefined' || ST.points.length < 2) return;
+  IrrigotoPath.openPreview({
+    points: ST.points,
+    act_max_throw: ST.act_max_throw, act_min_throw: ST.act_min_throw,
+    mode: pathMode, lockMode: false,
+    title: document.getElementById('zone-name').value || 'Zone',
+  });
+}
+// b536: Sections joins the mode cycle.
+
 
 function toggleHeatmap(){
   heatPasses = (heatPasses + 1) % 3;
@@ -846,7 +806,6 @@ function drawPath(W, H, cx, cy, maxR) {
     mode: pathMode, pass: pathPass,
     act_max_throw: ST.act_max_throw || 10058,
     act_min_throw: ST.act_min_throw || 0,
-    sequential: ringOrder >= 1,
   });
   const o = {cx: cx, cy: cy, maxR: maxR, scale_mm: _edScale()};
   IrrigotoPath.draw(ctx, geom, o);
@@ -1024,13 +983,6 @@ function applyState(s){
     lastWaterBearing = null;
   }
   if (s.act_max_throw !== undefined) s.act_max_throw = s.act_max_throw;
-  // b536: only adopt the device's value while the user hasn't touched the
-  // picker. Without this the ~1 s poll reset the selection on every cycle,
-  // so the buttons appeared to "snap back" the instant they were clicked.
-  if (s.ring_order !== undefined && !ringOrderEdited) {
-    ringOrder = (+s.ring_order === 1) ? 1 : 0;
-    paintRingOrder();
-  }
   if (s.act_min_throw !== undefined) s.act_min_throw = s.act_min_throw;
   ST=s;
   // Populate name field on first load (don't overwrite while user is typing)
@@ -1072,7 +1024,6 @@ async function doAct(cmd){
     if(cmd==='save'){
       const name=document.getElementById('zone-name').value.trim()||'Zone';
       url+='&name='+encodeURIComponent(name);
-      url+='&ring_order='+ringOrder;   // b535
     }
     const r=await fetch(url,{method:'POST'});
     if(!r.ok) throw new Error(r.status);
@@ -1080,7 +1031,6 @@ async function doAct(cmd){
     setConn(true);
     if(cmd==='save'){
       toast('Zone saved ✓');
-      ringOrderEdited = false;   // b536: device is authoritative again
       // Zone geometry changed -- clear cached heatmap data so stale coverage
       // is not shown.  Files were deleted server-side; clear JS state too.
       lastRun=null; waterCSVRows=null; draw();

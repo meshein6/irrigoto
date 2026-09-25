@@ -209,16 +209,6 @@ section{margin-bottom:18px;}
 .path-note{flex:1;min-width:0;font-size:11px;color:var(--text-mid);line-height:1.5;}
 .path-note b{display:block;color:var(--text);font-size:12px;margin-bottom:2px;}
 .path-note .pick{margin-top:6px;padding:5px 10px;font-size:11px;display:inline-block;width:auto;}
-#path-full{display:none;position:fixed;inset:0;background:rgba(0,0,0,.88);z-index:200;
-  align-items:center;justify-content:center;flex-direction:column;gap:12px;}
-#path-full.open{display:flex;}
-#path-full canvas{max-width:92vw;max-height:70vh;border-radius:50%;}
-#path-full .pf-bar{display:flex;gap:8px;align-items:center;color:var(--text-mid);font-size:12px;}
-#path-full .pick{width:auto;padding:7px 12px;}
-.pf-scrub{display:flex;gap:10px;align-items:center;width:min(92vw,620px);}
-.pf-scrub input[type=range]{flex:1;}
-#pf-at{font-family:'Courier New',monospace;font-size:11px;color:var(--text-mid);
-  min-width:96px;text-align:right;}
 .modal-actions .btn{flex:1;justify-content:center;}
 #modal-status{font-size:12px;color:var(--text-mid);text-align:center;
   margin-top:10px;min-height:18px;}
@@ -413,6 +403,7 @@ section{margin-bottom:18px;}
       <button class="pick" data-mode="5" onclick="selMode(this)">Gentle</button>
       <button class="pick" data-mode="7" onclick="selMode(this)">Smooth</button>
       <button class="pick" data-mode="8" onclick="selMode(this)">Serpentine</button>
+      <button class="pick" data-mode="9" onclick="selMode(this)">Sections</button>
       <button class="pick" data-mode="c" onclick="selMode(this)">&#128054; Chase</button>
       <button class="pick" data-mode="d" onclick="selMode(this)">Demo</button>
     </div>
@@ -737,6 +728,7 @@ const MODE_HELP = {
   '5': '<b>Gentle.</b> Low pressure over many light passes. Safe for seed and bare soil.',
   '7': '<b>Smooth.</b> Continuous sweep, then re-waters only the rings that are still short, timed to the pump cycle. Good default.',
   '8': '<b>Serpentine.</b> One continuous back-and-forth glide that never stops. Smoothest, with no start-of-row bursts, but less precise at edges and near the sprinkler.',
+  '9': '<b>Sections.</b> Serpentine motion, but it finishes one side of the zone from the outside in before crossing to the next, instead of crossing back and forth on every ring. Far less jumping about.',
   'c': '<b>Chase.</b> Play mode for dogs, 1-10 min. Not tracked as watering.',
   'd': '<b>Demo.</b> Max-speed sweep. Not tracked as watering.',
 };
@@ -792,7 +784,7 @@ function restoreModePrefs(){
 const SOL_KEY='irrigoto_solution';
 // b535: with Mode and Depth picked separately, this maps the web mode digit
 // to the schedule mode number the estimator wants; depth comes from selDepth.
-const SOL_MODE_MAP={'1':0,'5':1,'7':2,'8':3};
+const SOL_MODE_MAP={'1':0,'5':1,'7':2,'8':3,'9':4};
 let solRates=null, solEstMin=0, solEstReq=0, solEnabled=false;
 function solLoadRates(){
   fetch('/api/solution_cal',{cache:'no-store'}).then(r=>r.json()).then(d=>{
@@ -968,16 +960,16 @@ const PATH_DESC = {
   gentle:     'Outer ring inward, one direction per pass, flipping each pass. Many light passes.',
   smooth:     'Drawn outer to inner, but the real order is chosen during the run from how much each ring still needs.',
   serpentine: 'Out and back without stopping: direction flips every ring, and passes alternate inward and outward.',
+  sections:   'Serpentine motion, but one side of the zone is finished from the outside in before crossing to the next. Far less jumping about.',
   chase:      'No watering path -- the nozzle chases within the zone.',
   demo:       'Max-speed sweep, not tracked as watering.'
 };
-let pathZone = null, pfPassIdx = 0, pfT = 0, pfTimer = null;
+let pathZone = null;
 let _zoneCache = {};
 function zonePathOpts(pass){
   return { mode: selModeDat, pass: pass|0,
            act_max_throw: (pathZone && pathZone.act_max_throw) || 10058,
-           act_min_throw: (pathZone && pathZone.act_min_throw) || 0,
-           sequential: !!(pathZone && +pathZone.ring_order === 1) };
+           act_min_throw: (pathZone && pathZone.act_min_throw) || 0 };
 }
 function renderPathThumb(){
   const row = document.getElementById('path-row');
@@ -993,48 +985,17 @@ function renderPathThumb(){
     + (g && g.rings.length ? ' \u00b7 ' + g.rings.length + ' rings' : '');
   document.getElementById('path-desc').textContent = PATH_DESC[g ? g.modeKey : 'pulse'] || '';
 }
+// b536: the same overlay Zone Setup uses, with the mode LOCKED to the one
+// picked for this run -- the preview must not be able to disagree with it.
 function openPathFull(){
-  if (!pathZone || !pathZone.points || pathZone.points.length < 2) return;
-  pfPassIdx = 0; pfT = 0;
-  const sl = document.getElementById('pf-scrub'); if (sl) sl.value = 0;
-  document.getElementById('path-full').classList.add('open');
-  renderPathFull();
+  if (!pathZone || typeof IrrigotoPath === 'undefined') return;
+  IrrigotoPath.openPreview({
+    points: pathZone.points,
+    act_max_throw: pathZone.act_max_throw, act_min_throw: pathZone.act_min_throw,
+    mode: selModeDat, lockMode: true,
+    title: pathZone.name || 'Zone',
+  });
 }
-function closePathFull(){
-  if (pfTimer) { clearInterval(pfTimer); pfTimer = null; }
-  const b = document.getElementById('pf-play'); if (b) b.innerHTML = '&#9654;';
-  document.getElementById('path-full').classList.remove('open');
-}
-function pfPass(d){ pfPassIdx = Math.max(0, Math.min(9, pfPassIdx + d)); renderPathFull(); }
-function pfScrub(t){ pfT = t; renderPathFull(); }
-function pfPlay(){
-  const btn = document.getElementById('pf-play');
-  if (pfTimer) { clearInterval(pfTimer); pfTimer = null; btn.innerHTML = '&#9654;'; return; }
-  btn.innerHTML = '&#9632;';
-  pfTimer = setInterval(() => {          // ~8 s per pass, slow enough to follow
-    pfT += 1 / 240;
-    if (pfT >= 1) { pfT = 1; clearInterval(pfTimer); pfTimer = null; btn.innerHTML = '&#9654;'; }
-    const sl = document.getElementById('pf-scrub');
-    if (sl) sl.value = Math.round(pfT * 1000);
-    renderPathFull();
-  }, 33);
-}
-function renderPathFull(){
-  const cv = document.getElementById('path-full-cv');
-  if (!cv || typeof IrrigotoPath === 'undefined' || !pathZone) return;
-  const o = zonePathOpts(pfPassIdx); o.scrub = pfT;
-  const at = IrrigotoPath.thumb(cv, pathZone.points, o);
-  document.getElementById('pf-title').textContent =
-    (IrrigotoPath.MODES[selModeDat] || {label:''}).label + ' \u00b7 pass ' + (pfPassIdx + 1);
-  const lbl = document.getElementById('pf-at');
-  if (lbl) {
-    if (at && at.r_mm !== undefined)
-      lbl.textContent = at.dry ? 'moving \u00b7 dry'
-        : 'ring ' + (at.ring + 1) + ' \u00b7 ' + (at.r_mm / 304.8).toFixed(1) + "'";
-    else lbl.textContent = pfT <= 0 ? 'start' : '';
-  }
-}
-document.addEventListener('keydown', e => { if (e.key === 'Escape') closePathFull(); });
 
 async function toggleDetailLog(){
   try{
@@ -1420,22 +1381,6 @@ async function refreshSchedule(){
 }
 refreshSchedule(); setInterval(refreshSchedule, 30000);
 </script>
-<div id="path-full" onclick="if(event.target===this)closePathFull()">
-  <div class="pf-bar">
-    <button class="pick" onclick="pfPass(-1)">&#8249;</button>
-    <span id="pf-title">Pass 1</span>
-    <button class="pick" onclick="pfPass(1)">&#8250;</button>
-    <button class="pick" onclick="closePathFull()">&#10005;</button>
-  </div>
-  <canvas id="path-full-cv" width="620" height="620"></canvas>
-  <div class="pf-scrub">
-    <button class="pick" id="pf-play" onclick="pfPlay()" aria-label="Play or pause">&#9654;</button>
-    <input type="range" id="pf-scrub" min="0" max="1000" step="1" value="0"
-           oninput="pfScrub(+this.value/1000)" aria-label="Position along the path">
-    <span id="pf-at">start</span>
-  </div>
-</div>
-
 </body>
 </html>
 )LANDHTML"

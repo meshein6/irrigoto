@@ -239,7 +239,7 @@ body:not(.bottles) .sol{display:none;}
 
 <script>
 const DAY_LABELS = ['Sun','Mon','Tue','Wed','Thu','Fri','Sat'];
-const MODE_LABELS = ['Pulse','Gentle','Smooth','Serpentine'];
+const MODE_LABELS = ['Pulse','Gentle','Smooth','Serpentine','Sections'];
 // Depth is eighths of an inch, indexed by the stored value (1..8); index 0 is
 // an unused placeholder. Deeper targets are achieved as multiple 1/8" passes
 // (same as the other modes), so Smooth is no longer 1/8"-only.
@@ -460,10 +460,23 @@ function entryPathOpts(e){
   return { mode: String(SCHED_MODE_DIGIT[e.mode] || '1'), pass: 0,
            act_max_throw: z.act_max_throw || 10058,
            act_min_throw: z.act_min_throw || 0,
-           sequential: +z.ring_order === 1, thumb: true };
+           thumb: true };
 }
 // Schedule numbering (0 Pulse, 1 Gentle, 2 Smooth, 3 Serpentine) -> web digit.
-const SCHED_MODE_DIGIT = {0:'1', 1:'5', 2:'7', 3:'8'};
+const SCHED_MODE_DIGIT = {0:'1', 1:'5', 2:'7', 3:'8', 4:'9'};
+
+// b536: same overlay as Zone Setup and the Water modal, with the mode LOCKED
+// to this entry's -- the preview must match the run the entry will do.
+function openEntryPreview(idx){
+  const e = state.entries[idx];
+  const z = e && zoneGeom[e.zone - 1];
+  if (!e || !z || !z.points || z.points.length < 2 || typeof IrrigotoPath === 'undefined') return;
+  IrrigotoPath.openPreview({
+    points: z.points, act_max_throw: z.act_max_throw, act_min_throw: z.act_min_throw,
+    mode: String(SCHED_MODE_DIGIT[e.mode] || '1'), lockMode: true,
+    title: z.name || ('Zone ' + e.zone),
+  });
+}
 
 function drawEntryPath(cv){
   if (typeof IrrigotoPath === 'undefined' || !cv || cv.dataset.drawn) return;
@@ -682,6 +695,7 @@ function renderEntry(e, idx) {
           '<option value="1"' + (e.mode===1?' selected':'') + '>Gentle</option>' +
           '<option value="2"' + (e.mode===2?' selected':'') + '>Smooth</option>' +
           '<option value="3"' + (e.mode===3?' selected':'') + '>Serpentine</option>' +
+          '<option value="4"' + (e.mode===4?' selected':'') + '>Sections</option>' +
         '</select></div>' +
       '<div class="col"><label>Depth</label>' +
         '<select data-k="depth">' +
@@ -709,9 +723,10 @@ function renderEntry(e, idx) {
     '</div>' +
     solutionBlockHtml(e) +
     '<div class="ent-path">' +
-      '<canvas class="ent-thumb" width="96" height="96" data-idx="' + idx + '"></canvas>' +
+      '<canvas class="ent-thumb" width="96" height="96" data-idx="' + idx + '" ' +
+        'onclick="openEntryPreview(' + idx + ')" title="Tap for a bigger view"></canvas>' +
       '<div class="ep-note"><b>Path</b>Rings this mode will sweep, in order. ' +
-      'Blue and orange show the sweep direction.</div>' +
+      'Blue and orange show the sweep direction. Tap for a bigger view.</div>' +
     '</div>' +
     '<div class="toggle-row enabled-row">' +
       '<span class="toggle-lbl">Enabled</span>' +

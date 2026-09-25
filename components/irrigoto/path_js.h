@@ -31,6 +31,7 @@ R"PATHJS(
     '5': { key: 'gentle',     label: 'Gentle' },
     '7': { key: 'smooth',     label: 'Smooth' },
     '8': { key: 'serpentine', label: 'Serpentine' },
+    '9': { key: 'sections',   label: 'Sections' },
     'c': { key: 'chase',      label: 'Chase' },
     'd': { key: 'demo',       label: 'Demo' }
   };
@@ -148,14 +149,15 @@ R"PATHJS(
    */
   function planOrder(modeKey, nRings, pass, sequential) {
     var idx = [], i;
-    var inward = !(modeKey === 'serpentine' && (pass % 2) === 1);
+    var serpish = (modeKey === 'serpentine' || modeKey === 'sections');
+    var inward = !(serpish && (pass % 2) === 1);
     for (i = 0; i < nRings; i++) idx.push(inward ? i : nRings - 1 - i);
 
     var cw = [], dryReturn = [];
     for (i = 0; i < nRings; i++) {
       var d;
       if (sequential)                    d = (i % 2) === 0;
-      else if (modeKey === 'serpentine') d = (i % 2) === 0;
+      else if (serpish)                  d = (i % 2) === 0;
       else if (modeKey === 'pulse')      d = true;
       else                               d = (pass % 2) === 0;  /* gentle, smooth */
       cw.push(d);
@@ -404,7 +406,144 @@ R"PATHJS(
     return at || true;
   }
 
+  /* ── Shared full-screen preview ────────────────────────────────────────
+   * One overlay, used by Zone Setup, the Water modal and each schedule entry,
+   * so the picture is identical wherever it is opened. `lockMode` fixes the
+   * mode to what the caller already chose (manual run / schedule entry) and
+   * hides the mode chips; Zone Setup leaves it unlocked so a zone can be
+   * compared across modes.
+   *
+   * open({points, act_max_throw, act_min_throw, mode, lockMode, title}) */
+  var OV_MODES = ['1', '5', '7', '8', '9'];
+  var ov = null;
+
+  function ovBuild() {
+    if (ov) return ov;
+    var el = document.createElement('div');
+    el.id = 'irr-path-ov';
+    el.innerHTML =
+      '<div class="ipo-bar">' +
+        '<span class="ipo-title"></span>' +
+        '<span class="ipo-modes"></span>' +
+        '<button class="ipo-btn ipo-pass">Pass 1</button>' +
+        '<button class="ipo-btn ipo-x" aria-label="Close">&#10005;</button>' +
+      '</div>' +
+      '<canvas class="ipo-cv" width="620" height="620"></canvas>' +
+      '<div class="ipo-scrub">' +
+        '<button class="ipo-btn ipo-play" aria-label="Play">&#9654;</button>' +
+        '<input type="range" min="0" max="1000" step="1" value="0" aria-label="Position along the path">' +
+        '<span class="ipo-at">start</span>' +
+      '</div>';
+    var css = document.createElement('style');
+    css.textContent =
+      '#irr-path-ov{display:none;position:fixed;inset:0;background:rgba(0,0,0,.88);' +
+        'z-index:300;align-items:center;justify-content:center;flex-direction:column;gap:12px;}' +
+      '#irr-path-ov.open{display:flex;}' +
+      '#irr-path-ov .ipo-cv{max-width:92vw;max-height:66vh;border-radius:50%;}' +
+      '#irr-path-ov .ipo-bar,#irr-path-ov .ipo-scrub{display:flex;gap:8px;align-items:center;' +
+        'width:min(92vw,620px);color:var(--text-mid);font-size:12px;}' +
+      '#irr-path-ov .ipo-title{flex:1;color:var(--text);}' +
+      '#irr-path-ov .ipo-modes{display:flex;gap:4px;}' +
+      '#irr-path-ov .ipo-btn{background:var(--btn);border:1px solid var(--border);' +
+        'color:var(--text);font-size:11px;padding:6px 10px;border-radius:6px;' +
+        'cursor:pointer;font-family:inherit;}' +
+      '#irr-path-ov .ipo-btn.sel{border-color:var(--green);background:var(--green-dim);color:var(--green);}' +
+      '#irr-path-ov .ipo-scrub input{flex:1;min-width:0;}' +
+      '#irr-path-ov .ipo-at{font-family:"Courier New",monospace;font-size:11px;' +
+        'min-width:96px;text-align:right;}';
+    document.head.appendChild(css);
+    document.body.appendChild(el);
+    ov = {
+      el: el,
+      cv: el.querySelector('.ipo-cv'),
+      title: el.querySelector('.ipo-title'),
+      modes: el.querySelector('.ipo-modes'),
+      pass: el.querySelector('.ipo-pass'),
+      play: el.querySelector('.ipo-play'),
+      range: el.querySelector('input'),
+      at: el.querySelector('.ipo-at'),
+      opts: null, mode: '7', passIdx: 0, t: 0, timer: null
+    };
+    el.addEventListener('click', function (e) { if (e.target === el) ovClose(); });
+    ov.el.querySelector('.ipo-x').addEventListener('click', ovClose);
+    ov.pass.addEventListener('click', function () {
+      ov.passIdx = (ov.passIdx + 1) % 4;
+      ov.pass.textContent = 'Pass ' + (ov.passIdx + 1);
+      ovDraw();
+    });
+    ov.range.addEventListener('input', function () { ov.t = +ov.range.value / 1000; ovDraw(); });
+    ov.play.addEventListener('click', ovPlay);
+    document.addEventListener('keydown', function (e) { if (e.key === 'Escape') ovClose(); });
+    return ov;
+  }
+
+  function ovPlay() {
+    if (ov.timer) { clearInterval(ov.timer); ov.timer = null; ov.play.innerHTML = '&#9654;'; return; }
+    ov.play.innerHTML = '&#9632;';
+    ov.timer = setInterval(function () {      /* ~8 s a pass, slow enough to follow */
+      ov.t += 1 / 240;
+      if (ov.t >= 1) { ov.t = 1; clearInterval(ov.timer); ov.timer = null; ov.play.innerHTML = '&#9654;'; }
+      ov.range.value = Math.round(ov.t * 1000);
+      ovDraw();
+    }, 33);
+  }
+
+  function ovClose() {
+    if (!ov) return;
+    if (ov.timer) { clearInterval(ov.timer); ov.timer = null; ov.play.innerHTML = '&#9654;'; }
+    ov.el.classList.remove('open');
+  }
+
+  function ovDraw() {
+    var o = {
+      mode: ov.mode, pass: ov.passIdx, scrub: ov.t,
+      act_max_throw: ov.opts.act_max_throw, act_min_throw: ov.opts.act_min_throw
+    };
+    var at = thumb(ov.cv, ov.opts.points, o);
+    var label = (MODES[ov.mode] || {}).label || '';
+    ov.title.textContent = (ov.opts.title ? ov.opts.title + ' \u00b7 ' : '') + label;
+    ov.at.textContent = (at && at.r_mm !== undefined)
+      ? (at.dry ? 'moving \u00b7 dry'
+                : 'ring ' + (at.ring + 1) + ' \u00b7 ' + (at.r_mm / 304.8).toFixed(1) + "'")
+      : (ov.t <= 0 ? 'start' : '');
+  }
+
+  function openPreview(opts) {
+    if (!opts || !opts.points || opts.points.length < 2) return false;
+    ovBuild();
+    ov.opts = opts;
+    ov.mode = MODES[opts.mode] ? opts.mode : '7';
+    ov.passIdx = 0; ov.t = 0; ov.range.value = 0;
+    ov.pass.textContent = 'Pass 1';
+    /* Locked: the caller already chose the mode, so show it as a static chip
+     * rather than letting the preview disagree with the run that will happen. */
+    ov.modes.innerHTML = '';
+    if (opts.lockMode) {
+      var tag = document.createElement('span');
+      tag.className = 'ipo-btn sel';
+      tag.style.cursor = 'default';
+      tag.textContent = (MODES[ov.mode] || {}).label || '';
+      ov.modes.appendChild(tag);
+    } else {
+      OV_MODES.forEach(function (m) {
+        var b = document.createElement('button');
+        b.className = 'ipo-btn' + (m === ov.mode ? ' sel' : '');
+        b.textContent = (MODES[m] || {}).label || m;
+        b.addEventListener('click', function () {
+          ov.mode = m;
+          ov.modes.querySelectorAll('.ipo-btn').forEach(function (x) { x.classList.toggle('sel', x === b); });
+          ovDraw();
+        });
+        ov.modes.appendChild(b);
+      });
+    }
+    ov.el.classList.add('open');
+    ovDraw();
+    return true;
+  }
+
   root.IrrigotoPath = {
+    openPreview: openPreview, closePreview: ovClose,
     MODES: MODES, build: build, draw: draw, thumb: thumb,
     flatten: flatten, pointAt: pointAt, marker: marker,
     zoneArc: zoneArc, ringThrows: ringThrows, ringSpans: ringSpans,

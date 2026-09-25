@@ -422,10 +422,9 @@ static bool          s_water_detail_log = false; // when true: write per-pass ro
 // calibration. Persisted in NVS as "supply_reg". Default off -- well pump and
 // pressure-tank supplies cycle, so a fresh reading matters there.
 static bool          s_supply_regulated = false;
-// b535/b536: the running zone's ring-order setting. Held at run scope because
-// the serpentine pass runner is a separate function from phase_water_zone,
-// where the zone is loaded.
-static uint8_t       s_ring_order = ZONE_RING_ORDER_AUTO;
+// b536: set by the Sections mode (web digit 9) -- serpentine, but the plan is
+// lobe-major: finish one side of the zone outer -> inner before crossing.
+static bool          s_sections_mode = false;
 // b288: in smooth-aggregate mode the wbin file is created at run-END, not at start,
 // so the file is never held open during the loop (avoids LittleFS metadata-relocation
 // races against WiFi PHY work that caused the b285-b287 mid-run crashes).
@@ -10282,7 +10281,7 @@ static void water_serpentine_passes(
                                       act_max_throw, have_throw_cal,
                                       pressure_scale, psi_min, psi_max,
                                       spd, have_spd, serpentine_dps, depth_mm, corr,
-                                      /*sections=*/(s_ring_order == ZONE_RING_ORDER_SECTIONS));  // b536
+                                      /*sections=*/s_sections_mode);   // b536
         if (n == 0) {
             // b434: the only rings left are polygon-clipped to zero width
             // (e.g. the outermost ring on a spike-shaped zone) -- they can
@@ -11471,16 +11470,10 @@ static void phase_water_zone(void)
     // b535: per-zone ring order. Sequential walks the rings outer -> inner in
     // order for every mode, which for Smooth means bypassing its deficit/pump
     // scheduler. 0 / missing = auto, i.e. each mode's existing order.
-    const bool seq_ring_order = (zone.ring_order == ZONE_RING_ORDER_SEQUENTIAL);
     // b536: section-by-section -- finish one lobe outer->inner before crossing
     // to the next, instead of crossing the zone on every ring. Implemented for
     // serpentine (its planner emits an ordered leg list, so the order can be
     // changed without touching the shared ring loop's depth accounting).
-    s_ring_order = zone.ring_order;
-    const bool sec_ring_order = (zone.ring_order == ZONE_RING_ORDER_SECTIONS);
-    (void)sec_ring_order;
-    if (seq_ring_order) INFO("Ring order: sequential (per-zone setting)");
-    if (sec_ring_order) INFO("Ring order: section by section (per-zone setting)");
     if (have_zone) zone_sort_walk_order(&zone);
     INFO("Firmware build: %d", FW_BUILD);
     if (have_zone) INFO("Zone perimeter: %d points.", zone.num_points);
@@ -11713,8 +11706,10 @@ static void phase_water_zone(void)
     // Web-triggered: s_web_water_mode already set, skip interactive prompt
     int sel;
     if (s_web_water_mode > 0) {
-        // 0=idle, 1-4=metered, 5-6=gentle, 7=smooth, 8=serpentine (b423), 99=demo
+        // 0=idle, 1-4=metered, 5-6=gentle, 7=smooth, 8=serpentine (b423),
+        // 9=sections (b536, serpentine with a lobe-major plan), 99=demo
         sel = (s_web_water_mode == 99) ? 'd' :
+              (s_web_water_mode == 9)  ? 'e' :
               (s_web_water_mode == 8)  ? 'n' :
               (s_web_water_mode == 7)  ? 's' : ('0' + s_web_water_mode);
         INFO("Web mode: %c", sel);
@@ -11730,7 +11725,13 @@ static void phase_water_zone(void)
     bool  demo_mode   = (sel == 'd' || sel == 'D');
     bool  gentle_mode = (sel == '5' || sel == '6');
     bool  smooth_mode = (sel == 's' || sel == 'S');
-    bool  serpentine_mode  = (sel == 'n' || sel == 'N');   // b423: web-only mode 8
+    // b536: Sections is serpentine motion with a lobe-major plan -- finish one
+    // side of the zone outer -> inner, then ONE dry hop to the next, instead of
+    // crossing the zone on every ring. It shares every serpentine code path;
+    // only serpentine_build_pass_plan's emission order differs.
+    bool  sections_mode    = (sel == 'e' || sel == 'E');   // b536: web mode 9
+    bool  serpentine_mode  = (sel == 'n' || sel == 'N') || sections_mode;   // b423: mode 8
+    s_sections_mode = sections_mode;
     // b423: serpentine params, consumed once like depth_eighths below.
     float serpentine_dps = s_web_serpentine_dps; s_web_serpentine_dps = 0.0f;
     bool  serpentine_dry = s_web_serpentine_dry; s_web_serpentine_dry = false;
@@ -12399,12 +12400,7 @@ static void phase_water_zone(void)
         // no benefit, and pulse uses a completely different loop above.
         int ring;
         bool was_trigger_fire = false;   // b502: for post-fire futility check
-        // b535: a zone set to "One ring at a time" bypasses smooth's
-        // deficit/pump scheduler and walks the rings in order, like gentle
-        // and pulse. Satisfied rings are still skipped by the adaptive checks
-        // below; what is given up is pump-peak timing, which only matters on
-        // a well/tank supply.
-        if (smooth_mode && !seq_ring_order) {
+        if (smooth_mode) {
             // b499: throw-recovery endgame -- trigger-aware peak hunting.
             // When every remaining eligible ring is throw-driven (depth met,
             // throw short), firing order should follow the pump, not the
@@ -14795,14 +14791,13 @@ static int zone_build_json(char *buf, int maxlen)
         "\"at_min\":%s,\"at_max\":%s,\"points\":%s,"
         "\"act_max_throw\":%.0f,\"fw_build\":%d,"
         "\"actual_throw_mm\":%.0f,\"act_min_throw\":%.0f,"
-        "\"ring_order\":%u,\"name\":\"%s\"}",
+        "\"name\":\"%s\"}",
         nozzle_deg, throw_mm, throw_ft, s_web_pres_pct,
         s_web_water ? "true" : "false",
         at_min ? "true" : "false",
         at_max ? "true" : "false",
         pts, act_max_throw_mm, FW_BUILD,
         actual_throw_mm, act_min_throw_mm,
-        (unsigned)s_web_zone.ring_order,   // b535
         s_web_zone_name);
 }
 
@@ -15085,12 +15080,6 @@ static esp_err_t zone_act_handler(httpd_req_t *req)
         httpd_query_key_value(query, "name", name_param, sizeof(name_param));
         url_decode(name_param, sizeof(name_param));
         if (name_param[0]) strncpy(s_web_zone_name, name_param, sizeof(s_web_zone_name)-1);
-        // b535: per-zone ring order rides along on the save.
-        char ro_param[8] = {0};
-        if (httpd_query_key_value(query, "ring_order", ro_param, sizeof(ro_param)) == ESP_OK)
-            { int _ro = atoi(ro_param);
-              s_web_zone.ring_order = (_ro >= 1 && _ro <= ZONE_RING_ORDER_SECTIONS)
-                                      ? (uint8_t)_ro : ZONE_RING_ORDER_AUTO; }
         esp_err_t _save_err = zone_save_primary(s_web_zone_id, s_web_zone_name, &s_web_zone);
         if (_save_err != ESP_OK) {
             ESP_LOGE(TAG, "Zone %u save FAILED: %s", s_web_zone_id, esp_err_to_name(_save_err));
@@ -15292,6 +15281,7 @@ static esp_err_t zone_water_handler(httpd_req_t *req)
     int mode = mode_s[0]>'0'&&mode_s[0]<='6' ? mode_s[0]-'0' :
                mode_s[0]=='7'                 ? 7  :
                mode_s[0]=='8'                 ? 8  :
+               mode_s[0]=='9'                 ? 9  :   // b536: Sections
                mode_s[0]=='c'||mode_s[0]=='C' ? WATER_MODE_CHASE :
                mode_s[0]=='d'||mode_s[0]=='D' ? 99 : 0;
     uint16_t zone_id = (uint16_t)atoi(id_s);
@@ -19551,8 +19541,10 @@ int irrigoto_get_zone(void)
 
 int irrigoto_get_mode(void)
 {
-    // s_web_water_mode: 0=idle, 1-4=metered/pulse, 5-6=gentle, 7=smooth, 8=serpentine
-    // Map to HA options: 0=Pulse, 1=Gentle, 2=Smooth, 3=Serpentine (b431)
+    // s_web_water_mode: 0=idle, 1-4=metered/pulse, 5-6=gentle, 7=smooth,
+    // 8=serpentine, 9=sections (b536)
+    // Map to HA options: 0=Pulse, 1=Gentle, 2=Smooth, 3=Serpentine, 4=Sections
+    if (s_web_water_mode == 9)                     return 4;  // sections (b536)
     if (s_web_water_mode == 8)                     return 3;  // serpentine
     if (s_web_water_mode == 7)                     return 2;  // smooth
     if (s_web_water_mode == 5 || s_web_water_mode == 6) return 1; // gentle
@@ -19563,6 +19555,7 @@ void irrigoto_get_status(char *buf, size_t len)
 {
     if (s_web_water_mode != 0) {
         const char *mname =
+            (s_web_water_mode == 9)                    ? "sections"    :   // b536
             (s_web_water_mode == 8)                    ? "serpentine"  :   // b423
             (s_web_water_mode == 7)                    ? "smooth" :
             (s_web_water_mode >= 5)                    ? "gentle" : "pulse";
@@ -19688,6 +19681,7 @@ void irrigoto_last_water_mode_label(char *buf, size_t len)
         case 6:  l = "Gentle 1/4 in";     break;
         case 7:  l = "Smooth 1/8 in";     break;
         case 8:  l = "Serpentine";             break;   // b431: depth via depth= param
+        case 9:  l = "Sections";               break;   // b536
         default: l = "unknown";           break;
     }
     snprintf(buf, len, "%s", l);
@@ -20141,6 +20135,7 @@ static int schedule_web_mode(uint8_t mode)
         case 0:  return 1;  // Pulse
         case 1:  return 5;  // Gentle
         case 3:  return 8;  // Serpentine (b431)
+        case 4:  return 9;  // Sections (b536)
         default: return 7;  // Smooth
     }
 }
@@ -20748,6 +20743,7 @@ static int schedule_estimate_duration_min(uint8_t zone, uint8_t mode, uint8_t de
     int base;
     switch (mode) {
         case 3:  base = 12; break;  // serpentine (b435: Edge measured ~10.5 min/eighth)
+        case 4:  base = 12; break;  // sections (b536: serpentine motion, same rate)
         case 2:  base = 30; break;  // smooth (adaptive)
         case 1:  base = 15; break;  // gentle, per 1/8"
         default: base = 8;  break;  // pulse, per 1/8"
@@ -20907,7 +20903,7 @@ bool irrigoto_schedule_set_text(const char *text)
             ESP_LOGW(TAG, "%s", s_sched_last_status);
             return false;
         }
-        if (z < 1 || z > 250 || m < 0 || m > 3 || d < 0 || d > 8 ||   // b435: 3=Serpentine
+        if (z < 1 || z > 250 || m < 0 || m > 4 || d < 0 || d > 8 ||   // b536: 4=Sections
             hh < 0 || hh > 23 || mm < 0 || mm > 59 ||
             days < 0 || days > 127 || en < 0 || en > 1) {
             snprintf(s_sched_last_status, sizeof(s_sched_last_status),
@@ -21051,7 +21047,7 @@ bool irrigoto_schedule_sync_text(const char *text)
             return false;
         }
         if (tomb == 0) {
-            if (z < 1 || z > 250 || m < 0 || m > 3 || d < 0 || d > 8 ||   // b435: 3=Serpentine
+            if (z < 1 || z > 250 || m < 0 || m > 4 || d < 0 || d > 8 ||   // b536: 4=Sections
                 hh < 0 || hh > 23 || mm < 0 || mm > 59 ||
                 days < 0 || days > 127 || en < 0 || en > 1 ||
                 src < 0 || src > 3) {
