@@ -45,8 +45,8 @@
 #include "lwip/sockets.h"
 #include "esp_http_server.h"
 #include "fw_version.h"
-#include "pump.h"       // b534: solution pump driver
-#include "solution.h"   // b534: apply-solution dosing
+#include "pump.h"       // solution pump driver
+#include "solution.h"   // apply-solution dosing
 #include "storage.h"
 #ifdef ESPHOME_COMPONENT
 #include "irrigoto_api.h"  // visible at top so callsites above the impl block compile
@@ -912,7 +912,7 @@ static void motor_rail_on(void)
 
 static void motor_rail_off(void)
 {
-    pump_stop();   // b534: the drive line must never outlive the rail
+    pump_stop();   // the drive line must never outlive the rail
     if (!s_motor_rail) return;
     gpio_set_level(GPIO_VFWD,  0);
     gpio_set_level(GPIO_VREV,  0);
@@ -924,7 +924,7 @@ static void motor_rail_off(void)
     INFO("Motor rail OFF");
 }
 
-// b534: pump.c stays hardware-only; the rail and PCur ADC come from here.
+// pump.c stays hardware-only; the rail and PCur ADC come from here.
 static bool     pump_hal_rail_is_on(void) { return s_motor_rail; }
 static uint32_t pump_hal_pcur_mv(void)    { adc_setup(); return adc_mv(ADC_CH_PCUR); }
 static void pump_and_solution_init(void)
@@ -6231,7 +6231,7 @@ static inline void water_set_status(int code)
 // every sleep path so the device always sleeps in a known-safe state.
 static void prepare_for_sleep(void)
 {
-    solution_on_run_end();   // b534: pump off + counters committed before rails drop
+    solution_on_run_end();   // pump off + counters committed before rails drop
     motor_rail_on();
     sensor_rail_on();
     valve_goto(VALVE_CLOSED_DEG, 2.0f, 10000, false);
@@ -10002,7 +10002,7 @@ static bool serpentine_glide_legs(const serpentine_leg_t *legs, int n,
                     }
                     s_water_run_had_flow = true;
                     sched_note_flow_started();  // b450: stamp scheduled run on first flow
-                    solution_note_flow();       // b534
+                    solution_note_flow();
                 }
             }
 
@@ -11836,7 +11836,7 @@ static void phase_water_zone(void)
                      "(nothing connected)", _pmax, WATER_NO_SUPPLY_PSI);
                 water_set_status(WATER_STATUS_NO_SUPPLY);
             } else {
-                solution_note_flow();   // b534: water verifiably flowed during the check
+                solution_note_flow();   // water verifiably flowed during the check
             }
         } else {
             INFO("Supply pressure read failed -- using calibrated estimate");
@@ -12971,7 +12971,7 @@ static void phase_water_zone(void)
                 s_water_run_had_flow   = true;
                 s_water_no_flow_streak = 0;
                 sched_note_flow_started();  // b450: stamp scheduled run on first flow
-                solution_note_flow();       // b534
+                solution_note_flow();
             }
 
             // Sweep: gentle/smooth use encoder-position-based continuous sweep;
@@ -15029,7 +15029,7 @@ static esp_err_t api_device_name_handler(httpd_req_t *req)
 }
 
 // POST /zone/water  body: id=N&mode=1|2|3|4|5|6|7|8|c|d  (8=serpentine, b431)
-//   b534 optional Apply solution block (absent = no dose, so HA's water-now
+//   Optional Apply solution block (absent = no dose, so HA's water-now
 //   service is unaffected): solution_enabled=1&solution_bottle=1..3&
 //   solution_speed=60|80|100&solution_pulse=0|1&solution_pulse_on_s=N&
 //   solution_pulse_off_s=N. Ignored for chase and demo.
@@ -15042,7 +15042,7 @@ static void water_task(void *arg) {
     // can't retry-loop. No-op for gentle/smooth/serpentine (already marked at flow).
     sched_note_flow_started();
     sched_fire_clear_inprogress();   // b452: run reached completion -> not a mid-run crash
-    solution_on_run_end();           // b534: pump off, Nth/rotation counters committed
+    solution_on_run_end();           // pump off, Nth/rotation counters committed
     s_web_water_mode     = 0;
     s_water_est_min      = 0;
     s_water_cleanup_pass = 0;
@@ -15062,7 +15062,7 @@ static esp_err_t zone_water_cancel_handler(httpd_req_t *req)
 
 static esp_err_t zone_water_handler(httpd_req_t *req)
 {
-    char body[224]={0};   // b534: 96 -> 224 for the solution_* params
+    char body[224]={0};   // 96 -> 224 for the solution_* params
     httpd_req_recv(req,body,sizeof(body)-1);
     char mode_s[4]={0}, id_s[8]={0}, dur_s[8]={0};
     httpd_query_key_value(body,"mode",mode_s,sizeof(mode_s));
@@ -15119,7 +15119,7 @@ static esp_err_t zone_water_handler(httpd_req_t *req)
         s_web_serpentine_dry = (mode == 8 && dry_q[0] == '1');
     }
     s_active_sched_epoch = 0;   // b450: /zone/water is a manual run (never auto-marked)
-    // b534: manual Apply solution. One bottle, no rotation; the browser
+    // manual Apply solution. One bottle, no rotation; the browser
     // remembers the last-used settings, the device does not.
     {
         char en_q[4]={0}, b_q[4]={0}, sp_q[8]={0}, pu_q[4]={0}, on_q[8]={0}, off_q[8]={0};
@@ -15839,7 +15839,7 @@ static esp_err_t api_all_handler(httpd_req_t *req)
         (unsigned long)esp_get_minimum_free_heap_size(),
         (unsigned long)heap_caps_get_largest_free_block(MALLOC_CAP_8BIT));
     httpd_resp_send_chunk(req, buf, n);
-    // b534: live Apply solution state for the landing page's watering bar.
+    // live Apply solution state for the landing page's watering bar.
     n  = snprintf(buf, sizeof(buf), ",\"solution\":");
     n += solution_status_json(buf + n, sizeof(buf) - n);
     httpd_resp_send_chunk(req, buf, n);
@@ -16335,7 +16335,7 @@ static esp_err_t api_status_handler(httpd_req_t *req)
         "{\"fw_build\":%u,\"wifi_rssi\":%d,"
         "\"storage_used_kb\":%u,\"storage_total_kb\":%u,"
         "\"watering\":%s,\"water_mode\":%d,\"water_est_min\":%d,\"cleanup_pass\":%d,"
-        "\"led_expander\":\"%s\"}",   // b528: which 0x20 part led_expander_detect() picked
+        "\"led_expander\":\"%s\"}",   // which 0x20 part led_expander_detect() picked
         FW_BUILD, wifi_get_rssi(),
         (unsigned)(used/1024), (unsigned)(total/1024),
         s_web_water_mode?"true":"false", s_web_water_mode, s_water_est_min,
@@ -17964,7 +17964,7 @@ static esp_err_t cal_page_handler(httpd_req_t *req)
 // is in scope. Keeps the schedule data hidden from this section while still
 // letting the web handler read a consistent snapshot.
 static void schedule_snapshot(schedule_t *out);
-static int  schedule_estimate_duration_min(uint8_t zone, uint8_t mode, uint8_t depth);  // b534
+static int  schedule_estimate_duration_min(uint8_t zone, uint8_t mode, uint8_t depth);
 
 // GET /schedule -> the standalone schedule editor page (embedded HTML).
 static esp_err_t schedule_page_handler(httpd_req_t *req)
@@ -18260,8 +18260,8 @@ static esp_err_t api_schedule_handler(httpd_req_t *req)
             (unsigned long)e->client_tag,
             e->zone, e->mode, e->depth,
             e->hour, e->minute, e->days_mask, e->enabled, e->source,
-            schedule_estimate_duration_min(e->zone, e->mode, e->depth));   // b534
-        n += solution_entry_json(e, buf+n, sizeof(buf)-n);                  // b534
+            schedule_estimate_duration_min(e->zone, e->mode, e->depth));
+        n += solution_entry_json(e, buf+n, sizeof(buf)-n);
         n += snprintf(buf+n, sizeof(buf)-n, "}");
     }
     n += snprintf(buf+n, sizeof(buf)-n, "],");
@@ -18589,7 +18589,7 @@ static esp_err_t zone_last_water_handler(httpd_req_t *req)
 }
 
 
-// ── Apply solution endpoints (b534) ───────────────────────────────────────────
+// ── Apply solution endpoints ───────────────────────────────────────────
 // GET  /bottle_cal          calibration page
 // GET  /api/solution_cal    {"speeds":[100,80,60],"rates":[[b1 full,med,low],[b2..],[b3..]]}
 // POST /api/solution_cal    bottle=1..3&speed=100|80|60&rate=<mL/s>   (0 = clear)
@@ -18703,7 +18703,7 @@ static void zone_web_start(void)
     httpd_config_t cfg   = HTTPD_DEFAULT_CONFIG();
     cfg.server_port      = ZONE_WEB_PORT;
     cfg.ctrl_port        = ZONE_WEB_CTRL_PORT;
-    cfg.max_uri_handlers  = 82;  // b534: 79 -> 82 (-/api/pump_run, -/api/probe, -/api/gpio_probe, +/bottle_cal, /api/solution_cal x2, /api/pump_jog x2, /api/solution_est); b532: 78 -> 79 (/api/pump_run GET); b530: 77 -> 78 (/api/gpio_probe GET); b529: 76 -> 77 (/api/probe GET); b525: 74 -> 76 (/api/winter GET+POST); b522: 72 -> 74 (/api/fault_hold GET+POST); b512: 70 -> 72 (/api/uart_log GET+POST); b489: 68 -> 70, keeping the 2-slot margin over
+    cfg.max_uri_handlers  = 82;  // solution dosing: 76 -> 82 (/bottle_cal, /api/solution_cal x2, /api/pump_jog x2, /api/solution_est); b525: 74 -> 76 (/api/winter GET+POST); b522: 72 -> 74 (/api/fault_hold GET+POST); b512: 70 -> 72 (/api/uart_log GET+POST); b489: 68 -> 70, keeping the 2-slot margin over
                                  // the _Static_assert below.
                                  // MUST be set before httpd_start (cfg is copied there);
                                  // headroom over uris[] count -- _Static_assert below guards it.
@@ -18739,12 +18739,12 @@ static void zone_web_start(void)
         {.uri="/api/uart_log",    .method=HTTP_POST, .handler=api_uart_log_handler},   // b512
         {.uri="/api/winter",      .method=HTTP_GET,  .handler=api_winter_handler},     // b525
         {.uri="/api/winter",      .method=HTTP_POST, .handler=api_winter_handler},     // b525
-        {.uri="/bottle_cal",      .method=HTTP_GET,  .handler=bottle_cal_page_handler},  // b534
-        {.uri="/api/solution_cal",.method=HTTP_GET,  .handler=api_solution_cal_handler}, // b534
-        {.uri="/api/solution_cal",.method=HTTP_POST, .handler=api_solution_cal_handler}, // b534
-        {.uri="/api/pump_jog",    .method=HTTP_GET,  .handler=api_pump_jog_handler},     // b534
-        {.uri="/api/pump_jog",    .method=HTTP_POST, .handler=api_pump_jog_handler},     // b534
-        {.uri="/api/solution_est",.method=HTTP_GET,  .handler=api_solution_est_handler}, // b534
+        {.uri="/bottle_cal",      .method=HTTP_GET,  .handler=bottle_cal_page_handler},
+        {.uri="/api/solution_cal",.method=HTTP_GET,  .handler=api_solution_cal_handler},
+        {.uri="/api/solution_cal",.method=HTTP_POST, .handler=api_solution_cal_handler},
+        {.uri="/api/pump_jog",    .method=HTTP_GET,  .handler=api_pump_jog_handler},
+        {.uri="/api/pump_jog",    .method=HTTP_POST, .handler=api_pump_jog_handler},
+        {.uri="/api/solution_est",.method=HTTP_GET,  .handler=api_solution_est_handler},
         {.uri="/api/fault_hold",  .method=HTTP_GET,  .handler=api_fault_hold_handler}, // b522
         {.uri="/api/fault_hold",  .method=HTTP_POST, .handler=api_fault_hold_handler}, // b522
         {.uri="/api/cal",         .method=HTTP_GET,  .handler=api_cal_handler},
@@ -18803,7 +18803,7 @@ static void zone_web_start(void)
         {.uri="/fs/upload",             .method=HTTP_POST, .handler=fs_upload_handler},
         {.uri="/fs/delete",             .method=HTTP_POST, .handler=fs_delete_handler},
     };
-    _Static_assert(sizeof(uris)/sizeof(uris[0]) <= 80,   // b534: 77 -> 80 (see max_uri_handlers); b532: 76 -> 77 (/api/pump_run GET); b530: 75 -> 76 (/api/gpio_probe GET); b529: 74 -> 75 (/api/probe GET); b525: 72 -> 74 (/api/winter GET+POST); b522: 70 -> 72 (/api/fault_hold GET+POST); b512: 68 -> 70 (/api/uart_log GET+POST); b489: 66 -> 68
+    _Static_assert(sizeof(uris)/sizeof(uris[0]) <= 80,   // solution dosing: 74 -> 80 (see max_uri_handlers); b525: 72 -> 74 (/api/winter GET+POST); b522: 70 -> 72 (/api/fault_hold GET+POST); b512: 68 -> 70 (/api/uart_log GET+POST); b489: 66 -> 68
                    "uris[] exceeds cfg.max_uri_handlers -- raise it before httpd_start");
     for (size_t i = 0; i < sizeof(uris)/sizeof(uris[0]); i++)
         httpd_register_uri_handler(s_zone_server, &uris[i]);
@@ -19068,7 +19068,7 @@ void irrigoto_init(void)
     schedule_delay_load_nvs();   // restore rain/wind delay across reboot/wake
     last_water_load_nvs();       // restore "last completed" tag across deep-sleep wake
     sched_fire_load();           // b437: armed run + fired-epoch ring (clock-free firing)
-    pump_and_solution_init();    // b534: pump lines idle, solution cal + counters loaded
+    pump_and_solution_init();    // pump lines idle, solution cal + counters loaded
     xTaskCreate(schedule_task, "oto_sched", 3072, NULL, 2, NULL);
     INFO("Schedule loaded: %d entries", irrigoto_schedule_count());
 }
@@ -19718,7 +19718,7 @@ static void start_watering_web_mode(int zone, int web_mode, int depth8, uint32_t
         return;
     }
     if (zone < 1) zone = 1;
-    solution_arm_entry(entry);   // b534: decides dose / bottle for this run (NULL = none)
+    solution_arm_entry(entry);   // decides dose / bottle for this run (NULL = none)
     // b450: remember the scheduled epoch (0 = manual). Stamped "done" only once
     // water flows (sched_note_flow_started), set here only after the guards so a
     // refused start never leaves a stale epoch to mis-mark a later run.
@@ -19826,7 +19826,7 @@ typedef struct {
     // automation can reschedule or abandon it. 0 = none since the blob reset.
     uint32_t last_missed_epoch;   // scheduled UTC epoch of the miss
     uint16_t last_missed_zone;    // 1-based
-    uint16_t armed_entry_id;      // b534: schedule entry id of the armed run (0 = pre-b534 blob)
+    uint16_t armed_entry_id;      // schedule entry id of the armed run (0 = blob from before solution dosing)
     // b452: set when water starts flowing on a scheduled run, cleared at
     // completion. If still set on the next boot, the run crashed mid-watering
     // (under-watered) -> promoted to last_missed so HA sees the incomplete run.
@@ -20149,7 +20149,7 @@ static void schedule_load_nvs(void)
             memset(&s_schedule, 0, sizeof(s_schedule));
         }
     } else if (sr == ESP_OK && schema == 3 && blob_sz == sizeof(schedule_v3_t)) {
-        // b534 migration: tagged 20-byte entries -> 32-byte entries with the
+        // Solution-dosing migration: tagged 20-byte entries -> 32-byte entries with the
         // Apply solution block. Solution fields start at zero = defaults, so
         // nothing doses until the user turns it on per entry.
         schedule_v3_t old; memset(&old, 0, sizeof(old));
@@ -20336,7 +20336,7 @@ static int schedule_estimate_duration_min(uint8_t zone, uint8_t mode, uint8_t de
         water_run_t prev; memset(&prev, 0, sizeof(prev));
         if (storage_water_load(zone - 1, &prev) == ESP_OK
                 && prev.total_time_s > 60.0f) {
-            // b534: the last run may have targeted a different depth; scale
+            // the last run may have targeted a different depth; scale
             // by the depth ratio when it recorded one (target_depth_mm is
             // eighths x 3.175 mm). Mode differences are not scaled.
             float scale = 1.0f;
@@ -20463,7 +20463,7 @@ static int legacy_find_existing(uint8_t zone, uint8_t hour, uint8_t minute,
     return -1;
 }
 
-// b534: copy just the Apply solution block from one entry to another.
+// copy just the Apply solution block from one entry to another.
 static void schedule_copy_solution(schedule_entry_t *dst, const schedule_entry_t *src)
 {
     dst->solution_enabled     = src->solution_enabled;
@@ -20480,7 +20480,7 @@ bool irrigoto_schedule_set_text(const char *text)
 {
     if (text == NULL) return false;
     schedule_t next = { .count = 0 };
-    bool has_solution[SCHEDULE_MAX_ENTRIES] = {0};   // b534: entry carried its own block
+    bool has_solution[SCHEDULE_MAX_ENTRIES] = {0};   // entry carried its own block
     // Parse one entry at a time. Each entry: 7 comma-separated ints,
     // separated from other entries by ';' or '\n'.
     const char *p = text;
@@ -20489,7 +20489,7 @@ bool irrigoto_schedule_set_text(const char *text)
         while (*p == ' ' || *p == '\t' || *p == ';' || *p == '\n' || *p == '\r') p++;
         if (!*p) break;
         int z, m, d, hh, mm, days, en;
-        // b534: optional trailing Apply solution block. 7 fields = untouched
+        // optional trailing Apply solution block. 7 fields = untouched
         // (existing entries keep their solution settings, new ones default).
         int se = 0, sb = 0, sw = 0, sn = 0, ss = 0, sp = 0, son = 0, soff = 0;
         int n = sscanf(p, "%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d",
@@ -20563,7 +20563,7 @@ bool irrigoto_schedule_set_text(const char *text)
             bool changed = (old->mode != ne->mode) ||
                            (old->depth != ne->depth) ||
                            (old->enabled != ne->enabled);
-            // b534: a 7-field save (HA legacy pusher) keeps the entry's
+            // a 7-field save (HA legacy pusher) keeps the entry's
             // solution block; a 15-field save replaces it.
             if (!has_solution[i]) {
                 schedule_copy_solution(ne, old);
@@ -20959,8 +20959,8 @@ static bool schedule_next_run_full(time_t now, time_t *out_t,
     return true;
 }
 
-// b534: the entry behind an armed run. Prefers the stored id; a blob written
-// before b534 has id 0, so fall back to the entry whose zone and local time of
+// the entry behind an armed run. Prefers the stored id; a blob written
+// before solution dosing has id 0, so fall back to the entry whose zone and local time of
 // day match the armed epoch (overlap validation makes that unique).
 static const schedule_entry_t *schedule_entry_for_run(uint32_t entry_id, uint8_t zone, uint32_t epoch)
 {
@@ -21414,7 +21414,7 @@ void irrigoto_sleep_now_with_reason(uint32_t duration_s, const char *reason)
                         s_sched_fire.armed_zone      = next_zone;
                         s_sched_fire.armed_mode      = next_mode;
                         s_sched_fire.armed_depth     = next_depth;
-                        s_sched_fire.armed_entry_id  = (uint16_t)next_id;   // b534
+                        s_sched_fire.armed_entry_id  = (uint16_t)next_id;
                         s_sched_fire.armed_run_sleep = 1;
                         sched_fire_save();
                         armed_this_sleep = true;

@@ -207,7 +207,7 @@ place a mode list is hardcoded.
 
 Units that ship with the three peristaltic solution pumps can dose a watering
 run from one of three bottles. The stock OtO firmware has no pump code; this
-is greenfield (Build 534). It is configured per schedule entry and per manual
+is greenfield. It is configured per schedule entry and per manual
 run, not per zone, so two entries on the same zone can dose differently.
 
 - **Schedule entry** — the "Apply solution" block on each entry: bottle(s)

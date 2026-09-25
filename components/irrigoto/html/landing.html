@@ -123,7 +123,7 @@ section{margin-bottom:18px;}
 .mode-btn span{display:block;font-size:11px;color:var(--text-mid);margin-top:3px;}
 .mode-btn.sel span{color:rgba(0,232,122,.6);}
 .modal-actions{display:flex;gap:10px;}
-/* Apply solution block (b534) -- chips/toggles match the schedule page */
+/* Apply solution block -- chips/toggles match the schedule page */
 #sol-block{border-top:1px solid var(--border);margin:-6px 0 14px;padding-top:12px;}
 .toggle-row{display:flex;justify-content:space-between;align-items:center;}
 .toggle-row .toggle-lbl{font-size:13px;color:var(--text);}
@@ -303,7 +303,7 @@ section{margin-bottom:18px;}
         <span id="chase-dur-val" style="min-width:48px;text-align:right;color:var(--text);font-weight:600;">3 min</span>
       </div>
     </div>
-    <!-- b534: Apply solution (manual run). Hidden for chase/demo. -->
+    <!-- Apply solution (manual run). Hidden for chase/demo. -->
     <div id="sol-block">
       <div class="toggle-row">
         <span class="toggle-lbl">Apply solution</span>
@@ -345,7 +345,7 @@ section{margin-bottom:18px;}
 
 <script>
 let selZoneId=0, selModeDat='1';
-let lastSolution=null;   // b534: /api/all "solution" object
+let lastSolution=null;   // /api/all "solution" object
 let waterStartTime=0, waterEstMs=0, countdownTimer=null, lastWateringState=false, lastCleanupPass=0, lastEstMin=0;
 
 function handleZoneBtn(id){
@@ -502,7 +502,7 @@ function selMode(btn){
   solModeChanged();
 }
 
-// ── Apply solution on a manual run (b534) ────────────────────────────────────
+// ── Apply solution on a manual run ────────────────────────────────────
 // Settings live in the browser (localStorage), not on the device. The modal
 // mode digit maps to a schedule (mode, depth) pair for the run-length estimate.
 const SOL_KEY='irrigoto_solution';
@@ -690,7 +690,7 @@ async function refresh(){
       document.title=d.device_name;
     }
     renderZones(d.zones);
-    lastSolution = d.solution || null;   // b534
+    lastSolution = d.solution || null;
     updateWateringState(d.watering, d.water_mode, d.water_est_min, d.water_zone_id, d.cleanup_pass||0);
   }catch(e){ dot(false); }
 }
@@ -799,7 +799,7 @@ function tickCountdown(){
   const remMin=Math.floor(rem/60000);
   const remSec=Math.floor((rem%60000)/1000);
   const prefix = (lastWaterMode === 50) ? '🐶 Chase · ' : '';
-  // b534: show the dose alongside the countdown once it is armed.
+  // show the dose alongside the countdown once it is armed.
   const sol = lastSolution && lastSolution.armed
     ? ' · Bottle ' + lastSolution.bottle + (lastSolution.phase === 'dosing'
         ? (lastSolution.ml > 0 ? ' ' + Math.round(lastSolution.ml) + ' mL' : ' on')

@@ -110,7 +110,7 @@ typedef struct {
 // members first, then the uint8_t cluster). Old NVS blobs are auto-migrated on
 // first boot -- see schedule_load_nvs() in irrigoto.c.
 //
-// Schema 4 (b534) appends the "Apply solution" block. Every solution field is
+// Schema 4 (solution dosing) appends the "Apply solution" block. Every solution field is
 // zero in a migrated or freshly inserted entry, and zero means "default" (see
 // solution_cfg_from_entry() in solution.c: bottles 0 -> bottle 1, speed 0 ->
 // 100 %, on/off 0 -> 2 s / 4 s). That keeps HA's sync path -- which never
@@ -155,7 +155,7 @@ typedef struct {
     schedule_entry_t entries[SCHEDULE_MAX_ENTRIES];
 } schedule_t;
 
-// Schema-3 entry (b403..b533): tagged, no solution block. Kept so the NVS
+// Schema-3 entry (b403 up to solution dosing): tagged, no solution block. Kept so the NVS
 // migration recognizes the old blob size (644 B) and widens each entry.
 typedef struct {
     uint32_t id;
