@@ -123,6 +123,25 @@ section{margin-bottom:18px;}
 .mode-btn span{display:block;font-size:11px;color:var(--text-mid);margin-top:3px;}
 .mode-btn.sel span{color:rgba(0,232,122,.6);}
 .modal-actions{display:flex;gap:10px;}
+/* Mode + Depth pickers (b535). Replaces the fixed preset grid so any mode
+   can run at any depth, the way schedule entries and HA already work. */
+.pick-lbl{display:flex;align-items:center;gap:6px;font-size:10px;letter-spacing:.12em;
+  text-transform:uppercase;color:var(--text-mid);margin:0 0 6px;}
+.pick-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:6px;margin-bottom:14px;}
+.pick-grid.depth{grid-template-columns:repeat(4,1fr);}
+.pick{padding:9px 4px;border-radius:var(--radius-sm);border:1px solid var(--border);
+  background:var(--btn);color:var(--text);font-size:12px;cursor:pointer;
+  text-align:center;font-family:inherit;}
+.pick.sel{border-color:var(--green);background:var(--green-dim);color:var(--green);}
+.info-btn{background:none;border:1px solid var(--border);color:var(--text-mid);
+  width:16px;height:16px;line-height:1;border-radius:50%;font-size:10px;
+  cursor:pointer;font-family:inherit;padding:0;}
+.info-btn:active{color:var(--green);border-color:var(--green);}
+.mode-help{display:none;font-size:12px;color:var(--text-mid);line-height:1.5;
+  background:var(--btn);border:1px solid var(--border);border-radius:var(--radius-sm);
+  padding:10px 12px;margin:-8px 0 14px;}
+.mode-help.show{display:block;}
+.mode-help b{color:var(--text);}
 .modal-actions .btn{flex:1;justify-content:center;}
 #modal-status{font-size:12px;color:var(--text-mid);text-align:center;
   margin-top:10px;min-height:18px;}
@@ -233,35 +252,23 @@ section{margin-bottom:18px;}
 <div id="modal-bg" onclick="if(event.target===this)closeModal()">
   <div id="modal">
     <div class="modal-title" id="modal-zone-name">Water Zone</div>
-    <div class="modal-sub">Select depth and start watering</div>
-    <div class="mode-grid">
-      <button class="mode-btn sel" data-mode="1" onclick="selMode(this)">
-        1/8&Prime; <span>1 pass &middot; ~13 min</span>
-      </button>
-      <button class="mode-btn" data-mode="2" onclick="selMode(this)">
-        1/4&Prime; <span>1 pass &middot; ~26 min</span>
-      </button>
-      <button class="mode-btn" data-mode="3" onclick="selMode(this)">
-        1/8&Prime; &times;2 <span>2 passes &middot; ~26 min</span>
-      </button>
-      <button class="mode-btn" data-mode="5" onclick="selMode(this)">
-        Gentle 1/8&Prime; <span>seed-safe &middot; 5 passes</span>
-      </button>
-      <button class="mode-btn" data-mode="6" onclick="selMode(this)">
-        Gentle 1/4&Prime; <span>seed-safe &middot; 10 passes</span>
-      </button>
-      <button class="mode-btn" data-mode="7" onclick="selMode(this)">
-        Smooth 1/8&Prime; <span>open-loop &middot; multipass</span>
-      </button>
-      <button class="mode-btn" data-mode="8" onclick="selMode(this)">
-        Serpentine 1/8&Prime; <span>continuous glide &middot; multipass</span>
-      </button>
-      <button class="mode-btn" data-mode="d" onclick="selMode(this)">
-        Demo <span>max speed</span>
-      </button>
-      <button class="mode-btn" data-mode="c" onclick="selMode(this)">
-        &#128054; Chase <span>play mode &middot; 1-10 min</span>
-      </button>
+    <div class="modal-sub">Choose a mode and depth, then start watering</div>
+    <div class="pick-lbl">Mode
+      <button class="info-btn" id="mode-info-btn" onclick="toggleModeHelp()"
+              aria-expanded="false" aria-controls="mode-help" aria-label="What the modes do">i</button>
+    </div>
+    <div class="pick-grid" id="mode-pick">
+      <button class="pick sel" data-mode="1" onclick="selMode(this)">Pulse</button>
+      <button class="pick" data-mode="5" onclick="selMode(this)">Gentle</button>
+      <button class="pick" data-mode="7" onclick="selMode(this)">Smooth</button>
+      <button class="pick" data-mode="8" onclick="selMode(this)">Serpentine</button>
+      <button class="pick" data-mode="c" onclick="selMode(this)">&#128054; Chase</button>
+      <button class="pick" data-mode="d" onclick="selMode(this)">Demo</button>
+    </div>
+    <div class="mode-help" id="mode-help" role="region" aria-label="Mode descriptions"></div>
+    <div id="depth-block">
+      <div class="pick-lbl">Depth</div>
+      <div class="pick-grid depth" id="depth-pick"></div>
     </div>
     <div id="chase-row" style="display:none;margin:-6px 0 18px;padding:10px 12px;border:1px solid var(--border);border-radius:var(--radius-sm);background:var(--btn);font-size:12px;">
       <label for="chase-dur" style="display:block;color:var(--text-mid);margin-bottom:6px;">
@@ -419,23 +426,79 @@ function renderZones(zones){
 
 // ── Water modal ───────────────────────────────────────────────────────────────
 function openModal(id, name){
-  selZoneId=id; selModeDat='1';
+  selZoneId=id;
   document.getElementById('modal-zone-name').textContent='Water: '+name;
   document.getElementById('modal-status').textContent='';
   document.getElementById('start-btn').disabled=false;
   document.getElementById('start-btn').textContent='\u25B6 Start';
-  document.querySelectorAll('.mode-btn').forEach(b=>b.classList.remove('sel'));
-  document.querySelector('.mode-btn[data-mode="1"]').classList.add('sel');
-  document.getElementById('chase-row').style.display='none';
+  // b535: reopen with the last mode/depth this browser used.
+  restoreModePrefs();
+  document.getElementById('mode-help').classList.remove('show');
   document.getElementById('modal-bg').classList.add('open');
 }
 function closeModal(){ document.getElementById('modal-bg').classList.remove('open'); }
+// ── Mode + Depth pickers (b535) ──────────────────────────────────────────────
+// Web mode digits, unchanged: Pulse=1, Gentle=5, Smooth=7, Serpentine=8,
+// Demo=d, Chase=c. Depth rides along as eighths of an inch (1..8), which
+// POST /zone/water has always accepted -- the schedule and HA already send it.
+// Demo and Chase carry no depth.
+const DEPTH_LABELS = ['\u2014','1/8\u2033','1/4\u2033','3/8\u2033','1/2\u2033','5/8\u2033','3/4\u2033','7/8\u2033','1\u2033'];
+const MODE_HELP = {
+  '1': '<b>Pulse.</b> Steps ring by ring, outer to inner, stopping to fine-tune pressure at each step. Most precise placement, but stop-start and slower.',
+  '5': '<b>Gentle.</b> Low pressure over many light passes. Safe for seed and bare soil.',
+  '7': '<b>Smooth.</b> Continuous sweep, then re-waters only the rings that are still short, timed to the pump cycle. Good default.',
+  '8': '<b>Serpentine.</b> One continuous back-and-forth glide that never stops. Smoothest, with no start-of-row bursts, but less precise at edges and near the sprinkler.',
+  'c': '<b>Chase.</b> Play mode for dogs, 1-10 min. Not tracked as watering.',
+  'd': '<b>Demo.</b> Max-speed sweep. Not tracked as watering.',
+};
+let selDepth = 1;
+
+function buildDepthPicker(){
+  const g = document.getElementById('depth-pick');
+  if (!g || g.children.length) return;
+  g.innerHTML = [1,2,3,4,5,6,7,8].map(v =>
+    '<button class="pick' + (v === selDepth ? ' sel' : '') + '" data-depth="' + v + '" ' +
+    'onclick="selDepthBtn(this)">' + DEPTH_LABELS[v] + '</button>').join('');
+}
+function selDepthBtn(btn){
+  selDepth = +btn.dataset.depth;
+  document.querySelectorAll('#depth-pick .pick').forEach(b => b.classList.toggle('sel', b === btn));
+  saveModePrefs();
+}
 function selMode(btn){
-  document.querySelectorAll('.mode-btn').forEach(b=>b.classList.remove('sel'));
+  document.querySelectorAll('#mode-pick .pick').forEach(b=>b.classList.remove('sel'));
   btn.classList.add('sel'); selModeDat=btn.dataset.mode;
-  // Chase mode shows a duration slider; other modes hide it.
-  document.getElementById('chase-row').style.display =
-    (selModeDat === 'c') ? 'block' : 'none';
+  applyModeVisibility();
+  saveModePrefs();
+}
+// Chase shows its duration slider; Chase and Demo have no depth.
+function applyModeVisibility(){
+  const chase = (selModeDat === 'c'), demo = (selModeDat === 'd');
+  document.getElementById('chase-row').style.display = chase ? 'block' : 'none';
+  document.getElementById('depth-block').style.display = (chase || demo) ? 'none' : '';
+  const help = document.getElementById('mode-help');
+  if (help && help.classList.contains('show')) help.innerHTML = MODE_HELP[selModeDat] || '';
+}
+function toggleModeHelp(){
+  const help = document.getElementById('mode-help');
+  const btn  = document.getElementById('mode-info-btn');
+  const on = !help.classList.contains('show');
+  help.classList.toggle('show', on);
+  help.innerHTML = on ? (MODE_HELP[selModeDat] || '') : '';
+  if (btn) btn.setAttribute('aria-expanded', on ? 'true' : 'false');
+}
+function saveModePrefs(){
+  try { localStorage.setItem('irrigoto_mode', JSON.stringify({mode:selModeDat, depth:selDepth})); } catch(_){}
+}
+function restoreModePrefs(){
+  let p = {};
+  try { p = JSON.parse(localStorage.getItem('irrigoto_mode') || '{}'); } catch(_){}
+  if (MODE_HELP[p.mode]) selModeDat = p.mode;
+  if (p.depth >= 1 && p.depth <= 8) selDepth = p.depth;
+  buildDepthPicker();
+  document.querySelectorAll('#mode-pick .pick').forEach(b => b.classList.toggle('sel', b.dataset.mode === selModeDat));
+  document.querySelectorAll('#depth-pick .pick').forEach(b => b.classList.toggle('sel', +b.dataset.depth === selDepth));
+  applyModeVisibility();
 }
 async function startWater(){
   const btn=document.getElementById('start-btn');
@@ -445,6 +508,8 @@ async function startWater(){
   if (selModeDat === 'c') {
     const d=parseInt(document.getElementById('chase-dur').value, 10) || 3;
     body += '&duration=' + d;
+  } else if (selModeDat !== 'd') {
+    body += '&depth=' + selDepth;   // eighths of an inch; Demo/Chase send none
   }
   try{
     const r=await fetch('/zone/water',{method:'POST',
