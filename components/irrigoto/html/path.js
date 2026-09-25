@@ -28,11 +28,31 @@
     '5': { key: 'gentle',     label: 'Gentle' },
     '7': { key: 'smooth',     label: 'Smooth' },
     '8': { key: 'serpentine', label: 'Serpentine' },
+    '9': { key: 'sections',   label: 'Sections' },
     'c': { key: 'chase',      label: 'Chase' },
     'd': { key: 'demo',       label: 'Demo' }
   };
 
   function rad(d) { return (d - 90) * Math.PI / 180; }
+
+  /* The two endpoints that carry zone geometry disagree on the field name:
+   * /zone/state (Zone Setup) sends {deg, throw_mm}, /api/all (landing and
+   * schedule) sends {deg, mm}. Normalising here means callers can hand over
+   * whatever they were given -- the mismatch used to draw an empty circle. */
+  function normPoints(pts) {
+    if (!pts || !pts.length) return [];
+    var out = [], i, p, t;
+    for (i = 0; i < pts.length; i++) {
+      p = pts[i];
+      if (!p) continue;
+      t = (p.throw_mm !== undefined) ? p.throw_mm
+        : (p.mm !== undefined)       ? p.mm
+        : (p.r !== undefined)        ? p.r : undefined;
+      if (t === undefined || !(t > 0)) continue;
+      out.push({ deg: +p.deg || 0, throw_mm: +t });
+    }
+    return out;
+  }
 
   /* Even-odd point-in-polygon in (bearing, throw) space, translated so the
    * test point is the origin -- same method the page used before. */
@@ -145,14 +165,15 @@
    */
   function planOrder(modeKey, nRings, pass, sequential) {
     var idx = [], i;
-    var inward = !(modeKey === 'serpentine' && (pass % 2) === 1);
+    var serpish = (modeKey === 'serpentine' || modeKey === 'sections');
+    var inward = !(serpish && (pass % 2) === 1);
     for (i = 0; i < nRings; i++) idx.push(inward ? i : nRings - 1 - i);
 
     var cw = [], dryReturn = [];
     for (i = 0; i < nRings; i++) {
       var d;
       if (sequential)                    d = (i % 2) === 0;
-      else if (modeKey === 'serpentine') d = (i % 2) === 0;
+      else if (serpish)                  d = (i % 2) === 0;
       else if (modeKey === 'pulse')      d = true;
       else                               d = (pass % 2) === 0;  /* gentle, smooth */
       cw.push(d);
@@ -163,10 +184,60 @@
     return { idx: idx, cw: cw, dryReturn: dryReturn, orderVaries: (modeKey === 'smooth' && !sequential) };
   }
 
+  /* Do two circular bearing ranges overlap? Mirrors serp_arc_overlaps() in
+   * irrigoto.c so the preview groups arcs into lobes the same way the
+   * firmware's plan builder does. */
+  function spanOverlaps(a, b) {
+    var step = 2.0;
+    for (var t = 0; t <= a.span; t += step) {
+      var off = (((a.lo + t) % 360) - b.lo + 360) % 360;
+      if (off <= b.span) return true;
+    }
+    return false;
+  }
+
+  /* Lobe-major ordering for Sections: finish one side of the zone outer ->
+   * inner, then ONE hop to the next, instead of crossing on every ring.
+   * Lobes are the outermost waterable ring's arcs; going inward they merge,
+   * so an arc belongs to the lowest-index lobe it overlaps and merged rings
+   * are swept exactly once, under the first section. Mirrors the firmware. */
+  function orderSections(ringsIn) {
+    /* b541: lobes come from the ring with the MOST arcs, not the outermost --
+     * a zone with a waist is one arc at the outer rings and splits inward, so
+     * reading the outermost ring found a single lobe and disabled sections. */
+    var lobes = null, i, j;
+    for (i = 0; i < ringsIn.length; i++) {
+      if (!lobes || ringsIn[i].spans.length > lobes.length) lobes = ringsIn[i].spans;
+    }
+    if (!lobes || lobes.length < 2) return null;   /* nothing to section */
+    var out = [], visit = 0;
+    for (var L = 0; L < lobes.length; L++) {
+      for (i = 0; i < ringsIn.length; i++) {
+        var R = ringsIn[i], sub = [];
+        for (j = 0; j < R.spans.length; j++) {
+          var owner = -1;
+          for (var k = 0; k < lobes.length; k++)
+            if (spanOverlaps(R.spans[j], lobes[k])) { owner = k; break; }
+          if (owner < 0) owner = 0;
+          if (owner === L) sub.push(R.spans[j]);
+        }
+        if (!sub.length) continue;
+        out.push({ ring: R.ring, visit: visit++, throw_mm: R.throw_mm,
+                   cw: (out.length % 2) === 0, lobe: L, spans: sub });
+      }
+    }
+    /* A hop is dry whenever the next visit is a different ring or lobe. */
+    for (i = 0; i < out.length; i++)
+      out[i].dryReturn = (i > 0) && (out[i].lobe !== out[i - 1].lobe ||
+                                     out[i].cw === out[i - 1].cw);
+    return out.length ? out : null;
+  }
+
   /* Build everything needed to draw. `points` is [{deg, throw_mm}, ...]. */
   function build(points, opts) {
     opts = opts || {};
-    if (!points || points.length < 2) return null;
+    points = normPoints(points);
+    if (points.length < 2) return null;
     var actMax = opts.act_max_throw || 10058;
     var actMin = opts.act_min_throw || 0;
     var modeKey = (MODES[opts.mode] || MODES['1']).key;
@@ -189,10 +260,17 @@
         spans: ringSpans(points, arc, thr[ri])
       });
     }
+    /* b540: Sections reorders the visits lobe-major. Without this the preview
+     * drew Sections and Serpentine identically -- it claimed a behaviour the
+     * firmware has but the preview never modelled. */
+    var sectioned = (modeKey === 'sections') ? orderSections(rings) : null;
+    if (sectioned) rings = sectioned;
+
     return {
       modeKey: modeKey,
       modeLabel: (MODES[opts.mode] || MODES['1']).label,
       arc: arc,
+      lobes: sectioned ? (sectioned[sectioned.length - 1].lobe + 1) : 1,
       rings: rings,
       scale_mm: opts.scale_mm || (actMax + 914),
       orderVaries: plan.orderVaries,
@@ -365,7 +443,8 @@
     ctx.fillStyle = bg;
     ctx.beginPath(); ctx.arc(cx, cy, maxR, 0, Math.PI * 2); ctx.fill();
 
-    if (!points || points.length < 2) return false;
+    points = normPoints(points);
+    if (points.length < 2) return false;
     var geom = build(points, opts);
     if (!geom) return false;
 
@@ -401,8 +480,148 @@
     return at || true;
   }
 
+  /* ── Shared full-screen preview ────────────────────────────────────────
+   * One overlay, used by Zone Setup, the Water modal and each schedule entry,
+   * so the picture is identical wherever it is opened. `lockMode` fixes the
+   * mode to what the caller already chose (manual run / schedule entry) and
+   * hides the mode chips; Zone Setup leaves it unlocked so a zone can be
+   * compared across modes.
+   *
+   * open({points, act_max_throw, act_min_throw, mode, lockMode, title}) */
+  var OV_MODES = ['1', '5', '7', '8', '9'];
+  var ov = null;
+
+  function ovBuild() {
+    if (ov) return ov;
+    var el = document.createElement('div');
+    el.id = 'irr-path-ov';
+    el.innerHTML =
+      '<div class="ipo-bar">' +
+        '<span class="ipo-title"></span>' +
+        '<span class="ipo-modes"></span>' +
+        '<button class="ipo-btn ipo-pass">Pass 1</button>' +
+        '<button class="ipo-btn ipo-x" aria-label="Close">&#10005;</button>' +
+      '</div>' +
+      '<canvas class="ipo-cv" width="620" height="620"></canvas>' +
+      '<div class="ipo-scrub">' +
+        '<button class="ipo-btn ipo-play" aria-label="Play">&#9654;</button>' +
+        '<input type="range" min="0" max="1000" step="1" value="0" aria-label="Position along the path">' +
+        '<span class="ipo-at">start</span>' +
+      '</div>';
+    var css = document.createElement('style');
+    css.textContent =
+      '#irr-path-ov{display:none;position:fixed;inset:0;background:rgba(0,0,0,.88);' +
+        'z-index:300;align-items:center;justify-content:center;flex-direction:column;gap:12px;}' +
+      '#irr-path-ov.open{display:flex;}' +
+      '#irr-path-ov .ipo-cv{max-width:92vw;max-height:66vh;border-radius:50%;}' +
+      '#irr-path-ov .ipo-bar,#irr-path-ov .ipo-scrub{display:flex;gap:8px;align-items:center;' +
+        'width:min(92vw,620px);color:var(--text-mid);font-size:12px;}' +
+      '#irr-path-ov .ipo-title{flex:1;color:var(--text);}' +
+      '#irr-path-ov .ipo-modes{display:flex;gap:4px;}' +
+      '#irr-path-ov .ipo-btn{background:var(--btn);border:1px solid var(--border);' +
+        'color:var(--text);font-size:11px;padding:6px 10px;border-radius:6px;' +
+        'cursor:pointer;font-family:inherit;}' +
+      '#irr-path-ov .ipo-btn.sel{border-color:var(--green);background:var(--green-dim);color:var(--green);}' +
+      '#irr-path-ov .ipo-scrub input{flex:1;min-width:0;}' +
+      '#irr-path-ov .ipo-at{font-family:"Courier New",monospace;font-size:11px;' +
+        'min-width:96px;text-align:right;}';
+    document.head.appendChild(css);
+    document.body.appendChild(el);
+    ov = {
+      el: el,
+      cv: el.querySelector('.ipo-cv'),
+      title: el.querySelector('.ipo-title'),
+      modes: el.querySelector('.ipo-modes'),
+      pass: el.querySelector('.ipo-pass'),
+      play: el.querySelector('.ipo-play'),
+      range: el.querySelector('input'),
+      at: el.querySelector('.ipo-at'),
+      opts: null, mode: '7', passIdx: 0, t: 0, timer: null
+    };
+    el.addEventListener('click', function (e) { if (e.target === el) ovClose(); });
+    ov.el.querySelector('.ipo-x').addEventListener('click', ovClose);
+    ov.pass.addEventListener('click', function () {
+      ov.passIdx = (ov.passIdx + 1) % 4;
+      ov.pass.textContent = 'Pass ' + (ov.passIdx + 1);
+      ovDraw();
+    });
+    ov.range.addEventListener('input', function () { ov.t = +ov.range.value / 1000; ovDraw(); });
+    ov.play.addEventListener('click', ovPlay);
+    document.addEventListener('keydown', function (e) { if (e.key === 'Escape') ovClose(); });
+    return ov;
+  }
+
+  function ovPlay() {
+    if (ov.timer) { clearInterval(ov.timer); ov.timer = null; ov.play.innerHTML = '&#9654;'; return; }
+    ov.play.innerHTML = '&#9632;';
+    ov.timer = setInterval(function () {      /* ~8 s a pass, slow enough to follow */
+      ov.t += 1 / 240;
+      if (ov.t >= 1) { ov.t = 1; clearInterval(ov.timer); ov.timer = null; ov.play.innerHTML = '&#9654;'; }
+      ov.range.value = Math.round(ov.t * 1000);
+      ovDraw();
+    }, 33);
+  }
+
+  function ovClose() {
+    if (!ov) return;
+    if (ov.timer) { clearInterval(ov.timer); ov.timer = null; ov.play.innerHTML = '&#9654;'; }
+    ov.el.classList.remove('open');
+  }
+
+  function ovDraw() {
+    var o = {
+      mode: ov.mode, pass: ov.passIdx, scrub: ov.t,
+      act_max_throw: ov.opts.act_max_throw, act_min_throw: ov.opts.act_min_throw
+    };
+    var at = thumb(ov.cv, ov.opts.points, o);
+    var label = (MODES[ov.mode] || {}).label || '';
+    ov.title.textContent = (ov.opts.title ? ov.opts.title + ' \u00b7 ' : '') + label;
+    ov.at.textContent = (at && at.r_mm !== undefined)
+      ? (at.dry ? 'moving \u00b7 dry'
+                : 'ring ' + (at.ring + 1) + ' \u00b7 ' + (at.r_mm / 304.8).toFixed(1) + "'")
+      : (ov.t <= 0 ? 'start' : '');
+  }
+
+  function openPreview(opts) {
+    if (!opts) return false;
+    var pts = normPoints(opts.points);
+    if (pts.length < 2) return false;
+    ovBuild();
+    ov.opts = opts;
+    ov.opts.points = pts;
+    ov.mode = MODES[opts.mode] ? opts.mode : '7';
+    ov.passIdx = 0; ov.t = 0; ov.range.value = 0;
+    ov.pass.textContent = 'Pass 1';
+    /* Locked: the caller already chose the mode, so show it as a static chip
+     * rather than letting the preview disagree with the run that will happen. */
+    ov.modes.innerHTML = '';
+    if (opts.lockMode) {
+      var tag = document.createElement('span');
+      tag.className = 'ipo-btn sel';
+      tag.style.cursor = 'default';
+      tag.textContent = (MODES[ov.mode] || {}).label || '';
+      ov.modes.appendChild(tag);
+    } else {
+      OV_MODES.forEach(function (m) {
+        var b = document.createElement('button');
+        b.className = 'ipo-btn' + (m === ov.mode ? ' sel' : '');
+        b.textContent = (MODES[m] || {}).label || m;
+        b.addEventListener('click', function () {
+          ov.mode = m;
+          ov.modes.querySelectorAll('.ipo-btn').forEach(function (x) { x.classList.toggle('sel', x === b); });
+          ovDraw();
+        });
+        ov.modes.appendChild(b);
+      });
+    }
+    ov.el.classList.add('open');
+    ovDraw();
+    return true;
+  }
+
   root.IrrigotoPath = {
-    MODES: MODES, build: build, draw: draw, thumb: thumb,
+    openPreview: openPreview, closePreview: ovClose,
+    MODES: MODES, build: build, draw: draw, thumb: thumb, normPoints: normPoints,
     flatten: flatten, pointAt: pointAt, marker: marker,
     zoneArc: zoneArc, ringThrows: ringThrows, ringSpans: ringSpans,
     pointInZone: pointInZone
