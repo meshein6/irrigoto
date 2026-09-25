@@ -16243,6 +16243,95 @@ static esp_err_t api_time_handler(httpd_req_t *req)
     return ESP_OK;
 }
 
+// WiFi & power modal. GET returns the station credentials the device is using
+// plus the wake cycle; POST changes either part.
+//   GET  /api/wifi_power -> {"ssid","password","connected","rssi",
+//                            "always_on","awake_s","sleep_s"}
+//   POST always_on=0|1&awake_s=30..3600&sleep_s=30..3600   (any subset)
+//   POST ssid=..&password=..   saves the network through ESPHome's
+//        save_wifi_sta() (same store the captive portal uses; it overrides the
+//        compiled credentials from then on) and reboots to join it. If the new
+//        network can't be joined, ESPHome's fallback hotspot comes up as usual.
+// The password is returned in clear text to anyone on the LAN who can reach
+// the device, same trust model as the rest of this unauthenticated UI. No
+// CORS header, so other web pages can't read it from a browser.
+extern void irrigoto_wifi_save_sta(const char *ssid, const char *password);  // irrigoto.cpp
+
+static int json_escape(char *dst, size_t len, const char *src)
+{
+    size_t j = 0;
+    for (; *src && j + 7 < len; src++) {
+        unsigned char c = (unsigned char)*src;
+        if (c == '"' || c == '\\') { dst[j++] = '\\'; dst[j++] = (char)c; }
+        else if (c < 0x20)         { j += snprintf(dst + j, len - j, "\\u%04x", c); }
+        else                        { dst[j++] = (char)c; }
+    }
+    dst[j] = '\0';
+    return (int)j;
+}
+
+static esp_err_t api_wifi_power_handler(httpd_req_t *req)
+{
+    WEB_TOUCH();
+    HTTP_CONN_CLOSE(req);
+    httpd_resp_set_type(req, "application/json");
+    if (req->method == HTTP_POST) {
+        char b[400] = {0}, v[16] = {0};
+        int n = httpd_req_recv(req, b, sizeof(b) - 1);
+        if (n <= 0) { httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "empty body"); return ESP_OK; }
+
+        char ssid[192] = {0}, pass[192] = {0};
+        if (httpd_query_key_value(b, "ssid", ssid, sizeof(ssid)) == ESP_OK) {
+            httpd_query_key_value(b, "password", pass, sizeof(pass));
+            url_decode(ssid, 33);   // 32-char SSID max
+            url_decode(pass, 64);   // 63-char WPA passphrase max
+            if (!ssid[0]) {
+                httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "ssid required");
+                return ESP_OK;
+            }
+            if (pass[0] && strlen(pass) < 8) {
+                httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "password must be 8-63 characters (or empty for an open network)");
+                return ESP_OK;
+            }
+            httpd_resp_sendstr(req, "{\"ok\":true,\"rebooting\":true}");
+            INFO("WiFi: saving network \"%s\" and rebooting to join it", ssid);
+            vTaskDelay(pdMS_TO_TICKS(500));   // let the reply flush first
+            irrigoto_wifi_save_sta(ssid, pass);
+            vTaskDelay(pdMS_TO_TICKS(300));
+            esp_restart();
+            return ESP_OK;   // not reached
+        }
+        if (httpd_query_key_value(b, "always_on", v, sizeof(v)) == ESP_OK)
+            irrigoto_set_auto_sleep_enabled(atoi(v) == 0);
+        if (httpd_query_key_value(b, "awake_s", v, sizeof(v)) == ESP_OK)
+            irrigoto_set_inactivity_s((uint32_t)atoi(v));
+        if (httpd_query_key_value(b, "sleep_s", v, sizeof(v)) == ESP_OK)
+            irrigoto_set_sleep_duration_s((uint32_t)atoi(v));
+    }
+
+    wifi_config_t wc = {0};
+    esp_wifi_get_config(WIFI_IF_STA, &wc);
+    char ssid_raw[33] = {0}, pass_raw[65] = {0};
+    memcpy(ssid_raw, wc.sta.ssid, 32);
+    memcpy(pass_raw, wc.sta.password, 64);
+    char ssid_js[200], pass_js[400];
+    json_escape(ssid_js, sizeof(ssid_js), ssid_raw);
+    json_escape(pass_js, sizeof(pass_js), pass_raw);
+    wifi_ap_record_t ap = {0};
+    bool connected = (esp_wifi_sta_get_ap_info(&ap) == ESP_OK);
+
+    char buf[768];
+    int n = snprintf(buf, sizeof(buf),
+        "{\"ssid\":\"%s\",\"password\":\"%s\",\"connected\":%s,\"rssi\":%d,"
+        "\"always_on\":%s,\"awake_s\":%lu,\"sleep_s\":%lu}",
+        ssid_js, pass_js, connected ? "true" : "false", connected ? ap.rssi : 0,
+        irrigoto_get_auto_sleep_enabled() ? "false" : "true",
+        (unsigned long)irrigoto_get_inactivity_s(),
+        (unsigned long)irrigoto_get_sleep_duration_s());
+    httpd_resp_send(req, buf, n);
+    return ESP_OK;
+}
+
 // b447: HTTP auto-sleep toggle. The b437 baseline only exposes auto-sleep via
 // the HA switch; this lets the OTA flow re-enable it without HA. Wake-safe
 // (HTTP handler -- doesn't touch the boot/wake path the regression lives in).
@@ -18527,7 +18616,7 @@ static void zone_web_start(void)
     httpd_config_t cfg   = HTTPD_DEFAULT_CONFIG();
     cfg.server_port      = ZONE_WEB_PORT;
     cfg.ctrl_port        = ZONE_WEB_CTRL_PORT;
-    cfg.max_uri_handlers  = 76;  // b525: 74 -> 76 (/api/winter GET+POST); b522: 72 -> 74 (/api/fault_hold GET+POST); b512: 70 -> 72 (/api/uart_log GET+POST); b489: 68 -> 70, keeping the 2-slot margin over
+    cfg.max_uri_handlers  = 78;  // wifi & power modal: 76 -> 78 (/api/wifi_power GET+POST); b525: 74 -> 76 (/api/winter GET+POST); b522: 72 -> 74 (/api/fault_hold GET+POST); b512: 70 -> 72 (/api/uart_log GET+POST); b489: 68 -> 70, keeping the 2-slot margin over
                                  // the _Static_assert below.
                                  // MUST be set before httpd_start (cfg is copied there);
                                  // headroom over uris[] count -- _Static_assert below guards it.
@@ -18559,6 +18648,8 @@ static void zone_web_start(void)
         {.uri="/api/all",         .method=HTTP_GET,  .handler=api_all_handler},
         {.uri="/api/auto_sleep",  .method=HTTP_GET,  .handler=api_auto_sleep_handler},  // b447
         {.uri="/api/auto_sleep",  .method=HTTP_POST, .handler=api_auto_sleep_handler},  // b447
+        {.uri="/api/wifi_power",  .method=HTTP_GET,  .handler=api_wifi_power_handler},  // wifi & power modal
+        {.uri="/api/wifi_power",  .method=HTTP_POST, .handler=api_wifi_power_handler},  // wifi & power modal
         {.uri="/api/detail_log",  .method=HTTP_GET,  .handler=api_detail_log_handler},
         {.uri="/api/uart_log",    .method=HTTP_GET,  .handler=api_uart_log_handler},   // b512
         {.uri="/api/uart_log",    .method=HTTP_POST, .handler=api_uart_log_handler},   // b512
@@ -18622,7 +18713,7 @@ static void zone_web_start(void)
         {.uri="/fs/upload",             .method=HTTP_POST, .handler=fs_upload_handler},
         {.uri="/fs/delete",             .method=HTTP_POST, .handler=fs_delete_handler},
     };
-    _Static_assert(sizeof(uris)/sizeof(uris[0]) <= 74,   // b525: 72 -> 74 (/api/winter GET+POST); b522: 70 -> 72 (/api/fault_hold GET+POST); b512: 68 -> 70 (/api/uart_log GET+POST); b489: 66 -> 68
+    _Static_assert(sizeof(uris)/sizeof(uris[0]) <= 76,   // wifi & power modal: 74 -> 76 (/api/wifi_power GET+POST); b525: 72 -> 74 (/api/winter GET+POST); b522: 70 -> 72 (/api/fault_hold GET+POST); b512: 68 -> 70 (/api/uart_log GET+POST); b489: 66 -> 68
                    "uris[] exceeds cfg.max_uri_handlers -- raise it before httpd_start");
     for (size_t i = 0; i < sizeof(uris)/sizeof(uris[0]); i++)
         httpd_register_uri_handler(s_zone_server, &uris[i]);
@@ -21040,6 +21131,24 @@ void irrigoto_set_inactivity_minutes(uint32_t minutes)
     TOUCH_ACTIVITY();
     INFO("Inactivity threshold set to %u min (persisted, timer reset)",
          (unsigned)minutes);
+}
+
+uint32_t irrigoto_get_inactivity_s(void)
+{
+    return s_inactivity_ms / 1000u;
+}
+
+// Seconds flavour of the inactivity setter, used by the web WiFi & power
+// modal. Same NVS key and the same 30-3600 s range the boot loader accepts.
+void irrigoto_set_inactivity_s(uint32_t seconds)
+{
+    if (seconds < 30u)   seconds = 30u;
+    if (seconds > 3600u) seconds = 3600u;
+    s_inactivity_ms = seconds * 1000u;
+    pm_nvs_save_u32("pm_inact_s", seconds);
+    TOUCH_ACTIVITY();
+    INFO("Inactivity threshold set to %u s (persisted, timer reset)",
+         (unsigned)seconds);
 }
 
 uint32_t irrigoto_get_sleep_duration_s(void)

@@ -110,12 +110,31 @@ section{margin-bottom:18px;}
 .dev-val{color:var(--text);font-family:'Courier New',monospace;font-size:12px;}
 .cal-desc{font-size:12px;color:var(--text-mid);margin-bottom:10px;line-height:1.5;}
 /* Water modal */
-#modal-bg{display:none;position:fixed;inset:0;background:rgba(0,0,0,.7);
+#modal-bg,#wp-bg{display:none;position:fixed;inset:0;background:rgba(0,0,0,.7);
   z-index:100;align-items:flex-end;justify-content:center;}
-#modal-bg.open{display:flex;}
-#modal{background:var(--bg2);border:1px solid var(--border);
+#modal-bg.open,#wp-bg.open{display:flex;}
+#modal,#wp{background:var(--bg2);border:1px solid var(--border);
   border-radius:var(--radius) var(--radius) 0 0;padding:20px;width:100%;
-  max-width:480px;}
+  max-width:480px;max-height:92vh;overflow-y:auto;}
+/* WiFi & power modal */
+.wp-sec{font-size:11px;letter-spacing:.12em;text-transform:uppercase;color:var(--text-mid);margin:4px 0 8px;}
+.wp-field{display:flex;flex-direction:column;gap:4px;margin-bottom:10px;}
+.wp-field label{font-size:12px;color:var(--text-mid);}
+.wp-in{display:flex;align-items:center;gap:6px;background:var(--bg3);border:1px solid var(--border);
+  border-radius:var(--radius-sm);padding:0 10px;}
+.wp-in input{flex:1;min-width:0;background:transparent;border:0;color:var(--text);font-size:14px;
+  padding:9px 0;font-family:inherit;}
+.wp-in input:focus{outline:none;}
+.wp-in u{text-decoration:none;color:var(--text-mid);font-size:12px;}
+.wp-in button{background:none;border:0;color:var(--text-mid);font-size:12px;cursor:pointer;padding:4px;}
+.wp-row{display:flex;gap:10px;}
+.wp-row .wp-field{flex:1;}
+.wp-hint{font-size:11px;color:var(--text-mid);line-height:1.5;margin:-2px 0 12px;}
+.wp-chips{display:flex;gap:6px;margin-bottom:12px;flex-wrap:wrap;}
+.wp-chips .btn{flex:1;justify-content:center;font-size:12px;padding:8px 6px;}
+.wp-chips .btn.sel{border-color:var(--green);background:var(--green-dim);color:var(--green);}
+.wp-status{font-size:12px;color:var(--text-mid);text-align:center;margin-top:8px;min-height:16px;}
+.wp-div{border-top:1px solid var(--border);margin:14px 0;}
 .modal-title{font-size:16px;font-weight:600;margin-bottom:4px;}
 .modal-sub{font-size:12px;color:var(--text-mid);margin-bottom:18px;}
 .mode-grid{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-bottom:18px;}
@@ -222,6 +241,9 @@ section{margin-bottom:18px;}
         <span class="dev-label">Winter sleep</span><span class="dev-val" id="d-winter">Off</span>
       </div>
       <div class="zone-actions" style="margin-top:10px">
+        <button class="btn" onclick="openWp()">&#9881; WiFi &amp; power</button>
+      </div>
+      <div class="zone-actions" style="margin-top:10px">
         <button class="btn" id="ap-mode-btn" onclick="apMode()">&#128246; AP Setup Mode</button>
         <button class="btn" id="reconnect-btn" style="display:none" onclick="reconnectNet()">&#128268; Reconnect to network</button>
       </div>
@@ -233,6 +255,43 @@ section{margin-bottom:18px;}
 </main>
 
 <!-- Water modal -->
+<div id="wp-bg" onclick="if(event.target===this)closeWp()">
+  <div id="wp">
+    <div class="modal-title">WiFi &amp; power</div>
+    <div class="modal-sub">Network the device joins, and how long it stays awake between sleeps.</div>
+
+    <div class="wp-sec">Network</div>
+    <div class="wp-field"><label for="wp-ssid">WiFi name (SSID)</label>
+      <div class="wp-in"><input id="wp-ssid" maxlength="32" autocomplete="off" autocapitalize="off" spellcheck="false"></div></div>
+    <div class="wp-field"><label for="wp-pass">Password</label>
+      <div class="wp-in"><input id="wp-pass" type="password" maxlength="63" autocomplete="off" autocapitalize="off" spellcheck="false">
+        <button type="button" id="wp-eye" onclick="wpEye()">show</button></div></div>
+    <div class="wp-hint" id="wp-net-hint">&mdash;</div>
+    <div class="modal-actions"><button class="btn" id="wp-net-btn" onclick="wpSaveNet()">Save network &amp; reboot</button></div>
+    <div class="wp-status" id="wp-net-status"></div>
+
+    <div class="wp-div"></div>
+    <div class="wp-sec">Wake period</div>
+    <div class="wp-chips">
+      <button class="btn" data-p="on" onclick="wpPreset('on')">Always on</button>
+      <button class="btn" data-p="300" onclick="wpPreset('default',300,300)">300 s / 300 s (default)</button>
+      <button class="btn" data-p="custom" onclick="wpPreset('custom')">Custom</button>
+    </div>
+    <div class="wp-row" id="wp-cycle">
+      <div class="wp-field"><label for="wp-awake">Stay awake after last activity</label>
+        <div class="wp-in"><input id="wp-awake" type="number" min="30" max="3600" step="1" inputmode="numeric" oninput="wpCycleHint()"><u>seconds</u></div></div>
+      <div class="wp-field"><label for="wp-sleep">Then sleep for</label>
+        <div class="wp-in"><input id="wp-sleep" type="number" min="30" max="3600" step="1" inputmode="numeric" oninput="wpCycleHint()"><u>seconds</u></div></div>
+    </div>
+    <div class="wp-hint" id="wp-cycle-hint"></div>
+    <div class="modal-actions">
+      <button class="btn" onclick="closeWp()">Close</button>
+      <button class="btn btn-primary" id="wp-pow-btn" onclick="wpSavePower()">Save wake period</button>
+    </div>
+    <div class="wp-status" id="wp-pow-status"></div>
+  </div>
+</div>
+
 <div id="modal-bg" onclick="if(event.target===this)closeModal()">
   <div id="modal">
     <div class="modal-title" id="modal-zone-name">Water Zone</div>
@@ -433,6 +492,93 @@ function openModal(id, name){
   document.getElementById('modal-bg').classList.add('open');
 }
 function closeModal(){ document.getElementById('modal-bg').classList.remove('open'); }
+
+// ── WiFi & power modal ───────────────────────────────────────────────────────
+// Everything here is in SECONDS. Awake = how long the device stays up after the
+// last activity (web page, command, motor use); sleep = the deep-sleep nap
+// before it wakes again. A scheduled run always shortens the nap so it wakes
+// in time, and watering / calibration / OTA always hold it awake.
+let wpAlwaysOn=false, wpSsid0='';
+const wpEl=id=>document.getElementById(id);
+function wpClampS(v){ v=Math.round(+v); return isFinite(v)?Math.min(3600,Math.max(30,v)):300; }
+async function openWp(){
+  wpEl('wp-net-status').textContent=''; wpEl('wp-pow-status').textContent='';
+  wpEl('wp-bg').classList.add('open');
+  try{
+    const d=await fetch('/api/wifi_power',{cache:'no-store'}).then(r=>r.json());
+    wpSsid0=d.ssid||'';
+    wpEl('wp-ssid').value=wpSsid0;
+    wpEl('wp-pass').value=d.password||'';
+    wpEl('wp-pass').type='password'; wpEl('wp-eye').textContent='show';
+    wpEl('wp-net-hint').textContent = d.connected
+      ? 'Connected to “'+wpSsid0+'” ('+d.rssi+' dBm).'
+      : 'Not connected to a network right now.';
+    wpEl('wp-awake').value=d.awake_s; wpEl('wp-sleep').value=d.sleep_s;
+    wpAlwaysOn=!!d.always_on;
+    wpMarkPreset();
+  }catch(e){ wpEl('wp-net-hint').textContent='Could not read settings: '+e.message; }
+}
+function closeWp(){ wpEl('wp-bg').classList.remove('open'); }
+function wpEye(){
+  const p=wpEl('wp-pass'), show=p.type==='password';
+  p.type=show?'text':'password'; wpEl('wp-eye').textContent=show?'hide':'show';
+}
+function wpPreset(p,awake,sleep){
+  if(p==='on'){ wpAlwaysOn=true; }
+  else { wpAlwaysOn=false; if(p!=='custom'){ wpEl('wp-awake').value=awake; wpEl('wp-sleep').value=sleep; } }
+  wpMarkPreset();
+}
+function wpMarkPreset(){
+  const a=wpClampS(wpEl('wp-awake').value), s=wpClampS(wpEl('wp-sleep').value);
+  const cur = wpAlwaysOn ? 'on' : (a===300&&s===300 ? '300' : 'custom');
+  document.querySelectorAll('.wp-chips .btn').forEach(b=>b.classList.toggle('sel',b.dataset.p===cur));
+  wpEl('wp-cycle').style.opacity = wpAlwaysOn ? '.4' : '';
+  wpEl('wp-awake').disabled = wpEl('wp-sleep').disabled = wpAlwaysOn;
+  wpCycleHint();
+}
+function wpCycleHint(){
+  const h=wpEl('wp-cycle-hint');
+  if(wpAlwaysOn){ h.textContent='Never sleeps. Reachable at any time, but uses several times more battery than a sleep cycle.'; return; }
+  const a=wpClampS(wpEl('wp-awake').value), s=wpClampS(wpEl('wp-sleep').value);
+  h.textContent='Awake at least '+a+' s after the last activity, then asleep '+s+' s. Awake about '+
+    Math.round(100*a/(a+s))+'% of the time when idle. Each value 30–3600 seconds.';
+  document.querySelectorAll('.wp-chips .btn').forEach(b=>b.classList.toggle('sel',
+    b.dataset.p===(a===300&&s===300?'300':'custom')));
+}
+async function wpSavePower(){
+  const st=wpEl('wp-pow-status'), btn=wpEl('wp-pow-btn');
+  const a=wpClampS(wpEl('wp-awake').value), s=wpClampS(wpEl('wp-sleep').value);
+  wpEl('wp-awake').value=a; wpEl('wp-sleep').value=s;
+  btn.disabled=true; st.style.color=''; st.textContent='Saving…';
+  try{
+    const d=await fetch('/api/wifi_power',{method:'POST',
+      headers:{'Content-Type':'application/x-www-form-urlencoded'},
+      body:'always_on='+(wpAlwaysOn?1:0)+'&awake_s='+a+'&sleep_s='+s}).then(r=>r.json());
+    wpAlwaysOn=!!d.always_on; wpEl('wp-awake').value=d.awake_s; wpEl('wp-sleep').value=d.sleep_s;
+    wpMarkPreset();
+    st.style.color='var(--green)';
+    st.textContent = d.always_on ? 'Saved: always on.' : 'Saved: awake '+d.awake_s+' s, sleep '+d.sleep_s+' s.';
+  }catch(e){ st.style.color='#f87171'; st.textContent='Save failed: '+e.message; }
+  btn.disabled=false;
+}
+async function wpSaveNet(){
+  const st=wpEl('wp-net-status'), ssid=wpEl('wp-ssid').value.trim(), pass=wpEl('wp-pass').value;
+  if(!ssid){ st.style.color='#f87171'; st.textContent='Enter a WiFi name.'; return; }
+  if(pass && (pass.length<8 || pass.length>63)){ st.style.color='#f87171'; st.textContent='Password must be 8–63 characters (or empty for an open network).'; return; }
+  if(!confirm('Save “'+ssid+'” and reboot?\n\nThe device will restart and join this network. '+
+      'If it can’t connect, it opens its fallback hotspot after about a minute, '+
+      'where you can enter the details again.')) return;
+  wpEl('wp-net-btn').disabled=true; st.style.color=''; st.textContent='Saving…';
+  try{
+    const r=await fetch('/api/wifi_power',{method:'POST',
+      headers:{'Content-Type':'application/x-www-form-urlencoded'},
+      body:'ssid='+encodeURIComponent(ssid)+'&password='+encodeURIComponent(pass)});
+    if(!r.ok) throw new Error(await r.text());
+    st.style.color='var(--green)';
+    st.textContent='Saved. Rebooting to join “'+ssid+'”. '+
+      (ssid===wpSsid0 ? 'This page reconnects in about 30 seconds.' : 'Open the device on that network once it’s up.');
+  }catch(e){ st.style.color='#f87171'; st.textContent='Save failed: '+e.message; wpEl('wp-net-btn').disabled=false; }
+}
 function selMode(btn){
   document.querySelectorAll('.mode-btn').forEach(b=>b.classList.remove('sel'));
   btn.classList.add('sel'); selModeDat=btn.dataset.mode;

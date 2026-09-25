@@ -411,6 +411,11 @@ void irrigoto_sleep_now_with_reason(uint32_t duration_s, const char *reason);
 uint32_t irrigoto_get_inactivity_minutes(void);
 void     irrigoto_set_inactivity_minutes(uint32_t minutes);
 
+/** Inactivity threshold in seconds (30–3600). Same setting as the minutes
+ *  accessors above, for callers that need sub-minute resolution. */
+uint32_t irrigoto_get_inactivity_s(void);
+void     irrigoto_set_inactivity_s(uint32_t seconds);
+
 /** Sleep duration on auto-sleep wake, seconds (30–3600). */
 uint32_t irrigoto_get_sleep_duration_s(void);
 void     irrigoto_set_sleep_duration_s(uint32_t seconds);
