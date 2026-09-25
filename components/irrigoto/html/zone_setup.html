@@ -324,7 +324,9 @@ header{
   <button class="sbtn" onclick="doAct('undo')">⌫ Undo</button>
   <button class="sbtn" onclick="doAct('clear')">✕ Clear</button>
   <button class="sbtn" id="btn-zoom" onclick="toggleZoom()" title="Fit the map to this zone, or show the full reach">⛶ Zoom</button>
-  <button class="sbtn" id="btn-path" onclick="togglePath()">◎ Path</button>
+  <button class="sbtn" id="btn-path" onclick="togglePath()"
+          oncontextmenu="cyclePathMode();return false;"
+          title="Tap to show the path; long-press to change mode">◎ Path</button>
   <button class="sbtn" id="btn-heatmap" onclick="toggleHeatmap()">🌡 Depth</button>
   <button class="sbtn" id="btn-edit" onclick="toggleEdit()">✎ Edit</button>
 </div>
@@ -413,6 +415,14 @@ let waterTrail = [];
 let lastWaterBearing = null;
 let showPath = false;
 let ringOrder = 0;   // b535: 0 auto, 1 sequential -- saved with the zone
+let pathMode = '7';  // b535: which mode the Path view draws (web digit)
+function cyclePathMode(){
+  const order = ['1','5','7','8'];
+  pathMode = order[(order.indexOf(pathMode) + 1) % order.length];
+  const b = document.getElementById('btn-path');
+  if (b) b.innerHTML = '\u25ce ' + (IrrigotoPath.MODES[pathMode] || {label:'Path'}).label;
+  draw();
+}
 function selRingOrder(btn){
   ringOrder = +btn.dataset.ro;
   document.querySelectorAll('.ro').forEach(b => b.classList.toggle('sel', b === btn));
@@ -785,82 +795,19 @@ function drawHeatMap(W, H, cx, cy, maxR) {
 
 }
 
+// b535: the ring/arc geometry moved to the shared /path.js module, so this
+// page, the Water modal and each schedule entry all draw from one copy. The
+// old local version also alternated direction every ring, which is only true
+// for Serpentine -- IrrigotoPath.planOrder gets it right per mode.
 function drawPath(W, H, cx, cy, maxR) {
-  if (ST.points.length < 2) return;
-  function pointInZone(bearing, r_mm) {
-    const px=r_mm*Math.sin(bearing*Math.PI/180),py=r_mm*Math.cos(bearing*Math.PI/180);
-    let crosses=0;
-    const n=ST.points.length;
-    for(let i=0;i<n;i++){
-      const j=(i+1)%n,pi=ST.points[i],pj=ST.points[j];
-      const x1=pi.throw_mm*Math.sin(pi.deg*Math.PI/180)-px,y1=pi.throw_mm*Math.cos(pi.deg*Math.PI/180)-py;
-      const x2=pj.throw_mm*Math.sin(pj.deg*Math.PI/180)-px,y2=pj.throw_mm*Math.cos(pj.deg*Math.PI/180)-py;
-      if((y1>0)!==(y2>0)){const t=y1/(y1-y2);if(x1+t*(x2-x1)>0)crosses++;}
-    }
-    return(crosses%2===1);
-  }
-  const sdegs=ST.points.map(p=>p.deg).sort((a,b)=>a-b);
-  let mg=0,gi=0;
-  for(let i=0;i<sdegs.length;i++){const n=i<sdegs.length-1?sdegs[i+1]:sdegs[0]+360;if(n-sdegs[i]>mg){mg=n-sdegs[i];gi=i;}}
-  let arcStart=sdegs[(gi+1)%sdegs.length],arcEnd=sdegs[gi];
-  let arcSpan=((arcEnd-arcStart+360)%360)||360;
-  const actMax=ST.act_max_throw||10058;
-  const zoneMax=Math.max(...ST.points.map(p=>p.throw_mm));
-  const zoneMin=(ST.act_min_throw&&ST.act_min_throw>50)?ST.act_min_throw:Math.min(...ST.points.map(p=>p.throw_mm));
-  const zoneThrowMin2=Math.min(...ST.points.map(p=>p.throw_mm));
-  // Sprinkler-in-center: all walk points at same throw => gap is not an exclusion
-  const pathSIC=zoneMax>0&&(zoneMax-zoneThrowMin2)/zoneMax<0.05;
-  if(pathSIC){arcStart=0;arcSpan=360;}
-  // Origin-inside-polygon: force 360 deg arc so polygon boundary clips coverage
-  const pathOriginInside=pointInZone(0,1);
-  if(!pathSIC&&pathOriginInside){arcStart=0;arcSpan=360;}
-  // b435: spanned-gap guard (see drawHeatMap) -- a long straight edge can
-  // span the largest vertex-bearing gap; don't window it out of the path.
-  if(arcSpan<360&&mg>0){
-    let spanned=false;
-    for(let k=1;k<=3;k++){
-      const gb=(sdegs[gi]+mg*k/4)%360;
-      const gbs=Math.sin(gb*Math.PI/180),gbc=Math.cos(gb*Math.PI/180);
-      let best=0;
-      for(let i=0;i<ST.points.length;i++){
-        const j=(i+1)%ST.points.length,pi=ST.points[i],pj=ST.points[j];
-        const x1=pi.throw_mm*Math.sin(pi.deg*Math.PI/180),y1=pi.throw_mm*Math.cos(pi.deg*Math.PI/180);
-        const x2=pj.throw_mm*Math.sin(pj.deg*Math.PI/180),y2=pj.throw_mm*Math.cos(pj.deg*Math.PI/180);
-        const dx=x2-x1,dy=y2-y1,det=gbc*dx-gbs*dy;
-        if(Math.abs(det)<1e-6)continue;
-        const s=(dx*y1-dy*x1)/det,u=(gbs*y1-gbc*x1)/det;
-        if(s>0.5&&u>=0&&u<=1&&s>best)best=s;
-      }
-      if(best>=461)spanned=true;
-    }
-    if(spanned){arcStart=0;arcSpan=360;}
-  }
-  const rings=[];let t=zoneMax;
-  while(t>=zoneMin&&rings.length<36){rings.push(t);t-=Math.max(700*(t/actMax),80);}
-  if(!rings.length)return;
-  // Inner rings below zoneMin for sprinkler-inside-polygon zones
-  if(!pathSIC&&pathOriginInside&&zoneMin>461){
-    while(t>461&&rings.length<36){rings.push(t);t-=Math.max(700*(t/actMax),80);}
-  }
-  const STEP=0.5;
-  for(let ri=0;ri<rings.length;ri++){
-    const thr=rings[ri],r=(thr/_edScale())*maxR;
-    const cw=(ri%2===0),al=0.70-0.30*(ri/(rings.length-1||1));
-    const spans=[];let spanStart=null;
-    for(let o=0;o<=arcSpan+STEP;o+=STEP){
-      const bearing=(arcStart+o)%360,inside=pointInZone(bearing,thr);
-      if(inside&&spanStart===null)spanStart=o;
-      if(!inside&&spanStart!==null){spans.push({lo:(arcStart+spanStart+360)%360,span:o-spanStart});spanStart=null;}
-    }
-    if(spanStart!==null)spans.push({lo:(arcStart+spanStart+360)%360,span:arcSpan-spanStart});
-    for(const {lo,span} of spans){
-      if(span<0.5)continue;
-      const sa=(lo-90)*Math.PI/180;
-      ctx.beginPath();ctx.arc(cx,cy,r,sa,sa+span*Math.PI/180,false);
-      ctx.strokeStyle=cw?'rgba(80,180,255,'+al+')':'rgba(255,160,60,'+al+')';
-      ctx.lineWidth=1.5;ctx.setLineDash([]);ctx.stroke();
-    }
-  }
+  if (ST.points.length < 2 || typeof IrrigotoPath === 'undefined') return;
+  const geom = IrrigotoPath.build(ST.points, {
+    mode: pathMode, pass: 0,
+    act_max_throw: ST.act_max_throw || 10058,
+    act_min_throw: ST.act_min_throw || 0,
+    sequential: ringOrder === 1,
+  });
+  IrrigotoPath.draw(ctx, geom, {cx: cx, cy: cy, maxR: maxR, scale_mm: _edScale()});
 }
 
 function resizeCanvas(){

@@ -7,6 +7,7 @@ R"LANDHTML(
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no">
 <title>irrigoto</title>
+<script src="/path.js"></script>
 <script>
 // Apply theme before body renders to avoid flash. localStorage = instant
 // cache; /api/theme = source of truth (NVS-backed).
@@ -145,6 +146,22 @@ section{margin-bottom:18px;}
   padding:10px 12px;margin:-8px 0 14px;}
 .mode-help.show{display:block;}
 .mode-help b{color:var(--text);}
+/* Path preview (b535) */
+#path-row{display:flex;gap:12px;align-items:center;margin:0 0 14px;}
+#path-thumb{flex-shrink:0;cursor:pointer;border-radius:50%;}
+.path-note{flex:1;min-width:0;font-size:11px;color:var(--text-mid);line-height:1.5;}
+.path-note b{display:block;color:var(--text);font-size:12px;margin-bottom:2px;}
+.path-note .pick{margin-top:6px;padding:5px 10px;font-size:11px;display:inline-block;width:auto;}
+#path-full{display:none;position:fixed;inset:0;background:rgba(0,0,0,.88);z-index:200;
+  align-items:center;justify-content:center;flex-direction:column;gap:12px;}
+#path-full.open{display:flex;}
+#path-full canvas{max-width:92vw;max-height:70vh;border-radius:50%;}
+#path-full .pf-bar{display:flex;gap:8px;align-items:center;color:var(--text-mid);font-size:12px;}
+#path-full .pick{width:auto;padding:7px 12px;}
+.pf-scrub{display:flex;gap:10px;align-items:center;width:min(92vw,620px);}
+.pf-scrub input[type=range]{flex:1;}
+#pf-at{font-family:'Courier New',monospace;font-size:11px;color:var(--text-mid);
+  min-width:96px;text-align:right;}
 .modal-actions .btn{flex:1;justify-content:center;}
 #modal-status{font-size:12px;color:var(--text-mid);text-align:center;
   margin-top:10px;min-height:18px;}
@@ -273,6 +290,16 @@ section{margin-bottom:18px;}
       <div class="pick-lbl">Depth</div>
       <div class="pick-grid depth" id="depth-pick"></div>
     </div>
+    <!-- b535: what path this mode will take over the zone -->
+    <div id="path-row">
+      <canvas id="path-thumb" width="128" height="128" onclick="openPathFull()"
+              title="Tap for a bigger view"></canvas>
+      <div class="path-note">
+        <b id="path-mode">Path</b>
+        <span id="path-desc"></span>
+        <button class="pick" onclick="openPathFull()">View</button>
+      </div>
+    </div>
     <div id="chase-row" style="display:none;margin:-6px 0 18px;padding:10px 12px;border:1px solid var(--border);border-radius:var(--radius-sm);background:var(--btn);font-size:12px;">
       <label for="chase-dur" style="display:block;color:var(--text-mid);margin-bottom:6px;">
         Chase duration
@@ -380,7 +407,9 @@ function saveDeviceName(val) {
     });
 }
 
+let _zoneCache = {};   // b535: id -> zone record, for the path preview
 function renderZones(zones){
+  (zones||[]).forEach(z => { _zoneCache[z.id] = z; });
   const el=document.getElementById('zone-list');
   if(!zones||!zones.length){
     el.innerHTML='<div class="empty">No zones saved yet. Use zone setup to walk a zone.</div>';return;
@@ -430,6 +459,7 @@ function renderZones(zones){
 // ── Water modal ───────────────────────────────────────────────────────────────
 function openModal(id, name){
   selZoneId=id;
+  pathZone = (_zoneCache && _zoneCache[id]) || null;   // b535
   document.getElementById('modal-zone-name').textContent='Water: '+name;
   document.getElementById('modal-status').textContent='';
   document.getElementById('start-btn').disabled=false;
@@ -476,6 +506,7 @@ function selMode(btn){
 }
 // Chase shows its duration slider; Chase and Demo have no depth.
 function applyModeVisibility(){
+  renderPathThumb();
   const chase = (selModeDat === 'c'), demo = (selModeDat === 'd');
   document.getElementById('chase-row').style.display = chase ? 'block' : 'none';
   document.getElementById('depth-block').style.display = (chase || demo) ? 'none' : '';
@@ -490,6 +521,91 @@ function toggleModeHelp(){
   help.innerHTML = on ? (MODE_HELP[selModeDat] || '') : '';
   if (btn) btn.setAttribute('aria-expanded', on ? 'true' : 'false');
 }
+// ── Path preview (b535) ─────────────────────────────────────────────────────
+// Geometry comes from the shared /path.js module; zone points and reach are
+// cached from the /api/all poll, so opening the modal costs no extra request.
+const PATH_DESC = {
+  pulse:      'Outer ring inward, one ring at a time, always the same way round. Dashed lines are the dry swing back to the start of the next ring.',
+  gentle:     'Outer ring inward, one direction per pass, flipping each pass. Many light passes.',
+  smooth:     'Drawn outer to inner, but the real order is chosen during the run from how much each ring still needs.',
+  serpentine: 'Out and back without stopping: direction flips every ring, and passes alternate inward and outward.',
+  chase:      'No watering path -- the nozzle chases within the zone.',
+  demo:       'Max-speed sweep, not tracked as watering.'
+};
+let pathZone = null;   // {points, act_max_throw, act_min_throw, ring_order}
+let pfPassIdx = 0;
+
+function zonePathOpts(pass){
+  return { mode: selModeDat, pass: pass|0,
+           act_max_throw: (pathZone && pathZone.act_max_throw) || 10058,
+           act_min_throw: (pathZone && pathZone.act_min_throw) || 0,
+           sequential: !!(pathZone && +pathZone.ring_order === 1) };
+}
+function renderPathThumb(){
+  const row = document.getElementById('path-row');
+  if (!row || typeof IrrigotoPath === 'undefined') return;
+  const pts = pathZone && pathZone.points;
+  if (!pts || pts.length < 2) { row.style.display = 'none'; return; }
+  row.style.display = 'flex';
+  const o = zonePathOpts(0); o.thumb = true;
+  IrrigotoPath.thumb(document.getElementById('path-thumb'), pts, o);
+  const g = IrrigotoPath.build(pts, o);
+  const key = g ? g.modeKey : 'pulse';
+  document.getElementById('path-mode').textContent =
+    (IrrigotoPath.MODES[selModeDat] || {label:'Path'}).label + ' path'
+    + (g && g.rings.length ? ' \u00b7 ' + g.rings.length + ' rings' : '');
+  document.getElementById('path-desc').textContent = PATH_DESC[key] || '';
+}
+function openPathFull(){
+  if (!pathZone || !pathZone.points || pathZone.points.length < 2) return;
+  pfPassIdx = 0; pfT = 0;
+  const sl = document.getElementById('pf-scrub'); if (sl) sl.value = 0;
+  document.getElementById('path-full').classList.add('open');
+  renderPathFull();
+}
+function closePathFull(){
+  if (pfTimer) { clearInterval(pfTimer); pfTimer = null; }
+  const b = document.getElementById('pf-play'); if (b) b.innerHTML = '&#9654;';
+  document.getElementById('path-full').classList.remove('open');
+}
+function pfPass(d){ pfPassIdx = Math.max(0, Math.min(9, pfPassIdx + d)); renderPathFull(); }
+let pfT = 0, pfTimer = null;
+function renderPathFull(){
+  const cv = document.getElementById('path-full-cv');
+  if (!cv || typeof IrrigotoPath === 'undefined') return;
+  const o = zonePathOpts(pfPassIdx);
+  o.scrub = pfT;
+  const at = IrrigotoPath.thumb(cv, pathZone.points, o);
+  document.getElementById('pf-title').textContent =
+    (IrrigotoPath.MODES[selModeDat] || {label:''}).label + ' \u00b7 pass ' + (pfPassIdx + 1);
+  // Where the stream is pointing right now, in the same units as the map.
+  const lbl = document.getElementById('pf-at');
+  if (lbl) {
+    if (at && at.r_mm !== undefined) {
+      lbl.textContent = at.dry
+        ? 'moving \u00b7 dry'
+        : 'ring ' + (at.ring + 1) + ' \u00b7 ' + (at.r_mm / 304.8).toFixed(1) + "'";
+    } else lbl.textContent = pfT <= 0 ? 'start' : '';
+  }
+}
+function pfScrub(t){ pfT = t; renderPathFull(); }
+function pfPlay(){
+  const btn = document.getElementById('pf-play');
+  if (pfTimer) { clearInterval(pfTimer); pfTimer = null; btn.innerHTML = '&#9654;'; return; }
+  btn.innerHTML = '&#9632;';
+  // ~8 s for a full pass, which is slow enough to follow.
+  pfTimer = setInterval(() => {
+    pfT += 1 / 240;
+    if (pfT >= 1) { pfT = 1; clearInterval(pfTimer); pfTimer = null; btn.innerHTML = '&#9654;'; }
+    const sl = document.getElementById('pf-scrub');
+    if (sl) sl.value = Math.round(pfT * 1000);
+    renderPathFull();
+  }, 33);
+}
+document.addEventListener('keydown', e => {
+  if (e.key === 'Escape') closePathFull();
+});
+
 function saveModePrefs(){
   try { localStorage.setItem('irrigoto_mode', JSON.stringify({mode:selModeDat, depth:selDepth})); } catch(_){}
 }
@@ -907,6 +1023,22 @@ async function refreshSchedule(){
 }
 refreshSchedule(); setInterval(refreshSchedule, 30000);
 </script>
+<div id="path-full" onclick="if(event.target===this)closePathFull()">
+  <div class="pf-bar">
+    <button class="pick" onclick="pfPass(-1)">&#8249;</button>
+    <span id="pf-title">Pass 1</span>
+    <button class="pick" onclick="pfPass(1)">&#8250;</button>
+    <button class="pick" onclick="closePathFull()">&#10005;</button>
+  </div>
+  <canvas id="path-full-cv" width="620" height="620"></canvas>
+  <div class="pf-scrub">
+    <button class="pick" id="pf-play" onclick="pfPlay()" aria-label="Play or pause">&#9654;</button>
+    <input type="range" id="pf-scrub" min="0" max="1000" step="1" value="0"
+           oninput="pfScrub(+this.value/1000)" aria-label="Position along the path">
+    <span id="pf-at">start</span>
+  </div>
+</div>
+
 </body>
 </html>
 )LANDHTML"

@@ -14456,6 +14456,13 @@ static const char s_schedule_html[] =
 #include "schedule_html.h"
 ;
 
+// b535: shared browser code, served as its own file so zone_setup, landing
+// and schedule all use ONE copy of the path geometry instead of embedding a
+// duplicate each. Cached hard -- it only changes with a firmware update.
+static const char s_path_js[] =
+#include "path_js.h"
+;
+
 // Open-loop valve move using calibration table
 #define ZONE_VALVE_OPEN_LOOP() do { \
     if (s_web_water) { \
@@ -16139,6 +16146,14 @@ static esp_err_t api_detail_log_handler(httpd_req_t *req)
     snprintf(resp, sizeof(resp), "{\"detail_log\":%s}", s_water_detail_log?"true":"false");
     httpd_resp_set_type(req, "application/json");
     httpd_resp_sendstr(req, resp);
+    return ESP_OK;
+}
+
+static esp_err_t path_js_handler(httpd_req_t *req)
+{
+    httpd_resp_set_type(req, "application/javascript");
+    httpd_resp_set_hdr(req, "Cache-Control", "public, max-age=86400");
+    httpd_resp_sendstr(req, s_path_js);
     return ESP_OK;
 }
 
@@ -18543,7 +18558,7 @@ static void zone_web_start(void)
     httpd_config_t cfg   = HTTPD_DEFAULT_CONFIG();
     cfg.server_port      = ZONE_WEB_PORT;
     cfg.ctrl_port        = ZONE_WEB_CTRL_PORT;
-    cfg.max_uri_handlers  = 76;  // b525: 74 -> 76 (/api/winter GET+POST); b522: 72 -> 74 (/api/fault_hold GET+POST); b512: 70 -> 72 (/api/uart_log GET+POST); b489: 68 -> 70, keeping the 2-slot margin over
+    cfg.max_uri_handlers  = 77;  // b535: 76 -> 77 (/path.js GET); b525: 74 -> 76 (/api/winter GET+POST); b522: 72 -> 74 (/api/fault_hold GET+POST); b512: 70 -> 72 (/api/uart_log GET+POST); b489: 68 -> 70, keeping the 2-slot margin over
                                  // the _Static_assert below.
                                  // MUST be set before httpd_start (cfg is copied there);
                                  // headroom over uris[] count -- _Static_assert below guards it.
@@ -18575,6 +18590,7 @@ static void zone_web_start(void)
         {.uri="/api/all",         .method=HTTP_GET,  .handler=api_all_handler},
         {.uri="/api/auto_sleep",  .method=HTTP_GET,  .handler=api_auto_sleep_handler},  // b447
         {.uri="/api/auto_sleep",  .method=HTTP_POST, .handler=api_auto_sleep_handler},  // b447
+        {.uri="/path.js",         .method=HTTP_GET,  .handler=path_js_handler},   // b535
         {.uri="/api/detail_log",  .method=HTTP_GET,  .handler=api_detail_log_handler},
         {.uri="/api/uart_log",    .method=HTTP_GET,  .handler=api_uart_log_handler},   // b512
         {.uri="/api/uart_log",    .method=HTTP_POST, .handler=api_uart_log_handler},   // b512
@@ -18638,7 +18654,7 @@ static void zone_web_start(void)
         {.uri="/fs/upload",             .method=HTTP_POST, .handler=fs_upload_handler},
         {.uri="/fs/delete",             .method=HTTP_POST, .handler=fs_delete_handler},
     };
-    _Static_assert(sizeof(uris)/sizeof(uris[0]) <= 74,   // b525: 72 -> 74 (/api/winter GET+POST); b522: 70 -> 72 (/api/fault_hold GET+POST); b512: 68 -> 70 (/api/uart_log GET+POST); b489: 66 -> 68
+    _Static_assert(sizeof(uris)/sizeof(uris[0]) <= 75,   // b535: 74 -> 75 (/path.js GET); b525: 72 -> 74 (/api/winter GET+POST); b522: 70 -> 72 (/api/fault_hold GET+POST); b512: 68 -> 70 (/api/uart_log GET+POST); b489: 66 -> 68
                    "uris[] exceeds cfg.max_uri_handlers -- raise it before httpd_start");
     for (size_t i = 0; i < sizeof(uris)/sizeof(uris[0]); i++)
         httpd_register_uri_handler(s_zone_server, &uris[i]);
