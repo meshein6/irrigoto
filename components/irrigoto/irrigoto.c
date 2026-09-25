@@ -14458,7 +14458,7 @@ static const char s_schedule_html[] =
 
 // b535: shared browser code, served as its own file so zone_setup, landing
 // and schedule all use ONE copy of the path geometry instead of embedding a
-// duplicate each. Cached hard -- it only changes with a firmware update.
+// duplicate each.
 static const char s_path_js[] =
 #include "path_js.h"
 ;
@@ -16152,7 +16152,13 @@ static esp_err_t api_detail_log_handler(httpd_req_t *req)
 static esp_err_t path_js_handler(httpd_req_t *req)
 {
     httpd_resp_set_type(req, "application/javascript");
-    httpd_resp_set_hdr(req, "Cache-Control", "public, max-age=86400");
+    // b538: must NOT be cached hard. b535 served this with max-age=86400 on
+    // the reasoning that it only changes with a firmware update -- but that
+    // is exactly when it changes, and a browser holding yesterday's copy then
+    // runs old code against new pages (a new mode is missing from the preview
+    // and nothing explains why). The file is ~23 KB over LAN; revalidating is
+    // cheap, and the pages themselves are already no-store.
+    httpd_resp_set_hdr(req, "Cache-Control", "no-cache, must-revalidate");
     httpd_resp_sendstr(req, s_path_js);
     return ESP_OK;
 }
