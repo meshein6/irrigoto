@@ -146,7 +146,9 @@ select:focus,input[type="time"]:focus{outline:1px solid var(--green);}
 
 .hint{font-size:11px;color:var(--text-mid);margin-top:4px;line-height:1.4;}
 
-/* Apply solution block */
+/* Apply solution block. Hidden unless the "Bottles" device setting is on
+   (body.bottles, set from /api/solution_cal). */
+body:not(.bottles) .sol{display:none;}
 .sol{margin-top:12px;padding-top:12px;border-top:1px solid var(--border);}
 .sol-body{margin-top:10px;}
 .sol-body.off{display:none;}
@@ -302,6 +304,7 @@ async function loadRates() {
   try {
     const d = await fetch('/api/solution_cal', {cache:'no-store'}).then(r => r.json());
     state.rates = d.rates || null;
+    document.body.classList.toggle('bottles', !!d.enabled);
     document.querySelectorAll('#entries .card').forEach((card, i) => updateSolutionEst(card, state.entries[i]));
   } catch (e) { /* estimates just stay unknown */ }
 }

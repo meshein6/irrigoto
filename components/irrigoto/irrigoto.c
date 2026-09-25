@@ -18591,8 +18591,10 @@ static esp_err_t zone_last_water_handler(httpd_req_t *req)
 
 // ── Apply solution endpoints ───────────────────────────────────────────
 // GET  /bottle_cal          calibration page
-// GET  /api/solution_cal    {"speeds":[100,80,60],"rates":[[b1 full,med,low],[b2..],[b3..]]}
-// POST /api/solution_cal    bottle=1..3&speed=100|80|60&rate=<mL/s>   (0 = clear)
+// GET  /api/solution_cal    {"speeds":[100,80,60],"rates":[[b1 full,med,low],[b2..],[b3..]],
+//                            "defaults":[full,med,low],"enabled":b}
+// POST /api/solution_cal    bottle=1..3&speed=100|80|60&rate=<mL/s>   (0 = back to default)
+//                           enabled=0|1   "Bottles" device setting (hides bottle UI, no doses)
 // POST /api/pump_jog        pump=1..3&speed=60..100&s=1..120  | stop=1
 // GET  /api/pump_jog        {"running":b,"pump":n,"speed":n,"elapsed_ms":n,"ma":x}
 // GET  /api/solution_est    ?zone=Z&mode=M&depth=D -> {"est_min":n}
@@ -18619,16 +18621,23 @@ static esp_err_t api_solution_cal_handler(httpd_req_t *req)
         char b[64] = {0}, v[16] = {0};
         int len = httpd_req_recv(req, b, sizeof(b) - 1);
         if (len <= 0) { httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "empty body"); return ESP_OK; }
+        // enabled=0|1 alone toggles the "Bottles" device setting.
+        bool has_rate = httpd_query_key_value(b, "bottle", v, sizeof(v)) == ESP_OK;
+        if (httpd_query_key_value(b, "enabled", v, sizeof(v)) == ESP_OK) {
+            solution_set_enabled(atoi(v) != 0);
+            if (!has_rate) goto reply;
+        }
         int bottle = 0, speed = 0; float rate = 0.0f;
         if (httpd_query_key_value(b, "bottle", v, sizeof(v)) == ESP_OK) bottle = atoi(v);
         if (httpd_query_key_value(b, "speed",  v, sizeof(v)) == ESP_OK) speed  = atoi(v);
         if (httpd_query_key_value(b, "rate",   v, sizeof(v)) == ESP_OK) rate   = strtof(v, NULL);
         if (!solution_set_rate((uint8_t)bottle, (uint8_t)speed, rate)) {
-            httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "bottle 1-3, speed 60|80|100, rate 0-100 mL/s");
+            httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "bottle 1-3, speed 60|80|100, rate 0-100 mL/s (0 = default)");
             return ESP_OK;
         }
     }
-    char buf[160];
+reply:;
+    char buf[224];
     int n = solution_cal_json(buf, sizeof(buf));
     httpd_resp_send(req, buf, n);
     return ESP_OK;

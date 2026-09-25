@@ -101,6 +101,7 @@ main{padding:16px;}
   <div id="panels"></div>
   <div class="save-bar">
     <button class="btn" onclick="load()">Discard</button>
+    <button class="btn" onclick="fillDefaults()">Defaults</button>
     <button class="btn btn-primary" id="save-btn" onclick="save()">Save</button>
   </div>
   <div id="save-status"></div>
@@ -110,6 +111,7 @@ main{padding:16px;}
 const SPEEDS = [100, 80, 60];
 const SPEED_NAME = {100:'Full', 80:'Medium', 60:'Low'};
 let rates = [[0,0,0],[0,0,0],[0,0,0]];   // [bottle-1][speed idx] as loaded from the device
+let defaults = [0.30, 0.23, 0.17];         // built-in rates per speed idx (device sends its own)
 let jogTimer = null;
 
 // numVal: clamped read that leaves the field alone (so the user can clear it
@@ -192,6 +194,7 @@ async function load(){
   try {
     const d = await fetch('/api/solution_cal', {cache:'no-store'}).then(r => r.json());
     rates = d.rates || rates;
+    defaults = d.defaults || defaults;
     for (let b = 1; b <= 3; b++) SPEEDS.forEach((v, i) => {
       const el = panel(b).querySelector('[data-cal="' + v + '"]');
       el.value = rates[b-1][i] > 0 ? (+rates[b-1][i]).toFixed(2) : '';
@@ -199,6 +202,15 @@ async function load(){
   } catch (e) {
     st.className = 'err'; st.textContent = 'Load failed: ' + (e.message || e);
   }
+}
+
+// Fill every field with the device's built-in rates; Save applies them.
+function fillDefaults(){
+  for (let b = 1; b <= 3; b++) SPEEDS.forEach((v, i) => {
+    panel(b).querySelector('[data-cal="' + v + '"]').value = (+defaults[i]).toFixed(2);
+  });
+  const st = document.getElementById('save-status');
+  st.className = ''; st.textContent = 'Default rates filled in. Press Save to keep them.';
 }
 
 // One POST per changed (bottle, speed); untouched rates are not re-sent.
