@@ -146,7 +146,7 @@ select:focus,input[type="time"]:focus{outline:1px solid var(--green);}
 
 .hint{font-size:11px;color:var(--text-mid);margin-top:4px;line-height:1.4;}
 
-/* Apply solution block (b534) */
+/* Apply solution block */
 .sol{margin-top:12px;padding-top:12px;border-top:1px solid var(--border);}
 .sol-body{margin-top:10px;}
 .sol-body.off{display:none;}
@@ -246,7 +246,7 @@ let state = {
   deviceTime: 0,
   tzOffsetMin: 0,
   delayUntil: 0,     // epoch; 0 = no delay
-  rates: null,       // b534: [[full,med,low] x3 bottles] mL/s from /api/solution_cal
+  rates: null,       // [[full,med,low] x3 bottles] mL/s from /api/solution_cal
 };
 
 // ── Initial load ─────────────────────────────────────────────────────────────
@@ -282,7 +282,7 @@ function normalizeEntry(e) {
     days_mask: +e.days_mask || 0,
     enabled: e.enabled ? 1 : 0,
     est_min: +e.est_min || 0,
-    // b534: Apply solution. The device serves defaults for missing fields.
+    // Apply solution. The device serves defaults for missing fields.
     solution_enabled: e.solution_enabled ? 1 : 0,
     solution_bottles: (+e.solution_bottles & 7) || 1,
     solution_when: +e.solution_when === 1 ? 1 : 0,
@@ -294,7 +294,7 @@ function normalizeEntry(e) {
   };
 }
 
-// ── Apply solution (b534) ────────────────────────────────────────────────────
+// ── Apply solution ────────────────────────────────────────────────────
 const SPEED_LABELS = {60:'Low', 80:'Medium', 100:'Full'};
 const SPEED_IDX = {100:0, 80:1, 60:2};
 
@@ -788,7 +788,7 @@ async function saveAll() {
     if (d.ok) {
       st.className = 'ok';
       st.textContent = 'Saved ✓ ' + state.lastStatus;
-      // b534: the device re-estimates run length on save; refresh the mL strips.
+      // the device re-estimates run length on save; refresh the mL strips.
       (d.entries || []).forEach((de, i) => {
         if (state.entries[i]) state.entries[i].est_min = +de.est_min || 0;
       });
