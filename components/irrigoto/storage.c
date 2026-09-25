@@ -33,10 +33,12 @@ static const char *TAG = "storage";
 #define CAL_DIR       MOUNT_POINT "/cal"
 #define WATER_DIR     MOUNT_POINT "/water"
 #define LOGS_DIR      MOUNT_POINT "/logs"
+#define RUNS_CSV      LOGS_DIR "/runs.csv"
+#define RUNS_CSV_OLD  LOGS_DIR "/runs.1.csv"
+#define RUNS_MAX_BYTES  (128 * 1024)   /* ~600 rows before rotation */
 #define PRES_JSON     CAL_DIR "/pressure.json"
 #define SPD_JSON      CAL_DIR "/speed.json"
 #define SCHED_JSON    MOUNT_POINT "/schedule.json"
-#define MAX_LOG_FILES 14
 
 static bool s_ready = false;
 
@@ -817,40 +819,93 @@ esp_err_t storage_make_room(size_t bytes_needed, uint16_t skip_zone_id)
     return ESP_FAIL;
 }
 
-/* ── Logging ────────────────────────────────────────────────────────── */
+/* ── Run history ────────────────────────────────────────────────────── */
+/* One CSV row per watering run, appended at completion on every exit path.
+ * Replaces the old storage_log() daily-log scheme, which nothing ever called
+ * -- /lfs/logs was always empty, which read as a broken feature on the /fs
+ * page.
+ *
+ * Rotation: at RUNS_MAX_BYTES the current file becomes runs.1.csv (one
+ * generation kept) and a fresh file is started with the header. ~600 rows
+ * per file at the current column set. */
 
-esp_err_t storage_log(const char *line)
+esp_err_t storage_runs_append(const char *header, const char *row)
 {
     if (!s_ready) return ESP_ERR_INVALID_STATE;
-    time_t now = time(NULL);
-    struct tm t; localtime_r(&now, &t);
-    char path[64];
-    snprintf(path, sizeof(path), LOGS_DIR "/%04d%02d%02d.log",
-             t.tm_year+1900, t.tm_mon+1, t.tm_mday);
-    FILE *f = fopen(path, "ab");
-    if (!f) return ESP_FAIL;
-    fprintf(f, "%s\n", line);
-    fclose(f);
-    /* Rotate old logs */
-    DIR *d = opendir(LOGS_DIR);
-    if (d) {
-        char names[MAX_LOG_FILES+4][16]; int count = 0;
-        struct dirent *ent;
-        while ((ent = readdir(d)) && count < (int)(sizeof(names)/sizeof(names[0])))
-            if (ent->d_name[0] != '.') strncpy(names[count++], ent->d_name, 15);
-        closedir(d);
-        if (count > MAX_LOG_FILES) {
-            /* Simple sort to find oldest */
-            for (int i=0; i<count-1; i++)
-                for (int j=i+1; j<count; j++)
-                    if (strcmp(names[i], names[j]) > 0) {
-                        char tmp[16]; strcpy(tmp, names[i]);
-                        strcpy(names[i], names[j]); strcpy(names[j], tmp);
-                    }
-            char del[64]; snprintf(del, sizeof(del), LOGS_DIR "/%s", names[0]);
-            remove(del);
+    if (!row) return ESP_ERR_INVALID_ARG;
+
+    /* Rotate first, so a row never lands in an over-cap file. */
+    struct stat st;
+    if (stat(RUNS_CSV, &st) == 0 && st.st_size >= RUNS_MAX_BYTES) {
+        remove(RUNS_CSV_OLD);
+        if (rename(RUNS_CSV, RUNS_CSV_OLD) != 0) remove(RUNS_CSV);
+        ESP_LOGI(TAG, "runs.csv rotated at %u bytes", (unsigned)st.st_size);
+    }
+
+    /* Header is written only when the file is being created. */
+    bool fresh = (stat(RUNS_CSV, &st) != 0 || st.st_size == 0);
+    if (fresh) {
+        size_t need = (header ? strlen(header) : 0) + strlen(row) + 2;
+        size_t used = 0, total = 0;
+        if (storage_usage(&used, &total) == ESP_OK && total > used
+                && (total - used) < need + 4096) {
+            storage_make_room(need + 4096, 0xFFFF);
         }
     }
+    FILE *f = fopen(RUNS_CSV, "ab");
+    if (!f) return ESP_FAIL;
+    if (fresh && header) fprintf(f, "%s\n", header);
+    fprintf(f, "%s\n", row);
+    fclose(f);
+    return ESP_OK;
+}
+
+/* Stream the `max` most recent rows, newest first, through cb(). Streaming
+ * rather than returning one big buffer keeps this off the DRAM budget: only
+ * a single RUNS_LINE_MAX line is ever held, on the caller's stack. */
+int storage_runs_tail_cb(int max, storage_runs_row_cb cb, void *ctx)
+{
+    if (!s_ready || !cb) return 0;
+    FILE *f = fopen(RUNS_CSV, "rb");
+    if (!f) return 0;
+
+    if (max > RUNS_TAIL_MAX) max = RUNS_TAIL_MAX;
+    if (max < 1) max = 1;
+
+    /* Ring of line offsets: remember where the last `max` rows start. */
+    long offs[RUNS_TAIL_MAX];
+    int  n = 0, head = 0;
+    char line[RUNS_LINE_MAX];
+    bool first = true;
+    long pos = ftell(f);
+    while (fgets(line, sizeof(line), f)) {
+        if (first) { first = false; pos = ftell(f); continue; }  /* skip header */
+        offs[head] = pos;
+        head = (head + 1) % max;
+        if (n < max) n++;
+        pos = ftell(f);
+    }
+
+    int written = 0;
+    for (int i = 0; i < n; i++) {
+        int idx = (head - 1 - i + 2 * max) % max;
+        if (fseek(f, offs[idx], SEEK_SET) != 0) break;
+        if (!fgets(line, sizeof(line), f)) break;
+        size_t len = strlen(line);
+        while (len && (line[len-1] == '\n' || line[len-1] == '\r')) line[--len] = '\0';
+        if (len == 0) continue;
+        cb(line, ctx);
+        written++;
+    }
+    fclose(f);
+    return written;
+}
+
+esp_err_t storage_runs_clear(void)
+{
+    if (!s_ready) return ESP_ERR_INVALID_STATE;
+    remove(RUNS_CSV_OLD);
+    remove(RUNS_CSV);
     return ESP_OK;
 }
 

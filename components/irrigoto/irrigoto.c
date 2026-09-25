@@ -3588,6 +3588,13 @@ static int  s_last_water_status_code = WATER_STATUS_COMPLETED;
 // snapshots zone_id/status). 0 = no watering completed since boot.
 // Used by the landing-page schedule card to show "Last: <zone> ago Xm".
 static time_t s_last_water_finish_epoch = 0;
+// b535: run-history. Captured when a run starts so the CSV row can record
+// when it began and what asked for it. The clock is often unset on this
+// device (it deep-sleeps and only learns the time from a phone or HA), so
+// the uptime is recorded alongside and carries the ordering when it is.
+static time_t   s_run_start_epoch  = 0;
+static uint32_t s_run_start_uptime = 0;
+static uint8_t  s_run_trigger      = 0;   // 0=unknown, 1=web, 2=schedule, 3=HA
 
 // NVS-backed metadata so the "last completed zone" tag survives a
 // deep-sleep wake. Persisted in lockstep with the in-RAM snapshot
@@ -3855,6 +3862,72 @@ static void zone_name_resolve(uint16_t id, const char *lfs_name,
         }
     }
 }
+
+// b535: append this run to /lfs/logs/runs.csv. Called from the one completion
+// block, which every exit path funnels through (completed, cancelled,
+// no-supply, fault), so a partial run is recorded as faithfully as a clean one.
+// Row is built on the stack -- no new statics, the DRAM segment has no room.
+static const char RUNS_CSV_HEADER[] =
+    "start_local,end_local,uptime_s,duration_min,zone_id,zone_name,trigger,"
+    "mode,depth_in,status,rings,rings_supply_limited,volume_l,avg_depth_mm,"
+    "coverage_pct,score,supply_psi_min,supply_psi_avg,supply_psi_max,fw_build";
+
+static void runs_csv_append(void)
+{
+    if (!storage_ready()) return;
+    const last_water_meta_t *m = &s_last_water_meta;
+
+    // The clock is often unset (deep sleep, no RTC). Leave the timestamps
+    // blank rather than writing 1970; uptime_s keeps the rows ordered.
+    char t0[24] = {0}, t1[24] = {0};
+    if (s_run_start_epoch > 1700000000) {
+        struct tm lt; localtime_r(&s_run_start_epoch, &lt);
+        strftime(t0, sizeof(t0), "%Y-%m-%dT%H:%M:%S", &lt);
+    }
+    if (s_last_water_finish_epoch > 1700000000) {
+        struct tm lt; localtime_r(&s_last_water_finish_epoch, &lt);
+        strftime(t1, sizeof(t1), "%Y-%m-%dT%H:%M:%S", &lt);
+    }
+
+    char zname[32] = {0};
+    {
+        char zdef[16]; snprintf(zdef, sizeof(zdef), "Zone #%u", (unsigned)s_last_water_zone_id);
+        char raw[32] = {0};
+        if (storage_ready()) {
+            zone_perimeter_t zp = {0};
+            storage_zone_load(s_last_water_zone_id, raw, sizeof(raw), &zp);
+        }
+        zone_name_resolve(s_last_water_zone_id, raw, zdef, zname, sizeof(zname));
+        // Commas would break the column count; the name is user-entered.
+        for (char *p = zname; *p; p++) if (*p == ',' || *p == '"') *p = ' ';
+    }
+
+    static const char *TRIG[] = { "unknown", "web", "schedule", "ha" };
+    static const char *STAT[] = { "completed", "cancelled", "valve_fault",
+                                  "nozzle_fault", "water_loss", "no_supply" };
+    char mode_lbl[24] = {0};
+    irrigoto_last_water_mode_label(mode_lbl, sizeof(mode_lbl));
+    for (char *p = mode_lbl; *p; p++) if (*p == ',') *p = ' ';
+
+    int depth8 = (int)(m->target_depth_mm / 3.175f + 0.5f);
+
+    char row[RUNS_LINE_MAX];
+    snprintf(row, sizeof(row),
+        "%s,%s,%lu,%.1f,%u,%s,%s,%s,%d,%s,%u,%u,%.2f,%.2f,%.1f,%.2f,%.2f,%.2f,%.2f,%u",
+        t0, t1, (unsigned long)s_run_start_uptime,
+        m->duration_s / 60.0f,
+        (unsigned)s_last_water_zone_id, zname,
+        TRIG[s_run_trigger < 4 ? s_run_trigger : 0],
+        mode_lbl, depth8,
+        STAT[s_last_water_status_code < 6 ? s_last_water_status_code : 0],
+        (unsigned)m->num_rings, (unsigned)m->rings_supply_limited,
+        m->volume_l, m->actual_avg_depth_mm, m->polygon_coverage_pct, m->score,
+        m->supply_psi_min, m->supply_psi_avg, m->supply_psi_max,
+        (unsigned)FW_BUILD);
+    if (storage_runs_append(RUNS_CSV_HEADER, row) == ESP_OK)
+        INFO("Run logged to runs.csv");
+}
+
 
 static void device_name_save_nvs(const char *name) {
     nvs_handle_t h;
@@ -13640,6 +13713,7 @@ abort:
     // "Last completed" tag survives. NVS write is ~6 ms; happens
     // at most once per watering completion.
     last_water_save_nvs();
+    runs_csv_append();   // b535: one CSV row per run, every exit path
     int expected_rings = num_rings * passes;
     if (demo_mode) {
         INFO("Demo complete -- %d/%d rings.", rings_done, num_rings);
@@ -15086,6 +15160,9 @@ static esp_err_t zone_water_handler(httpd_req_t *req)
         s_web_serpentine_dry = (mode == 8 && dry_q[0] == '1');
     }
     s_active_sched_epoch = 0;   // b450: /zone/water is a manual run (never auto-marked)
+    s_run_start_epoch  = time(NULL);          // b535
+    s_run_start_uptime = (uint32_t)(esp_timer_get_time() / 1000000ULL);
+    s_run_trigger      = 1;                   // web
     s_web_water_mode = mode;
     // b294: moved from APP_CPU (core 1) to PRO_CPU (core 0). The original
     // pin-to-core-1 reasoning was "isolate motion control from WiFi/lwIP
@@ -16123,6 +16200,41 @@ static esp_err_t api_detail_log_handler(httpd_req_t *req)
     snprintf(resp, sizeof(resp), "{\"detail_log\":%s}", s_water_detail_log?"true":"false");
     httpd_resp_set_type(req, "application/json");
     httpd_resp_sendstr(req, resp);
+    return ESP_OK;
+}
+
+static void runs_send_row(const char *line, void *ctx)
+{
+    httpd_req_t *req = (httpd_req_t *)ctx;
+    httpd_resp_send_chunk(req, line, strlen(line));
+    httpd_resp_send_chunk(req, "\n", 1);
+}
+
+// b535: GET /api/runs?limit=N -> the most recent run rows, newest first, as
+// raw CSV (text/csv). The landing page's History card parses it; the same URL
+// with no limit is the "Download CSV" link. GET /api/runs?clear=1 empties it.
+static esp_err_t api_runs_handler(httpd_req_t *req)
+{
+    HTTP_CONN_CLOSE(req);
+    char qs[48] = {0}, v[12] = {0};
+    httpd_req_get_url_query_str(req, qs, sizeof(qs));
+    if (httpd_query_key_value(qs, "clear", v, sizeof(v)) == ESP_OK && v[0] == '1') {
+        storage_runs_clear();
+        httpd_resp_set_type(req, "application/json");
+        httpd_resp_sendstr(req, "{\"ok\":true}");
+        return ESP_OK;
+    }
+    int limit = 20;
+    if (httpd_query_key_value(qs, "limit", v, sizeof(v)) == ESP_OK) limit = atoi(v);
+    if (limit < 1) limit = 1;
+    if (limit > RUNS_TAIL_MAX) limit = RUNS_TAIL_MAX;
+
+    httpd_resp_set_type(req, "text/csv");
+    httpd_resp_set_hdr(req, "Cache-Control", "no-cache, no-store");
+    // Chunked: one row at a time, so no multi-KB response buffer is held.
+    // The DRAM segment is ~95 % full; a static buffer here cost 3.8 KB.
+    storage_runs_tail_cb(limit, runs_send_row, req);
+    httpd_resp_send_chunk(req, NULL, 0);
     return ESP_OK;
 }
 
@@ -18527,7 +18639,7 @@ static void zone_web_start(void)
     httpd_config_t cfg   = HTTPD_DEFAULT_CONFIG();
     cfg.server_port      = ZONE_WEB_PORT;
     cfg.ctrl_port        = ZONE_WEB_CTRL_PORT;
-    cfg.max_uri_handlers  = 76;  // b525: 74 -> 76 (/api/winter GET+POST); b522: 72 -> 74 (/api/fault_hold GET+POST); b512: 70 -> 72 (/api/uart_log GET+POST); b489: 68 -> 70, keeping the 2-slot margin over
+    cfg.max_uri_handlers  = 77;  // b535: 76 -> 77 (/api/runs GET); b525: 74 -> 76 (/api/winter GET+POST); b522: 72 -> 74 (/api/fault_hold GET+POST); b512: 70 -> 72 (/api/uart_log GET+POST); b489: 68 -> 70, keeping the 2-slot margin over
                                  // the _Static_assert below.
                                  // MUST be set before httpd_start (cfg is copied there);
                                  // headroom over uris[] count -- _Static_assert below guards it.
@@ -18560,6 +18672,7 @@ static void zone_web_start(void)
         {.uri="/api/auto_sleep",  .method=HTTP_GET,  .handler=api_auto_sleep_handler},  // b447
         {.uri="/api/auto_sleep",  .method=HTTP_POST, .handler=api_auto_sleep_handler},  // b447
         {.uri="/api/detail_log",  .method=HTTP_GET,  .handler=api_detail_log_handler},
+        {.uri="/api/runs",        .method=HTTP_GET,  .handler=api_runs_handler},   // b535
         {.uri="/api/uart_log",    .method=HTTP_GET,  .handler=api_uart_log_handler},   // b512
         {.uri="/api/uart_log",    .method=HTTP_POST, .handler=api_uart_log_handler},   // b512
         {.uri="/api/winter",      .method=HTTP_GET,  .handler=api_winter_handler},     // b525
@@ -18622,7 +18735,7 @@ static void zone_web_start(void)
         {.uri="/fs/upload",             .method=HTTP_POST, .handler=fs_upload_handler},
         {.uri="/fs/delete",             .method=HTTP_POST, .handler=fs_delete_handler},
     };
-    _Static_assert(sizeof(uris)/sizeof(uris[0]) <= 74,   // b525: 72 -> 74 (/api/winter GET+POST); b522: 70 -> 72 (/api/fault_hold GET+POST); b512: 68 -> 70 (/api/uart_log GET+POST); b489: 66 -> 68
+    _Static_assert(sizeof(uris)/sizeof(uris[0]) <= 75,   // b535: 74 -> 75 (/api/runs GET); b525: 72 -> 74 (/api/winter GET+POST); b522: 70 -> 72 (/api/fault_hold GET+POST); b512: 68 -> 70 (/api/uart_log GET+POST); b489: 66 -> 68
                    "uris[] exceeds cfg.max_uri_handlers -- raise it before httpd_start");
     for (size_t i = 0; i < sizeof(uris)/sizeof(uris[0]); i++)
         httpd_register_uri_handler(s_zone_server, &uris[i]);
@@ -19545,6 +19658,9 @@ static void start_watering_web_mode(int zone, int web_mode, int depth8, uint32_t
     s_water_est_min  = (web_mode == 99) ? 2 : 13;
     s_water_zone_id  = (uint16_t)(zone - 1);
     s_web_water_depth_eighths = (depth8 >= 1 && depth8 <= 8) ? depth8 : 0;
+    s_run_start_epoch  = time(NULL);          // b535
+    s_run_start_uptime = (uint32_t)(esp_timer_get_time() / 1000000ULL);
+    s_run_trigger      = sched_epoch ? 2 : 3; // schedule vs HA service
     s_web_water_mode = web_mode;
     // b294: moved to PRO_CPU (core 0). See water_web above for rationale.
     // b285: bumped from 8192 -> 16384, same reason as water_web above.
