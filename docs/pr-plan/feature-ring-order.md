@@ -1,11 +1,27 @@
 # Per-zone ring order: auto / one ring at a time / section by section
 
-**Branch:** `feature/ring-order` · **Type:** feature · **Status:** PARTIALLY built and merged into `combined` (b535): `auto` and
-`sequential` are implemented, `sections` is NOT. The lobe merge-tree and the
-depth-first rewrite of the ring/arc loop can only be validated by a wet run,
-so it was left out rather than shipped unverified. The stored field is a
-plain enum, so adding value 2 later needs no migration.
-Suggest an upstream issue first: it touches the core ring loop.
+**Branch:** `feature/ring-order` · **Type:** feature · **Status:** ABANDONED
+and removed (b537). Superseded by the **Sections** watering mode --- see
+`feature-sections-mode` below. Kept as a record of why the per-zone-setting
+shape was the wrong one.
+
+A per-zone "ring order" was built in b535 (`auto` / `sequential`, with
+`sections` deferred) and taken out again two builds later. What it got wrong:
+
+- It only meant anything for two of the five modes. Pulse and Gentle already
+  walk rings outer to inner, so the setting was a no-op there; it only really
+  changed Smooth (bypassing its deficit scheduler) and Serpentine.
+- It was a property of the **zone** when it is really a property of the
+  **run**. You cannot water the same zone two different ways without editing
+  the zone.
+- `sections` was serpentine-specific while living in a setting that claimed
+  to apply to everything, so selecting it silently did nothing for the other
+  modes --- and the code and the help text disagreed about that.
+
+Rebuilt as a mode (web digit 9, HA/schedule index 4), which is the encoding
+the rest of the system already uses for "how should this run behave". The
+per-zone field, its NVS key, the storage read/write and the Zone Setup picker
+are all gone; Smooth's scheduler is unconditional again.
 
 ## Summary
 
