@@ -178,6 +178,7 @@ body:not(.bottles) .sol{display:none;}
 .ent-path canvas{flex-shrink:0;border-radius:50%;cursor:pointer;}
 .ent-path .ep-note{flex:1;min-width:0;font-size:11px;color:var(--text-mid);line-height:1.45;}
 .ent-path .ep-note b{color:var(--text);display:block;font-size:12px;margin-bottom:2px;}
+.ent-path .ep-btn{flex:0 0 auto;margin-top:6px;padding:5px 10px;font-size:11px;display:inline-block;}
 </style>
 </head>
 <body>
@@ -495,7 +496,7 @@ function drawEntryPath(cv){
   cv.dataset.drawn = '1';
   const g = IrrigotoPath.build(z.points, o);
   const note = wrap && wrap.querySelector('.ep-note b');
-  if (note) note.textContent = (MODE_LABELS[e.mode] || '') + ' path'
+  if (note) note.textContent = (MODE_LABELS[e.mode] || 'Path') + ' path'
     + (g && g.rings.length ? ' \u00b7 ' + g.rings.length + ' rings' : '');
 }
 
@@ -726,7 +727,9 @@ function renderEntry(e, idx) {
       '<canvas class="ent-thumb" width="96" height="96" data-idx="' + idx + '" ' +
         'onclick="openEntryPreview(' + idx + ')" title="Tap for a bigger view"></canvas>' +
       '<div class="ep-note"><b>Path</b>Rings this mode will sweep, in order. ' +
-      'Blue and orange show the sweep direction. Tap for a bigger view.</div>' +
+      'Blue and orange show the sweep direction.' +
+      '<button class="day ep-btn" onclick="openEntryPreview(' + idx + ')">&#9974; Preview</button>' +
+      '</div>' +
     '</div>' +
     '<div class="toggle-row enabled-row">' +
       '<span class="toggle-lbl">Enabled</span>' +

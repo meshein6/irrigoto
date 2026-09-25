@@ -418,7 +418,7 @@ section{margin-bottom:18px;}
       <div class="path-note">
         <b id="path-mode">Path</b>
         <span id="path-desc"></span>
-        <button class="pick" onclick="openPathFull()">View</button>
+        <button class="pick" onclick="openPathFull()">&#9974; Preview</button>
       </div>
     </div>
     <div id="chase-row" style="display:none;margin:-6px 0 18px;padding:10px 12px;border:1px solid var(--border);border-radius:var(--radius-sm);background:var(--btn);font-size:12px;">
@@ -980,10 +980,16 @@ function renderPathThumb(){
   const o = zonePathOpts(0); o.thumb = true;
   IrrigotoPath.thumb(document.getElementById('path-thumb'), pts, o);
   const g = IrrigotoPath.build(pts, o);
-  document.getElementById('path-mode').textContent =
-    (IrrigotoPath.MODES[selModeDat] || {label:'Path'}).label + ' path'
-    + (g && g.rings.length ? ' \u00b7 ' + g.rings.length + ' rings' : '');
-  document.getElementById('path-desc').textContent = PATH_DESC[g ? g.modeKey : 'pulse'] || '';
+  const m = IrrigotoPath.MODES[selModeDat];
+  // b539: never invent a description. If the geometry didn't resolve, say so
+  // rather than falling back to Pulse's text for every mode -- which made all
+  // the modes look identical. An unknown mode means a stale cached path.js.
+  document.getElementById('path-mode').textContent = m
+    ? m.label + ' path' + (g && g.rings.length ? ' \u00b7 ' + g.rings.length + ' rings' : '')
+    : 'Path preview unavailable';
+  document.getElementById('path-desc').textContent = !m
+    ? 'This page is running an old cached script. Reload to update.'
+    : (g ? (PATH_DESC[g.modeKey] || '') : 'No zone outline yet -- set the zone perimeter first.');
 }
 // b536: the same overlay Zone Setup uses, with the mode LOCKED to the one
 // picked for this run -- the preview must not be able to disagree with it.

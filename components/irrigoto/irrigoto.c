@@ -11887,19 +11887,22 @@ static void phase_water_zone(void)
     // the estimate uses calibrated flow. No-supply detection moves to the
     // first ring instead (see s_supply_regulated below).
     //
-    // b536 FIX: this block does TWO things -- it opens the valve and then
-    // samples. b535 skipped the whole block, so with the setting on the valve
-    // was never opened and NO RUN EVER WATERED (it planned, started, and
-    // stopped within ~130 ms with no flow). Only the sampling may be skipped;
-    // the valve open and its settle must always happen.
-    if (!demo_mode && !serpentine_dry && psi_max > 0.5f) {
-        valve_goto(VALVE_OPEN_DEG, 1.0f, 8000, false);
-        vTaskDelay(pdMS_TO_TICKS(1500));   // settle after valve open
-    }
+    // b539: the point of this setting is to avoid 12 s of FULL-OPEN spray,
+    // which on a small zone lands well past the edge. b536 made the full-open
+    // unconditional (only the sampling was skipped) on the theory that a run
+    // with the setting on never watered because the valve was never opened.
+    // That theory was never demonstrated -- the failing run logged none of the
+    // serpentine abort messages, and 130 ms is far too short for the 4 samples
+    // its flow check needs, which points at s_water_abort already being set --
+    // and the change reintroduced exactly the full-power spray the setting is
+    // meant to prevent. Reverted: when regulated, the valve is not forced open
+    // here at all; each mode's own valve control opens it for the first ring.
     if (s_supply_regulated && !demo_mode && !serpentine_dry) {
-        INFO("Supply sample skipped (regulated) -- valve open, using calibration");
+        INFO("Supply check skipped (regulated) -- no full-open spray");
     }
     if (!s_supply_regulated && !demo_mode && !serpentine_dry && psi_max > 0.5f) {
+        valve_goto(VALVE_OPEN_DEG, 1.0f, 8000, false);
+        vTaskDelay(pdMS_TO_TICKS(1500));   // settle after valve open
 
         // b365: spin up the waggle motor. NOZZLE_DUTY=90 matches chase mode --
         // smooth at typical loads, low enough that reversals are quick. Setup

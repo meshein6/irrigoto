@@ -38,6 +38,25 @@ R"PATHJS(
 
   function rad(d) { return (d - 90) * Math.PI / 180; }
 
+  /* The two endpoints that carry zone geometry disagree on the field name:
+   * /zone/state (Zone Setup) sends {deg, throw_mm}, /api/all (landing and
+   * schedule) sends {deg, mm}. Normalising here means callers can hand over
+   * whatever they were given -- the mismatch used to draw an empty circle. */
+  function normPoints(pts) {
+    if (!pts || !pts.length) return [];
+    var out = [], i, p, t;
+    for (i = 0; i < pts.length; i++) {
+      p = pts[i];
+      if (!p) continue;
+      t = (p.throw_mm !== undefined) ? p.throw_mm
+        : (p.mm !== undefined)       ? p.mm
+        : (p.r !== undefined)        ? p.r : undefined;
+      if (t === undefined || !(t > 0)) continue;
+      out.push({ deg: +p.deg || 0, throw_mm: +t });
+    }
+    return out;
+  }
+
   /* Even-odd point-in-polygon in (bearing, throw) space, translated so the
    * test point is the origin -- same method the page used before. */
   function pointInZone(pts, bearing, r_mm) {
@@ -171,7 +190,8 @@ R"PATHJS(
   /* Build everything needed to draw. `points` is [{deg, throw_mm}, ...]. */
   function build(points, opts) {
     opts = opts || {};
-    if (!points || points.length < 2) return null;
+    points = normPoints(points);
+    if (points.length < 2) return null;
     var actMax = opts.act_max_throw || 10058;
     var actMin = opts.act_min_throw || 0;
     var modeKey = (MODES[opts.mode] || MODES['1']).key;
@@ -370,7 +390,8 @@ R"PATHJS(
     ctx.fillStyle = bg;
     ctx.beginPath(); ctx.arc(cx, cy, maxR, 0, Math.PI * 2); ctx.fill();
 
-    if (!points || points.length < 2) return false;
+    points = normPoints(points);
+    if (points.length < 2) return false;
     var geom = build(points, opts);
     if (!geom) return false;
 
@@ -509,9 +530,12 @@ R"PATHJS(
   }
 
   function openPreview(opts) {
-    if (!opts || !opts.points || opts.points.length < 2) return false;
+    if (!opts) return false;
+    var pts = normPoints(opts.points);
+    if (pts.length < 2) return false;
     ovBuild();
     ov.opts = opts;
+    ov.opts.points = pts;
     ov.mode = MODES[opts.mode] ? opts.mode : '7';
     ov.passIdx = 0; ov.t = 0; ov.range.value = 0;
     ov.pass.textContent = 'Pass 1';
@@ -544,7 +568,7 @@ R"PATHJS(
 
   root.IrrigotoPath = {
     openPreview: openPreview, closePreview: ovClose,
-    MODES: MODES, build: build, draw: draw, thumb: thumb,
+    MODES: MODES, build: build, draw: draw, thumb: thumb, normPoints: normPoints,
     flatten: flatten, pointAt: pointAt, marker: marker,
     zoneArc: zoneArc, ringThrows: ringThrows, ringSpans: ringSpans,
     pointInZone: pointInZone
