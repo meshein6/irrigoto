@@ -2,7 +2,7 @@
 /*
  * pump.h -- peristaltic solution pump driver (OtO board, three pumps).
  *
- * Hardware (owner-probed 2026-09-20, see HANDOFF.md):
+ * Hardware (owner-probed 2026-09-20, see README.md "Pump hardware"):
  *   GPIO16  drive, active-high, needs the 9 V motor rail. PWM at 20 kHz only;
  *           lower frequencies stall under roller load.
  *   GPIO21  selects pump 2, GPIO19 selects pump 3; neither = pump 1. The
