@@ -55,6 +55,7 @@ number (see CONTRIBUTING.md). So fork branches must not claim build numbers:
 | `feature/zone-map-zoom` | feature | planned | [Zoom the Zone Setup map to the zone](feature-zone-map-zoom.md) |
 | `feature/mode-path-preview` | feature | planned | [Path preview per mode (manual + schedule)](feature-mode-path-preview.md) |
 | `feature/run-history` | feature | planned | [Per-run history log file + History card](feature-run-history.md) |
+| `feature/wifi-power-settings` | feature | **built**, in `combined`; needs on-device test | [WiFi & power modal: network + wake period in seconds](feature-wifi-power-settings.md) |
 
 Dropped (not worth doing now / not an issue): `fix/pulse-ring-swing`,
 `fix/rain-delay-feedback`, and `feature/solution-dosing-improvements` (folded
