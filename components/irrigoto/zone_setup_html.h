@@ -7,6 +7,7 @@ R"ZONEHTML(
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no">
 <title>irrigoto · Zone Setup</title>
+<script src="/path.js"></script>
 <script>
 (function(){
   try{var t=localStorage.getItem('irrigoto_theme');
@@ -117,6 +118,19 @@ header{
   flex:1;display:flex;align-items:center;justify-content:center;
   padding:12px 16px;min-height:0;position:relative;
 }
+/* b535: map view controls + path scrubber, overlaid on the map */
+#view-ctl{position:absolute;top:14px;left:16px;display:flex;gap:6px;z-index:5;}
+.vbtn{background:rgba(6,12,16,.78);border:1px solid var(--border);color:var(--text-mid);
+  font-size:11px;font-weight:600;padding:6px 9px;border-radius:6px;cursor:pointer;
+  font-family:inherit;backdrop-filter:blur(2px);}
+.vbtn.on{color:var(--green);border-color:var(--green);background:var(--green-dim);}
+#path-ctl{display:none;position:absolute;left:16px;right:16px;bottom:10px;z-index:5;
+  gap:8px;align-items:center;background:rgba(6,12,16,.78);border:1px solid var(--border);
+  border-radius:8px;padding:6px 10px;backdrop-filter:blur(2px);}
+#path-ctl.on{display:flex;}
+#path-ctl input[type=range]{flex:1;min-width:0;}
+#zs-at{font-family:'Courier New',monospace;font-size:10px;color:var(--text-mid);
+  min-width:78px;text-align:right;}
 #heat-legend{
   display:none;flex-direction:column;align-items:flex-start;
   gap:4px;position:absolute;right:10px;top:50%;transform:translateY(-50%);
@@ -287,6 +301,19 @@ header{
 </header>
 
 <div id="map-wrap"><canvas id="map"></canvas>
+  <!-- b535: view controls live over the map, not in the action row below. -->
+  <div id="view-ctl">
+    <button class="vbtn" id="btn-zoom" onclick="toggleZoom()" title="Fit the map to this zone, or show the full reach">&#9974; Zoom</button>
+    <button class="vbtn" id="btn-path" onclick="togglePath()" title="Show the watering path; tap the mode chip to change mode">&#9678; Path</button>
+    <button class="vbtn" id="btn-heatmap" onclick="toggleHeatmap()">&#127777; Depth</button>
+  </div>
+  <div id="path-ctl">
+    <button class="vbtn" id="btn-path-mode" onclick="cyclePathMode()" title="Which mode's path to draw">Smooth</button>
+    <button class="vbtn" id="btn-path-pass" onclick="cyclePathPass()" title="Which pass">Pass 1</button>
+    <input type="range" id="zs-scrub" min="0" max="1000" step="1" value="0"
+           oninput="zsScrub(+this.value/1000)" aria-label="Position along the path">
+    <span id="zs-at">start</span>
+  </div>
   <div id="heat-legend">
     <div style="display:flex;gap:5px;align-items:stretch">
       <div class="hl-bar" style="height:90px"></div>
@@ -326,11 +353,6 @@ header{
   <button class="sbtn" id="btn-water" onclick="doAct('water_toggle')">💧 Water</button>
   <button class="sbtn" onclick="doAct('undo')">⌫ Undo</button>
   <button class="sbtn" onclick="doAct('clear')">✕ Clear</button>
-  <button class="sbtn" id="btn-zoom" onclick="toggleZoom()" title="Fit the map to this zone, or show the full reach">⛶ Zoom</button>
-  <button class="sbtn" id="btn-path" onclick="togglePath()"
-          oncontextmenu="cyclePathMode();return false;"
-          title="Tap to show the path; long-press to change mode">◎ Path</button>
-  <button class="sbtn" id="btn-heatmap" onclick="toggleHeatmap()">🌡 Depth</button>
   <button class="sbtn" id="btn-edit" onclick="toggleEdit()">✎ Edit</button>
 </div>
 <!-- b400: edit-mode toolbar (drag/delete interior points). Shown only while
@@ -402,10 +424,7 @@ function _zoomed(){ return _zoom === 'zone' && _zoneScale() < _fullScale(); }
 // Reflect the restored zoom on the button once the DOM is up.
 function _paintZoomBtn(){
   const b = document.getElementById('btn-zoom');
-  if (!b) return;
-  const on = _zoomed();
-  b.style.color = on ? 'var(--green)' : '';
-  b.style.borderColor = on ? 'var(--green)' : '';
+  if (b) b.classList.toggle('on', _zoomed());
 }
 function toggleZoom(){
   _zoom = (_zoom === 'zone') ? 'full' : 'zone';
@@ -419,13 +438,8 @@ let lastWaterBearing = null;
 let showPath = false;
 let ringOrder = 0;   // b535: 0 auto, 1 sequential -- saved with the zone
 let pathMode = '7';  // b535: which mode the Path view draws (web digit)
-function cyclePathMode(){
-  const order = ['1','5','7','8'];
-  pathMode = order[(order.indexOf(pathMode) + 1) % order.length];
-  const b = document.getElementById('btn-path');
-  if (b) b.innerHTML = '\u25ce ' + (IrrigotoPath.MODES[pathMode] || {label:'Path'}).label;
-  draw();
-}
+let pathPass = 0;    // b535: which pass (serpentine/gentle alternate by pass)
+let pathT = 0;       // b535: scrub position, 0..1 along the path
 function selRingOrder(btn){
   ringOrder = +btn.dataset.ro;
   document.querySelectorAll('.ro').forEach(b => b.classList.toggle('sel', b === btn));
@@ -471,11 +485,25 @@ fetch('/zone/last_water?id='+_zoneIdParam).then(r=>r.json()).then(d=>{
 
 function togglePath(){
   showPath = !showPath;
-  const btn = document.getElementById('btn-path');
-  btn.style.color = showPath ? 'var(--green)' : '';
-  btn.style.borderColor = showPath ? 'var(--green)' : '';
+  document.getElementById('btn-path').classList.toggle('on', showPath);
+  // The scrubber only makes sense while the path is up.
+  document.getElementById('path-ctl').classList.toggle('on', showPath);
   draw();
 }
+// b535: which mode's path to draw, and which pass.
+function cyclePathMode(){
+  const order = ['1','5','7','8'];
+  pathMode = order[(order.indexOf(pathMode) + 1) % order.length];
+  document.getElementById('btn-path-mode').textContent =
+    (IrrigotoPath.MODES[pathMode] || {label:'Path'}).label;
+  draw();
+}
+function cyclePathPass(){
+  pathPass = (pathPass + 1) % 4;
+  document.getElementById('btn-path-pass').textContent = 'Pass ' + (pathPass + 1);
+  draw();
+}
+function zsScrub(t){ pathT = t; draw(); }
 
 function toggleHeatmap(){
   heatPasses = (heatPasses + 1) % 3;
@@ -805,12 +833,21 @@ function drawHeatMap(W, H, cx, cy, maxR) {
 function drawPath(W, H, cx, cy, maxR) {
   if (ST.points.length < 2 || typeof IrrigotoPath === 'undefined') return;
   const geom = IrrigotoPath.build(ST.points, {
-    mode: pathMode, pass: 0,
+    mode: pathMode, pass: pathPass,
     act_max_throw: ST.act_max_throw || 10058,
     act_min_throw: ST.act_min_throw || 0,
     sequential: ringOrder === 1,
   });
-  IrrigotoPath.draw(ctx, geom, {cx: cx, cy: cy, maxR: maxR, scale_mm: _edScale()});
+  const o = {cx: cx, cy: cy, maxR: maxR, scale_mm: _edScale()};
+  IrrigotoPath.draw(ctx, geom, o);
+  // Scrub marker: where the nozzle is at this point along the path.
+  const at = IrrigotoPath.marker(ctx, IrrigotoPath.flatten(geom), pathT, o);
+  const lbl = document.getElementById('zs-at');
+  if (lbl) {
+    lbl.textContent = !at ? (pathT <= 0 ? 'start' : '')
+      : at.dry ? 'moving \u00b7 dry'
+      : 'ring ' + (at.ring + 1) + ' \u00b7 ' + (at.r_mm / 304.8).toFixed(1) + "'";
+  }
 }
 
 function resizeCanvas(){
@@ -1194,6 +1231,10 @@ async function poll(){
 window.addEventListener('resize',resizeCanvas);
 resizeCanvas();
 _paintZoomBtn();   // b535: reflect the zoom restored from localStorage
+if (typeof IrrigotoPath !== 'undefined') {
+  document.getElementById('btn-path-mode').textContent =
+    (IrrigotoPath.MODES[pathMode] || {label:'Path'}).label;
+}
 // Mark name field edited when user types so polling won't overwrite it
 document.getElementById('zone-name').addEventListener('input',function(){
   this.dataset.edited='1';
