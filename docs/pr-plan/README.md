@@ -1,19 +1,24 @@
 # PR plan: fork changes proposed for upstream
 
-This folder holds one description per change in the fork
-(`meshein6/irrigoto`). Each one can be pasted as the body of an upstream
-issue or PR and read without the others. It says what the change is, why it's
-needed, exactly what it touches, and how it was (or should be) tested.
+Every change in the fork (`meshein6/irrigoto`) lives on its own `fix/` or
+`feature/` branch, and each branch carries its own description at
+`docs/pr-plan/<branch-name>.md`. The file says what the change is, why it's
+needed, exactly what it touches, and how it was (or should be) tested. It can
+be pasted as the body of an upstream issue or PR.
 
-This folder is planning material. It lives on `feature/pr-plan` and in the
-fork's `combined` branch, and is **not** part of any upstream PR.
+`combined` collects all of them when the branches are merged in. This index
+exists only on `combined`.
+
+Before opening an upstream PR, drop the branch's `docs/pr-plan/` file from it
+(or leave it for the maintainer as a design note), and use its text as the PR
+description.
 
 ## Branches
 
 | Branch | What it is |
 |---|---|
 | `main` | Exact copy of upstream `rob-farrellrobotics/irrigoto` `main`. Never committed to. |
-| `combined` | `main` + every `fix/*` and `feature/*` branch not yet upstream. This is what the fork's devices run. Changes arrive only by merging a fix/feature branch. |
+| `combined` | `main` + every `fix/*` and `feature/*` branch not yet upstream. This is what the fork's devices run. Changes arrive only by merging a fix/feature branch; the one exception is this index file. |
 | `fix/<name>` | One bug fix, cut from `main`. |
 | `feature/<name>` | One feature, cut from `main` (unless noted). |
 
