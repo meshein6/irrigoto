@@ -36,7 +36,7 @@ The default, **Auto**, keeps today's behaviour exactly.
 - `auto` (default): today's per-mode order.
 - `sequential`: outer → inner, one ring after the next, **alternating
   direction every ring** so there's no swing back. This also removes the
-  ring-change swing from `fix/pulse-ring-swing`.
+  open-valve swing back to the arc start at each ring change.
 - `sections`: finish one lobe before the next.
   - For each ring, the arcs come from `water_find_arcs()` (up to
     `WATER_MAX_ARCS_PER_RING`, 10° sectors).
