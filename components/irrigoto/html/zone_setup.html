@@ -307,6 +307,7 @@ header{
   <button class="sbtn" id="btn-water" onclick="doAct('water_toggle')">💧 Water</button>
   <button class="sbtn" onclick="doAct('undo')">⌫ Undo</button>
   <button class="sbtn" onclick="doAct('clear')">✕ Clear</button>
+  <button class="sbtn" id="btn-zoom" onclick="toggleZoom()" title="Fit the map to this zone, or show the full reach">⛶ Zoom</button>
   <button class="sbtn" id="btn-path" onclick="togglePath()">◎ Path</button>
   <button class="sbtn" id="btn-heatmap" onclick="toggleHeatmap()">🌡 Depth</button>
   <button class="sbtn" id="btn-edit" onclick="toggleEdit()">✎ Edit</button>
@@ -342,7 +343,36 @@ let _editMode=false, _selPt=-1, _dragging=false, _cx=0, _cy=0, _maxR=1;
 // Display scale (mm at canvas rim): device's reported max throw (calibrated
 // reach, or live throw if pressure exceeds the cal table) + 3ft (914mm) buffer.
 // Tracks calibration, so the radar stays correctly scaled at any water pressure.
-function _edScale(){ return (ST.act_max_throw||10058) + 914; }
+// b535: zoom. 'full' keeps the historic behaviour (whole calibrated reach);
+// 'zone' fits the map to the zone's own extent so a small zone isn't a
+// cluster in the middle. Every draw path goes through _edScale(), so the zoom
+// is almost entirely this one function.
+let _zoom = 'full';
+try { const z = localStorage.getItem('irrigoto_map_zoom'); if (z === 'zone' || z === 'full') _zoom = z; } catch(_){}
+function _fullScale(){ return (ST.act_max_throw||10058) + 914; }
+// Zone extent x 1.15, floored so a 1-2 point zone can't collapse the scale.
+function _zoneScale(){
+  let m = 0;
+  for (const p of (ST.points||[])) if (p.throw_mm > m) m = p.throw_mm;
+  if (!(m > 0)) return _fullScale();
+  return Math.max(m * 1.15, 1200);
+}
+function _edScale(){ return _zoom === 'zone' ? Math.min(_zoneScale(), _fullScale()) : _fullScale(); }
+function _zoomed(){ return _zoom === 'zone' && _zoneScale() < _fullScale(); }
+// Reflect the restored zoom on the button once the DOM is up.
+function _paintZoomBtn(){
+  const b = document.getElementById('btn-zoom');
+  if (!b) return;
+  const on = _zoomed();
+  b.style.color = on ? 'var(--green)' : '';
+  b.style.borderColor = on ? 'var(--green)' : '';
+}
+function toggleZoom(){
+  _zoom = (_zoom === 'zone') ? 'full' : 'zone';
+  try { localStorage.setItem('irrigoto_map_zoom', _zoom); } catch(_){}
+  _paintZoomBtn();
+  draw();
+}
 const TRAIL_MAX = 120;
 let waterTrail = [];
 let lastWaterBearing = null;
@@ -819,8 +849,10 @@ function draw(){
   ctx.lineWidth   = 0.7;
   // Range rings + labels — tick list derived from the domain so the grid
   // adapts to any calibrated max throw (and thus any supply pressure).
-  const _maxFt = (ST.act_max_throw||10058)/304.8;
-  const _step  = _maxFt > 40 ? 10 : 5;
+  // Grid ticks span the VISIBLE domain, not the full reach, so a zoomed map
+  // keeps useful labels instead of one ring at the rim.
+  const _maxFt = _edScale()/304.8;
+  const _step  = _maxFt > 40 ? 10 : _maxFt > 18 ? 5 : _maxFt > 9 ? 2 : 1;
   const _ft = [];
   for(let f=_step; f<=_maxFt+0.01; f+=_step) _ft.push(f);
   _ft.forEach(ft => {
@@ -850,11 +882,15 @@ function draw(){
     ctx.strokeStyle='rgba(255,140,0,.55)'; ctx.lineWidth=1.5; ctx.stroke();
   }
 
-  // Current throw ring (dashed)
-  const throwR=(ST.throw_mm/_edScale())*maxR;
-  ctx.beginPath(); ctx.arc(cx,cy,throwR,0,Math.PI*2);
-  ctx.strokeStyle='rgba(0,232,122,.12)'; ctx.lineWidth=1;
-  ctx.setLineDash([3,5]); ctx.stroke(); ctx.setLineDash([]);
+  // Current throw ring (dashed). When zoomed, the spray can reach past the
+  // view -- clip the ring at the rim rather than drawing off-canvas.
+  const throwRraw=(ST.throw_mm/_edScale())*maxR;
+  const throwR=Math.min(throwRraw, maxR);
+  if (throwRraw <= maxR) {
+    ctx.beginPath(); ctx.arc(cx,cy,throwR,0,Math.PI*2);
+    ctx.strokeStyle='rgba(0,232,122,.12)'; ctx.lineWidth=1;
+    ctx.setLineDash([3,5]); ctx.stroke(); ctx.setLineDash([]);
+  }
 
   // Overlays (drawn before nozzle line so line stays on top)
   drawHeatMap(W, H, cx, cy, maxR);
@@ -879,8 +915,13 @@ function draw(){
   ctx.strokeStyle='rgba(0,232,122,.55)'; ctx.lineWidth=1.5;
   ctx.shadowBlur=14; ctx.shadowColor='#00e87a'; ctx.stroke(); ctx.shadowBlur=0;
 
-  // Throw indicator dot — at actual throw when valve open, else slider position
-  const actualThrowR = actualThrowMm > 100 ? (actualThrowMm/_edScale())*maxR : throwR;
+  // Throw indicator dot — at actual throw when valve open, else slider position.
+  // Clipped to the rim when zoomed; the distance is then written beside it so
+  // it's clear the spray goes past the view.
+  const _throwMmShown = actualThrowMm > 100 ? actualThrowMm : ST.throw_mm;
+  const actualThrowRraw = (_throwMmShown/_edScale())*maxR;
+  const actualThrowR = Math.min(actualThrowRraw, maxR);
+  const _throwClipped = actualThrowRraw > maxR;
   const dotIsActual = actualThrowMm > 100;
   const tx=cx+Math.cos(brad)*actualThrowR, ty=cy+Math.sin(brad)*actualThrowR;
   ctx.beginPath(); ctx.arc(tx,ty,5.5,0,Math.PI*2);
@@ -890,6 +931,13 @@ function draw(){
   if (dotIsActual) {
     ctx.beginPath(); ctx.arc(tx,ty,9,0,Math.PI*2);
     ctx.strokeStyle='rgba(0,232,122,.35)'; ctx.lineWidth=1.5; ctx.stroke();
+  }
+  if (_throwClipped) {
+    ctx.fillStyle='#00e87a'; ctx.font='10px "Courier New",monospace';
+    ctx.textAlign = (Math.cos(brad) < 0) ? 'right' : 'left';
+    ctx.textBaseline='middle';
+    ctx.fillText((_throwMmShown/304.8).toFixed(1) + "' \u2192",
+                 tx + (Math.cos(brad) < 0 ? -10 : 10), ty);
   }
 
   // Perimeter points
@@ -1099,7 +1147,9 @@ CV.addEventListener('pointerdown',e=>{
 CV.addEventListener('pointermove',e=>{
   if(!_editMode||!_dragging||_selPt<0) return;
   const {x,y}=_cxy(e); const dx=x-_cx, dy=y-_cy;
-  let r=Math.hypot(dx,dy)/_maxR*_edScale(); if(r>_edScale()) r=_edScale(); if(r<0) r=0;
+  // Clamp to the full calibrated reach, not the zoomed domain -- zooming in
+  // must not cap how far out a point can be dragged.
+  let r=Math.hypot(dx,dy)/_maxR*_edScale(); if(r>_fullScale()) r=_fullScale(); if(r<0) r=0;
   let deg=Math.atan2(dy,dx)*180/Math.PI+90; deg=((deg%360)+360)%360;
   ST.points[_selPt].throw_mm=r; ST.points[_selPt].deg=deg; draw();
 });
@@ -1141,6 +1191,7 @@ async function poll(){
 // ── Init ────────────────────────────────────────────────────────
 window.addEventListener('resize',resizeCanvas);
 resizeCanvas();
+_paintZoomBtn();   // b535: reflect the zoom restored from localStorage
 // Mark name field edited when user types so polling won't overwrite it
 document.getElementById('zone-name').addEventListener('input',function(){
   this.dataset.edited='1';
