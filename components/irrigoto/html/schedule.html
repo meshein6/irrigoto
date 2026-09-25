@@ -142,6 +142,30 @@ select:focus,input[type="time"]:focus{outline:1px solid var(--green);}
 .add-btn:disabled{opacity:.4;cursor:not-allowed;}
 
 .hint{font-size:11px;color:var(--text-mid);margin-top:4px;line-height:1.4;}
+
+/* Apply solution block (b534) */
+.sol{margin-top:12px;padding-top:12px;border-top:1px solid var(--border);}
+.sol-body{margin-top:10px;}
+.sol-body.off{display:none;}
+.sol .lbl{display:block;font-size:10px;letter-spacing:.12em;text-transform:uppercase;
+  color:var(--text-mid);margin:10px 0 4px;}
+.sol .lbl:first-child{margin-top:0;}
+.sub{display:none;margin-top:8px;}
+.sub.on{display:block;}
+.num{position:relative;}
+.num input{background:var(--bg3);border:1px solid var(--border);border-radius:var(--radius-sm);
+  color:var(--text);font-size:14px;padding:8px 26px 8px 10px;width:100%;font-family:inherit;
+  -moz-appearance:textfield;}
+.num input:focus{outline:1px solid var(--green);}
+.num input::-webkit-outer-spin-button,.num input::-webkit-inner-spin-button{-webkit-appearance:none;margin:0;}
+.num u{position:absolute;right:10px;top:50%;transform:translateY(-50%);font-size:12px;
+  color:var(--text-mid);text-decoration:none;}
+.est{display:flex;justify-content:space-between;align-items:baseline;margin-top:10px;
+  padding:8px 10px;border:1px solid var(--border);border-radius:var(--radius-sm);
+  background:var(--btn);font-size:12px;color:var(--text-mid);}
+.est b{color:var(--green);font-family:'Courier New',monospace;font-size:13px;font-weight:700;}
+.est b.unset{color:var(--orange);font-weight:400;font-size:11px;}
+.enabled-row{margin-top:12px;padding-top:12px;border-top:1px solid var(--border);}
 </style>
 </head>
 <body>
@@ -219,6 +243,7 @@ let state = {
   deviceTime: 0,
   tzOffsetMin: 0,
   delayUntil: 0,     // epoch; 0 = no delay
+  rates: null,       // b534: [[full,med,low] x3 bottles] mL/s from /api/solution_cal
 };
 
 // ── Initial load ─────────────────────────────────────────────────────────────
@@ -237,6 +262,7 @@ async function init() {
     state.tzOffsetMin = (typeof d.tz_offset_min === 'number') ? d.tz_offset_min : 0;
     state.delayUntil = d.delay_until || 0;
     renderAll();
+    loadRates();
   } catch (e) {
     document.getElementById('entries').innerHTML =
       '<div class="empty" style="color:var(--red)">Load failed: ' + (e.message||e) + '</div>';
@@ -252,7 +278,152 @@ function normalizeEntry(e) {
     minute: +e.minute || 0,
     days_mask: +e.days_mask || 0,
     enabled: e.enabled ? 1 : 0,
+    est_min: +e.est_min || 0,
+    // b534: Apply solution. The device serves defaults for missing fields.
+    solution_enabled: e.solution_enabled ? 1 : 0,
+    solution_bottles: (+e.solution_bottles & 7) || 1,
+    solution_when: +e.solution_when === 1 ? 1 : 0,
+    solution_every_n: Math.min(20, Math.max(2, +e.solution_every_n || 3)),
+    solution_speed: [60,80,100].includes(+e.solution_speed) ? +e.solution_speed : 100,
+    solution_pulse: e.solution_pulse ? 1 : 0,
+    solution_pulse_on_s: Math.min(600, Math.max(1, +e.solution_pulse_on_s || 2)),
+    solution_pulse_off_s: Math.min(600, Math.max(1, +e.solution_pulse_off_s || 4)),
   };
+}
+
+// ── Apply solution (b534) ────────────────────────────────────────────────────
+const SPEED_LABELS = {60:'Low', 80:'Medium', 100:'Full'};
+const SPEED_IDX = {100:0, 80:1, 60:2};
+
+async function loadRates() {
+  try {
+    const d = await fetch('/api/solution_cal', {cache:'no-store'}).then(r => r.json());
+    state.rates = d.rates || null;
+    document.querySelectorAll('#entries .card').forEach((card, i) => updateSolutionEst(card, state.entries[i]));
+  } catch (e) { /* estimates just stay unknown */ }
+}
+
+// Which bottle pumps first for this entry (lowest selected). The device
+// rotates through the set across runs; the estimate uses the first.
+function firstBottle(mask) { for (let b = 1; b <= 3; b++) if (mask & (1 << (b-1))) return b; return 1; }
+function bottleCount(mask) { return [1,2,4].filter(b => mask & b).length; }
+
+// mL per run = rate(bottle, speed) x pump-on seconds. Pump-on = run length
+// minus the 10 s start delay, scaled by the on/off ratio when pulsing.
+function estimateMl(e) {
+  if (!state.rates || !e.est_min) return null;
+  const rate = +state.rates[firstBottle(e.solution_bottles) - 1][SPEED_IDX[e.solution_speed]] || 0;
+  if (rate <= 0) return null;
+  let pumpS = Math.max(0, e.est_min * 60 - 10);
+  if (e.solution_pulse) pumpS *= e.solution_pulse_on_s / (e.solution_pulse_on_s + e.solution_pulse_off_s);
+  return { ml: pumpS * rate, pumpS: pumpS };
+}
+
+function fmtSecs(s) { const m = Math.floor(s/60), r = Math.round(s%60); return m ? m+' min'+(r?' '+r+' s':'') : r+' s'; }
+
+function updateSolutionEst(card, e) {
+  const l = card.querySelector('.est-l'), v = card.querySelector('.est-v');
+  if (!l || !v) return;
+  const est = estimateMl(e);
+  if (!e.est_min) { l.textContent = 'Run length unknown'; v.textContent = '—'; v.classList.add('unset'); return; }
+  let pumpS = Math.max(0, e.est_min * 60 - 10);
+  if (e.solution_pulse) pumpS *= e.solution_pulse_on_s / (e.solution_pulse_on_s + e.solution_pulse_off_s);
+  l.textContent = '~' + e.est_min + ' min run \u00b7 pump on ' + fmtSecs(pumpS);
+  if (!est) { v.textContent = 'calibrate bottle ' + firstBottle(e.solution_bottles); v.classList.add('unset'); return; }
+  v.textContent = '~' + (est.ml < 50 ? Math.round(est.ml) : Math.round(est.ml/5)*5) + ' mL';
+  v.classList.remove('unset');
+}
+
+function updateSolutionHints(card, e) {
+  const bits = [1,2,3].filter(b => e.solution_bottles & (1 << (b-1)));
+  card.querySelector('.bottles-hint').textContent = bits.length > 1
+    ? 'Alternates ' + bits.join(', ') + ', ' + bits[0] + '\u2026 across runs'
+    : 'Bottle ' + bits[0] + ' every run';
+  card.querySelector('.nth-hint').textContent = (e.solution_when === 1 && bits.length > 1)
+    ? 'Each bottle every ' + (e.solution_every_n * bits.length) + ' runs' : '';
+}
+
+function solutionBlockHtml(e) {
+  const chips = (cls, items, sel) => items.map(([v, lbl]) =>
+    '<button class="day' + (sel(v) ? ' sel' : '') + '" data-' + cls + '="' + v + '">' + lbl + '</button>').join('');
+  return '<div class="sol">' +
+    '<div class="toggle-row" style="padding:0">' +
+      '<span class="toggle-lbl">Apply solution</span>' +
+      '<label class="theme-switch"><input type="checkbox" data-k="sol_en"' + (e.solution_enabled ? ' checked' : '') + '>' +
+      '<span class="theme-slider"></span></label>' +
+    '</div>' +
+    '<div class="sol-body' + (e.solution_enabled ? '' : ' off') + '">' +
+      '<span class="lbl">Bottles</span>' +
+      '<div class="days" data-k="bottles">' + chips('b', [[1,'Bottle 1'],[2,'Bottle 2'],[3,'Bottle 3']], b => e.solution_bottles & (1 << (b-1))) + '</div>' +
+      '<div class="hint bottles-hint"></div>' +
+      '<span class="lbl">Pump speed</span>' +
+      '<div class="days" data-k="speed">' + chips('v', [[60,'Low'],[80,'Medium'],[100,'Full']], v => e.solution_speed === v) + '</div>' +
+      '<div class="hint">Low is the slowest the pump will turn under load.</div>' +
+      '<span class="lbl">When</span>' +
+      '<div class="days" data-k="when">' + chips('w', [[0,'Every run'],[1,'Every Nth run']], w => e.solution_when === w) + '</div>' +
+      '<div class="sub' + (e.solution_when === 1 ? ' on' : '') + '" data-k="nth-body">' +
+        '<div class="row" style="margin:0"><div class="col"><label>Every</label>' +
+          '<div class="num"><input type="number" data-k="nth" min="2" max="20" step="1" inputmode="numeric" value="' + e.solution_every_n + '"><u>runs</u></div></div><div class="col"></div></div>' +
+        '<div class="hint nth-hint"></div>' +
+      '</div>' +
+      '<div class="toggle-row" style="margin-top:12px;padding:0">' +
+        '<span class="toggle-lbl">Pulse solution</span>' +
+        '<label class="theme-switch"><input type="checkbox" data-k="pulse"' + (e.solution_pulse ? ' checked' : '') + '>' +
+        '<span class="theme-slider"></span></label>' +
+      '</div>' +
+      '<div class="sub' + (e.solution_pulse ? ' on' : '') + '" data-k="pulse-body">' +
+        '<div class="row" style="margin:0">' +
+          '<div class="col"><label>On</label><div class="num"><input type="number" data-k="on" min="1" max="600" step="1" inputmode="numeric" value="' + e.solution_pulse_on_s + '"><u>s</u></div></div>' +
+          '<div class="col"><label>Off</label><div class="num"><input type="number" data-k="off" min="1" max="600" step="1" inputmode="numeric" value="' + e.solution_pulse_off_s + '"><u>s</u></div></div>' +
+        '</div>' +
+        '<div class="hint">A deeper watering target runs longer, so the same on/off cycle delivers more solution. Re-check this if you change Depth.</div>' +
+      '</div>' +
+      '<div class="est"><span class="est-l"></span><b class="est-v"></b></div>' +
+    '</div>' +
+  '</div>';
+}
+
+function wireSolutionBlock(card, idx) {
+  const e = state.entries[idx];
+  const body = card.querySelector('.sol-body');
+  const refresh = () => { updateSolutionHints(card, e); updateSolutionEst(card, e); };
+  const clampNum = (el, lo, hi) => { let v = parseInt(el.value, 10); if (!(v >= lo)) v = lo; if (v > hi) v = hi; return v; };
+  card.querySelector('[data-k="sol_en"]').addEventListener('change', ev => {
+    e.solution_enabled = ev.target.checked ? 1 : 0;
+    body.classList.toggle('off', !ev.target.checked);
+  });
+  card.querySelectorAll('[data-k="bottles"] .day').forEach(btn => btn.addEventListener('click', () => {
+    const bit = 1 << (+btn.dataset.b - 1);
+    if ((e.solution_bottles & bit) && bottleCount(e.solution_bottles) === 1) return;  // keep one
+    e.solution_bottles ^= bit;
+    btn.classList.toggle('sel', !!(e.solution_bottles & bit));
+    refresh();
+  }));
+  card.querySelectorAll('[data-k="speed"] .day').forEach(btn => btn.addEventListener('click', () => {
+    e.solution_speed = +btn.dataset.v;
+    card.querySelectorAll('[data-k="speed"] .day').forEach(x => x.classList.toggle('sel', x === btn));
+    refresh();
+  }));
+  card.querySelectorAll('[data-k="when"] .day').forEach(btn => btn.addEventListener('click', () => {
+    e.solution_when = +btn.dataset.w;
+    card.querySelectorAll('[data-k="when"] .day').forEach(x => x.classList.toggle('sel', x === btn));
+    card.querySelector('[data-k="nth-body"]').classList.toggle('on', e.solution_when === 1);
+    refresh();
+  }));
+  const nth = card.querySelector('[data-k="nth"]');
+  nth.addEventListener('input', () => { e.solution_every_n = clampNum(nth, 2, 20); refresh(); });
+  nth.addEventListener('blur',  () => { nth.value = e.solution_every_n; });
+  card.querySelector('[data-k="pulse"]').addEventListener('change', ev => {
+    e.solution_pulse = ev.target.checked ? 1 : 0;
+    card.querySelector('[data-k="pulse-body"]').classList.toggle('on', !!e.solution_pulse);
+    refresh();
+  });
+  [['on','solution_pulse_on_s'],['off','solution_pulse_off_s']].forEach(([k, f]) => {
+    const el = card.querySelector('[data-k="' + k + '"]');
+    el.addEventListener('input', () => { e[f] = clampNum(el, 1, 600); refresh(); });
+    el.addEventListener('blur',  () => { el.value = e[f]; });
+  });
+  refresh();
 }
 
 // ── Render ───────────────────────────────────────────────────────────────────
@@ -459,7 +630,8 @@ function renderEntry(e, idx) {
         '<button class="day-preset" data-preset="0">None</button>' +
       '</div>' +
     '</div>' +
-    '<div class="toggle-row" style="margin-top:12px;">' +
+    solutionBlockHtml(e) +
+    '<div class="toggle-row enabled-row">' +
       '<span class="toggle-lbl">Enabled</span>' +
       '<label class="theme-switch">' +
         '<input type="checkbox" data-k="enabled"' + (e.enabled ? ' checked' : '') + '>' +
@@ -485,13 +657,14 @@ function renderEntry(e, idx) {
   });
   card.querySelector('[data-k="depth"]').addEventListener('change', ev => {
     state.entries[idx].depth = +ev.target.value;
+    updateSolutionEst(card, state.entries[idx]);   // est_min refreshes on save
   });
   card.querySelector('[data-k="enabled"]').addEventListener('change', ev => {
     state.entries[idx].enabled = ev.target.checked ? 1 : 0;
     card.classList.toggle('disabled', !ev.target.checked);
     updateEntryPreview(card, state.entries[idx]);
   });
-  card.querySelectorAll('.day').forEach(btn => {
+  card.querySelectorAll('[data-k="days"] .day').forEach(btn => {
     btn.addEventListener('click', () => {
       const bit = +btn.dataset.bit;
       state.entries[idx].days_mask ^= (1 << bit);
@@ -503,7 +676,7 @@ function renderEntry(e, idx) {
     btn.addEventListener('click', () => {
       const mask = +btn.dataset.preset;
       state.entries[idx].days_mask = mask;
-      card.querySelectorAll('.day').forEach(d => {
+      card.querySelectorAll('[data-k="days"] .day').forEach(d => {
         const bit = +d.dataset.bit;
         d.classList.toggle('sel', !!(mask & (1<<bit)));
       });
@@ -511,6 +684,7 @@ function renderEntry(e, idx) {
     });
   });
 
+  wireSolutionBlock(card, idx);
   return card;
 }
 
@@ -565,11 +739,11 @@ function addEntry() {
   if (state.entries.length >= state.maxEntries) return;
   // Sensible defaults: first available zone, Smooth 1/8", 6:00 AM, every day.
   const firstZone = state.zones.length ? state.zones[0].id + 1 : 1;
-  state.entries.push({
+  state.entries.push(normalizeEntry({
     zone: firstZone, mode: 2, depth: 1,
     hour: 6, minute: 0,
     days_mask: 127, enabled: 1,
-  });
+  }));
   renderAll();
   // Scroll the new entry into view.
   const el = document.getElementById('entries');
@@ -585,7 +759,9 @@ function delEntry(idx) {
 // ── Save / clear ─────────────────────────────────────────────────────────────
 function entriesToText(entries) {
   return entries.map(e =>
-    [e.zone, e.mode, e.depth, e.hour, e.minute, e.days_mask, e.enabled].join(',')
+    [e.zone, e.mode, e.depth, e.hour, e.minute, e.days_mask, e.enabled,
+     e.solution_enabled, e.solution_bottles, e.solution_when, e.solution_every_n,
+     e.solution_speed, e.solution_pulse, e.solution_pulse_on_s, e.solution_pulse_off_s].join(',')
   ).join(';');
 }
 
@@ -609,6 +785,11 @@ async function saveAll() {
     if (d.ok) {
       st.className = 'ok';
       st.textContent = 'Saved ✓ ' + state.lastStatus;
+      // b534: the device re-estimates run length on save; refresh the mL strips.
+      (d.entries || []).forEach((de, i) => {
+        if (state.entries[i]) state.entries[i].est_min = +de.est_min || 0;
+      });
+      document.querySelectorAll('#entries .card').forEach((card, i) => updateSolutionEst(card, state.entries[i]));
     } else {
       st.className = 'err';
       st.textContent = state.lastStatus;

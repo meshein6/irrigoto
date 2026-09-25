@@ -54,3 +54,10 @@ Documents/
 # Editor / IDE state — per-developer, often contains user-folder paths.
 .vscode/
 .idea/
+
+# macOS folder metadata
+.DS_Store
+
+# Device calibration/state snapshots pulled by push.sh before an OTA.
+# Per-unit data (zone geometry, cal points) — keep local.
+cal-backups/

@@ -203,6 +203,86 @@ Schedule entries and the HA select use their own numbering — `0` Pulse,
 web digit. If you add a mode, `docs/adding_a_watering_mode.md` lists every
 place a mode list is hardcoded.
 
+## Apply solution (pump dosing)
+
+Units that ship with the three peristaltic solution pumps can dose a watering
+run from one of three bottles. The stock OtO firmware has no pump code; this
+is greenfield (Build 534). It is configured per schedule entry and per manual
+run, not per zone, so two entries on the same zone can dose differently.
+
+- **Schedule entry** — the "Apply solution" block on each entry: bottle(s)
+  (multi-select rotates 1, 2, 3, … across runs), pump speed (Low / Medium /
+  Full = 60 / 80 / 100 % PWM), when (every run, or every Nth run of that
+  entry), and optional pulsing (on / off seconds). The block shows an estimated
+  mL per run.
+- **Manual run** — the Water modal on the landing page has the same block minus
+  the scheduling parts, one bottle only. Settings are remembered in the browser,
+  not on the device, and are sent as `solution_*` params on `POST /zone/water`
+  (absent = no dose, so HA's water-now service is unaffected).
+- **Bottle calibration** (`/bottle_cal`, linked from the landing page's
+  Calibration card) — mL/s per bottle per speed. Only used for the estimate; the
+  device cannot measure flow. Run a pump into a cup with the outlet line off,
+  weigh what was consumed (1 g ≈ 1 mL), enter the rate.
+
+Runtime: the pump starts 10 s after water is confirmed flowing and stops when
+the run ends, on every exit path (complete, fault, cancel, sleep). One pump at a
+time; a new request kills the running one. The drive line is also dropped
+whenever the 9 V motor rail goes down, so nothing can outlive a rail-off.
+
+Storage: schedule entries widened from 20 to 32 bytes (schema 4, migrated on
+first boot). Calibration and the per-entry run counters live in their own NVS
+namespace (`solution`), so HA schedule pushes never touch them. The legacy
+`text=` schedule save accepts 7 fields (solution block kept) or 15 fields
+(solution block replaced).
+
+Code lives in `components/irrigoto/pump.c` (hardware only) and `solution.c`
+(dosing logic); `irrigoto.c` carries only the hooks and HTTP handlers.
+
+### Pump hardware (found by probing, 2026-09-20)
+
+Nothing in the stock firmware or the OtO pin summary documents the pumps; the
+following was established by pulsing lines while watching the pumps, with
+`PCur` (GPIO34) as the electrical witness.
+
+| Line | Role |
+| ---- | ---- |
+| **GPIO16** | Pump drive, active-high. Needs the 9 V motor rail (`GPIO18`); reads 0 mA with it off. |
+| **GPIO21** | Selects pump 2 when held high before GPIO16 rises. |
+| **GPIO19** | Selects pump 3 when held high before GPIO16 rises. |
+| *(neither)* | GPIO16 alone drives pump 1. |
+| **GPIO34 / ADC1_CH6 (`PCur`)** | Pump current sense — wired on this board despite the pin summary saying otherwise. INA4180A3 chain: 142 mV zero offset, `I(mA) = (mV − 142) × 0.2`. Reads 60–300 mA per pump; brushed-motor ripple makes single samples swing ±50 %. |
+
+Physical positions: pump 1 = GPIO16 alone, pump 2 = GPIO21 + GPIO16, pump 3 =
+GPIO19 + GPIO16 (owner-confirmed; the selector is raised ~20 ms before the
+drive, and the driver keeps that order). All three pump bottle → outlet as
+wired; there is no reverse line. Selection is fully independent — no hardware
+modification needed.
+
+Ruled out: the SX1501 expander bits P3–P7 (silent, and bits 4–7 don't even
+latch — the part is a 4-I/O SX1501, not the SX1502 the detector assumes), and
+GPIO 2, 5, 12, 14, 15, 33.
+
+**Speed control** works only with PWM at **20 kHz**. Under roller load the
+motor cannot restart after each off-period at lower frequencies (1–5 kHz
+stalls and hums, 200 Hz is marginal); unloaded tests suggested the opposite and
+should be ignored. Measured floor at 20 kHz, loaded: **60 % duty** turns
+reliably, 50 % twitches, 40 % and below stall. Average PCur while turning is
+~270 mA at 100 %, ~215 at 80 %, ~160 at 60 %. Hence the three UI speeds.
+Stall detection (flat PCur trace while driving) is possible but not implemented
+— every measurement so far was with dry tubing.
+
+**Feed line and bottles.** The clear feed line from each pump to its feed cap
+measures 3/16″ OD with a ~0.03″ wall (≈ 1/8″ ID, 3.2 × 4.8 mm). The bottle sits
+opening-up under a screw-on feed cap, so a dip tube to the bottom of the bottle
+is required; the stock caps on this unit have none (it was most likely part of
+OtO's proprietary bottle, which was discontinued in January 2025). Rigid
+aquarium airline tubing (3/16″ OD × 1/8″ ID) pushed into the cap is a direct
+fit. The cap needs a vent, or the pump pulls a vacuum. Jog each bottle from
+`/bottle_cal` until the line is primed before relying on a scheduled dose.
+
+Back-flow prevention on the plumbing side is required before injecting into a
+hose supply.
+
 ## Winter sleep
 
 Off-season hibernation. The device closes and pressure-verifies the valve,

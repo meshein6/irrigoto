@@ -106,11 +106,17 @@ typedef struct {
 //   - source      : 0=unknown, 1=user_device, 2=user_ha, 3=algorithm. No
 //                   behavior wired up yet — informational only.
 //
-// Field order is chosen so the struct packs to 16 bytes on ESP32 (4-byte
-// aligned uint32_t members first, then the existing uint8_t cluster).
-// Old NVS blobs (7 bytes/entry) are auto-migrated on first boot — see
-// schedule_load_nvs() in irrigoto.c.
+// Field order is chosen so the struct packs on ESP32 (4-byte aligned uint32_t
+// members first, then the uint8_t cluster). Old NVS blobs are auto-migrated on
+// first boot -- see schedule_load_nvs() in irrigoto.c.
+//
+// Schema 4 (b534) appends the "Apply solution" block. Every solution field is
+// zero in a migrated or freshly inserted entry, and zero means "default" (see
+// solution_cfg_from_entry() in solution.c: bottles 0 -> bottle 1, speed 0 ->
+// 100 %, on/off 0 -> 2 s / 4 s). That keeps HA's sync path -- which never
+// writes these fields -- from ever having to know about them.
 #define SCHEDULE_MAX_ENTRIES 32
+#define SCHEDULE_SCHEMA      4
 typedef struct {
     uint32_t id;            // 1-based, stable across edits. 0 = unassigned (wire only).
     uint32_t last_modified; // unix epoch of last edit (0 if never set)
@@ -132,12 +138,43 @@ typedef struct {
     uint8_t  minute;        // 0-59
     uint8_t  days_mask;     // bit0=Sun, bit1=Mon, ..., bit6=Sat (matches tm_wday)
     uint8_t  enabled;       // 0/1 — disabled entries stay in storage but don't fire
-} schedule_entry_t;         // sizeof() == 20 (3×u32 + 8×u8, 4-aligned)
+    // ── Apply solution (schema 4) ──
+    uint8_t  solution_enabled;      // 0/1: dose this entry's runs at all
+    uint8_t  solution_bottles;      // bitmask bit0..2 = bottle 1..3; >1 bit rotates
+    uint8_t  solution_when;         // 0 = every run, 1 = every Nth run
+    uint8_t  solution_every_n;      // 2..20, only for solution_when == 1
+    uint8_t  solution_speed;        // pump PWM %, 60/80/100 (Low/Medium/Full)
+    uint8_t  solution_pulse;        // 0 = continuous, 1 = on/off cycle
+    uint16_t solution_pulse_on_s;   // 1..600
+    uint16_t solution_pulse_off_s;  // 1..600
+    uint8_t  _rsv[2];
+} schedule_entry_t;         // sizeof() == 32
 
 typedef struct {
     uint8_t          count;
     schedule_entry_t entries[SCHEDULE_MAX_ENTRIES];
 } schedule_t;
+
+// Schema-3 entry (b403..b533): tagged, no solution block. Kept so the NVS
+// migration recognizes the old blob size (644 B) and widens each entry.
+typedef struct {
+    uint32_t id;
+    uint32_t last_modified;
+    uint32_t client_tag;
+    uint8_t  source;
+    uint8_t  zone;
+    uint8_t  mode;
+    uint8_t  depth;
+    uint8_t  hour;
+    uint8_t  minute;
+    uint8_t  days_mask;
+    uint8_t  enabled;
+} schedule_entry_v3_t;      // sizeof() == 20
+
+typedef struct {
+    uint8_t              count;
+    schedule_entry_v3_t  entries[SCHEDULE_MAX_ENTRIES];
+} schedule_v3_t;
 
 // Old-schema entry as it lived in NVS pre-b355. Kept here so the migration
 // path in schedule_load_nvs() can recognize the legacy blob size and
