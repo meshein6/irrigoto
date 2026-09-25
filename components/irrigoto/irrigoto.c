@@ -11717,7 +11717,7 @@ static void phase_water_zone(void)
     // the estimate uses calibrated flow. No-supply detection moves to the
     // first ring instead (see s_supply_regulated below).
     if (s_supply_regulated && !demo_mode && !serpentine_dry) {
-        INFO("Supply check skipped (regulated)");
+        INFO("Supply check skipped (regulated) -- no full-open spray");
     }
     if (!s_supply_regulated && !demo_mode && !serpentine_dry && psi_max > 0.5f) {
         valve_goto(VALVE_OPEN_DEG, 1.0f, 8000, false);
