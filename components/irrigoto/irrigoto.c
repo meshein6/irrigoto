@@ -8944,7 +8944,14 @@ typedef struct {
 // 36 rings x (turn + sweep) + boundary-hug waypoint (b426) and multi-arc
 // slack. Static: the water task stack is 16 KB and has history of running
 // close (b285).
-#define SERPENTINE_MAX_LEGS 256
+// b547: 256 -> 384. The measured run on a 20-ring zone hit the cap at ring 13
+// and truncated, so the outer third was planned but never watered -- and it
+// said so in one INFO line that is easy to miss. A boundary-hug turn alone
+// emits ~33 legs, so ~20 legs/ring average; 20 rings needs ~400. 384 covers
+// the measured case with the dry-hop saving from b541, and costs 4 KB of the
+// 8.5 KB freed by shrinking mr_buf. It is NOT enough for finer coverage
+// (29 rings would want ~580); that needs the shared-arena work first.
+#define SERPENTINE_MAX_LEGS 384
 // b426: boundary-hugging turns. Waypoint pitch along the connector, and how
 // far inside the polygon's radial extent the hug path rides. The hug radius
 // at each waypoint is min(linear glide, perimeter extent - margin); a turn
@@ -9196,7 +9203,11 @@ static int serpentine_build_pass_plan(
 
 #define SERPENTINE_EMIT(_b, _v, _duty, _dps, _ring, _dir, _kind, _throw) do {      \
         if (n >= SERPENTINE_MAX_LEGS) {                                            \
-            INFO("Serpentine plan: leg cap (%d) hit -- truncating", SERPENTINE_MAX_LEGS);\
+            /* b547: this silently watered part of the zone. Say so loudly --
+               it is a coverage failure, not a formatting detail. */          \
+            WARN("Serpentine plan TRUNCATED at the %d-leg cap -- the rest of " \
+                 "this zone will NOT be watered this pass. Use coarser "      \
+                 "coverage, or a smaller zone.", SERPENTINE_MAX_LEGS);        \
             return n;                                                         \
         }                                                                     \
         s_serpentine_legs[n++] = (serpentine_leg_t){ .b1_deg=(_b), .v1_deg=(_v),        \

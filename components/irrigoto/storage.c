@@ -762,13 +762,19 @@ esp_err_t storage_make_room(size_t bytes_needed, uint16_t skip_zone_id)
     // Collect all water log files for zones other than skip_zone_id.
     // We'll delete binary/csv data files first (bulk), then JSON summaries.
     typedef struct { uint16_t zone_id; uint8_t is_data; char name[60]; } mr_ent_t;
-    static mr_ent_t mr_buf[200];
+    // b547: was [200] = 12.8 KB of filenames sitting in .bss permanently, for
+    // a list that only exists inside this one call. 64 is ample -- the loop
+    // deletes until enough space is free and returns, and make_room is called
+    // again if more is needed, so a short list costs at most another pass over
+    // the directory. Frees 8.5 KB of a DRAM segment that was at 95.7 %.
+    #define MR_MAX_ENTS 64
+    static mr_ent_t mr_buf[MR_MAX_ENTS];
     int mr_n = 0;
 
     DIR *d = opendir(WATER_DIR);
     if (d) {
         struct dirent *ent;
-        while ((ent = readdir(d)) && mr_n < 200) {
+        while ((ent = readdir(d)) && mr_n < MR_MAX_ENTS) {
             if (strncmp(ent->d_name, "water_", 6) != 0) continue;
             uint16_t zid = (uint16_t)atoi(ent->d_name + 6);
             if (zid == skip_zone_id) continue;
