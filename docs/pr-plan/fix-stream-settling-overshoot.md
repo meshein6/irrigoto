@@ -1,9 +1,41 @@
 # Fix: the stream over- and undershoots when the throw distance changes
 
 **Branch:** `fix/stream-settling-overshoot` · **Type:** fix · **Status:**
-planned, cause not yet identified. Observed 2026-09-25: on a distance change
-the stream visibly overshoots or undershoots and takes roughly half a second
-to settle to the new distance.
+FIXED in b543 and confirmed on hardware. Observed 2026-09-25: on a distance
+change the stream visibly overshoots or undershoots and takes roughly half a
+second to settle to the new distance.
+
+## Cause (confirmed)
+
+Candidate 3 below, essentially: closed-loop pressure seeking rather than
+trusting a precalculated angle. `water_hold_pressure()` runs a feedforward to
+the calibrated angle and then corrects that angle against measured pressure
+up to `WATER_PRESSURE_ITER` (8) times with a 500 ms settle after each nudge.
+That settling is the overshoot, and it runs at every distance change.
+
+The owner identified this from the symptom before the code was read --
+"is it trying to do a closed loop pressure adjustment vs saying x actuator
+opening IS the target for this pass" -- which is exactly what it was doing.
+
+## Fix
+
+Gated on **Regulated water supply**: `water_hold_pressure_ex(..., correct)`
+always does the feedforward, and only runs the correction loop when asked.
+The two watering call sites pass `!s_supply_regulated`; the five calibration
+call sites always correct, since measuring is the point there. On a well or
+pressure tank the loop still runs, which is where it earns its keep.
+
+Confirmed by the owner on hardware after b543: the overshoot is gone.
+
+## Still open
+
+Whether throws land accurately over a whole run without the correction. The
+loop was also compensating for any error in the pressure calibration, so a
+zone whose cal is off will now show it. The tell is throws landing
+consistently short or long; the fix for that is to recalibrate pressure, not
+to re-enable the hunt.
+
+## Original triage notes (kept for the record)
 
 ## What is actually being observed
 
