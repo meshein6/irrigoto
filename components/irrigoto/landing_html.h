@@ -110,31 +110,36 @@ section{margin-bottom:18px;}
 .dev-val{color:var(--text);font-family:'Courier New',monospace;font-size:12px;}
 .cal-desc{font-size:12px;color:var(--text-mid);margin-bottom:10px;line-height:1.5;}
 /* Water modal */
-#modal-bg,#wp-bg{display:none;position:fixed;inset:0;background:rgba(0,0,0,.7);
+#modal-bg,#sys-bg{display:none;position:fixed;inset:0;background:rgba(0,0,0,.7);
   z-index:100;align-items:flex-end;justify-content:center;}
-#modal-bg.open,#wp-bg.open{display:flex;}
-#modal,#wp{background:var(--bg2);border:1px solid var(--border);
+#modal-bg.open,#sys-bg.open{display:flex;}
+#modal,#sys{background:var(--bg2);border:1px solid var(--border);
   border-radius:var(--radius) var(--radius) 0 0;padding:20px;width:100%;
   max-width:480px;max-height:92vh;overflow-y:auto;}
-/* WiFi & power modal */
-.wp-sec{font-size:11px;letter-spacing:.12em;text-transform:uppercase;color:var(--text-mid);margin:4px 0 8px;}
-.wp-field{display:flex;flex-direction:column;gap:4px;margin-bottom:10px;}
-.wp-field label{font-size:12px;color:var(--text-mid);}
-.wp-in{display:flex;align-items:center;gap:6px;background:var(--bg3);border:1px solid var(--border);
+/* System settings modal */
+.sys-sec{font-size:11px;letter-spacing:.12em;text-transform:uppercase;color:var(--text-mid);margin:4px 0 8px;}
+.sys-field{display:flex;flex-direction:column;gap:4px;margin-bottom:10px;}
+.sys-field label{font-size:12px;color:var(--text-mid);}
+.sys-in{display:flex;align-items:center;gap:6px;background:var(--bg3);border:1px solid var(--border);
   border-radius:var(--radius-sm);padding:0 10px;}
-.wp-in input{flex:1;min-width:0;background:transparent;border:0;color:var(--text);font-size:14px;
+.sys-in input{flex:1;min-width:0;background:transparent;border:0;color:var(--text);font-size:14px;
   padding:9px 0;font-family:inherit;}
-.wp-in input:focus{outline:none;}
-.wp-in u{text-decoration:none;color:var(--text-mid);font-size:12px;}
-.wp-in button{background:none;border:0;color:var(--text-mid);font-size:12px;cursor:pointer;padding:4px;}
-.wp-row{display:flex;gap:10px;}
-.wp-row .wp-field{flex:1;}
-.wp-hint{font-size:11px;color:var(--text-mid);line-height:1.5;margin:-2px 0 12px;}
-.wp-chips{display:flex;gap:6px;margin-bottom:12px;flex-wrap:wrap;}
-.wp-chips .btn{flex:1;justify-content:center;font-size:12px;padding:8px 6px;}
-.wp-chips .btn.sel{border-color:var(--green);background:var(--green-dim);color:var(--green);}
-.wp-status{font-size:12px;color:var(--text-mid);text-align:center;margin-top:8px;min-height:16px;}
-.wp-div{border-top:1px solid var(--border);margin:14px 0;}
+.sys-in input:focus{outline:none;}
+.sys-in u{text-decoration:none;color:var(--text-mid);font-size:12px;}
+.sys-in button{background:none;border:0;color:var(--text-mid);font-size:12px;cursor:pointer;padding:4px;}
+.sys-row{display:flex;gap:10px;}
+.sys-row .sys-field{flex:1;}
+.sys-hint{font-size:11px;color:var(--text-mid);line-height:1.5;margin:-2px 0 12px;}
+.sys-chips{display:flex;gap:6px;margin-bottom:12px;flex-wrap:wrap;}
+.sys-chips .btn{flex:1;justify-content:center;font-size:12px;padding:8px 6px;}
+.sys-chips .btn.sel{border-color:var(--green);background:var(--green-dim);color:var(--green);}
+.sys-status{font-size:12px;color:var(--text-mid);text-align:center;margin-top:8px;min-height:16px;}
+.sys-div{border-top:1px solid var(--border);margin:14px 0;}
+.sys-in select{flex:1;min-width:0;background:transparent;border:0;color:var(--text);font-size:14px;
+  padding:9px 0;font-family:inherit;}
+.sys-in select:focus{outline:none;}
+.sys-in select option{background:var(--bg2);color:var(--text);}
+.sys-link{background:none;border:0;color:var(--green);font-size:12px;cursor:pointer;padding:0;text-decoration:underline;}
 .modal-title{font-size:16px;font-weight:600;margin-bottom:4px;}
 .modal-sub{font-size:12px;color:var(--text-mid);margin-bottom:18px;}
 .mode-grid{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-bottom:18px;}
@@ -241,7 +246,7 @@ section{margin-bottom:18px;}
         <span class="dev-label">Winter sleep</span><span class="dev-val" id="d-winter">Off</span>
       </div>
       <div class="zone-actions" style="margin-top:10px">
-        <button class="btn" onclick="openWp()">&#9881; WiFi &amp; power</button>
+        <button class="btn" onclick="openSys()">&#9881; System settings</button>
       </div>
       <div class="zone-actions" style="margin-top:10px">
         <button class="btn" id="ap-mode-btn" onclick="apMode()">&#128246; AP Setup Mode</button>
@@ -254,43 +259,57 @@ section{margin-bottom:18px;}
   </section>
 </main>
 
-<!-- Water modal -->
-<div id="wp-bg" onclick="if(event.target===this)closeWp()">
-  <div id="wp">
-    <div class="modal-title">WiFi &amp; power</div>
-    <div class="modal-sub">Network the device joins, and how long it stays awake between sleeps.</div>
+<!-- System settings modal -->
+<div id="sys-bg" onclick="if(event.target===this)closeSys()">
+  <div id="sys">
+    <div class="modal-title">System settings</div>
+    <div class="modal-sub">Network the device joins, how long it stays awake between sleeps, and the timezone schedules run in.</div>
 
-    <div class="wp-sec">Network</div>
-    <div class="wp-field"><label for="wp-ssid">WiFi name (SSID)</label>
-      <div class="wp-in"><input id="wp-ssid" maxlength="32" autocomplete="off" autocapitalize="off" spellcheck="false"></div></div>
-    <div class="wp-field"><label for="wp-pass">Password</label>
-      <div class="wp-in"><input id="wp-pass" type="password" maxlength="63" autocomplete="off" autocapitalize="off" spellcheck="false">
-        <button type="button" id="wp-eye" onclick="wpEye()">show</button></div></div>
-    <div class="wp-hint" id="wp-net-hint">&mdash;</div>
-    <div class="modal-actions"><button class="btn" id="wp-net-btn" onclick="wpSaveNet()">Save network &amp; reboot</button></div>
-    <div class="wp-status" id="wp-net-status"></div>
+    <div class="sys-sec">Network</div>
+    <div class="sys-field"><label for="sys-ssid">WiFi name (SSID)</label>
+      <div class="sys-in"><input id="sys-ssid" maxlength="32" autocomplete="off" autocapitalize="off" spellcheck="false"></div></div>
+    <div class="sys-field"><label for="sys-pass">Password</label>
+      <div class="sys-in"><input id="sys-pass" type="password" maxlength="63" autocomplete="off" autocapitalize="off" spellcheck="false">
+        <button type="button" id="sys-eye" onclick="sysEye()">show</button></div></div>
+    <div class="sys-hint" id="sys-net-hint">&mdash;</div>
+    <div class="modal-actions"><button class="btn" id="sys-net-btn" onclick="sysSaveNet()">Save network &amp; reboot</button></div>
+    <div class="sys-status" id="sys-net-status"></div>
 
-    <div class="wp-div"></div>
-    <div class="wp-sec">Wake period</div>
-    <div class="wp-chips">
-      <button class="btn" data-p="on" onclick="wpPreset('on')">Always on</button>
-      <button class="btn" data-p="300" onclick="wpPreset('default',300,300)">300 s / 300 s (default)</button>
-      <button class="btn" data-p="custom" onclick="wpPreset('custom')">Custom</button>
+    <div class="sys-div"></div>
+    <div class="sys-sec">Wake period</div>
+    <div class="sys-chips">
+      <button class="btn" data-p="on" onclick="sysPreset('on')">Always on</button>
+      <button class="btn" data-p="300" onclick="sysPreset('default',300,300)">300 s / 300 s (default)</button>
+      <button class="btn" data-p="custom" onclick="sysPreset('custom')">Custom</button>
     </div>
-    <div class="wp-row" id="wp-cycle">
-      <div class="wp-field"><label for="wp-awake">Stay awake after last activity</label>
-        <div class="wp-in"><input id="wp-awake" type="number" min="30" max="3600" step="1" inputmode="numeric" oninput="wpCycleHint()"><u>seconds</u></div></div>
-      <div class="wp-field"><label for="wp-sleep">Then sleep for</label>
-        <div class="wp-in"><input id="wp-sleep" type="number" min="30" max="3600" step="1" inputmode="numeric" oninput="wpCycleHint()"><u>seconds</u></div></div>
+    <div class="sys-row" id="sys-cycle">
+      <div class="sys-field"><label for="sys-awake">Stay awake after last activity</label>
+        <div class="sys-in"><input id="sys-awake" type="number" min="30" max="3600" step="1" inputmode="numeric" oninput="sysCycleHint()"><u>seconds</u></div></div>
+      <div class="sys-field"><label for="sys-sleep">Then sleep for</label>
+        <div class="sys-in"><input id="sys-sleep" type="number" min="30" max="3600" step="1" inputmode="numeric" oninput="sysCycleHint()"><u>seconds</u></div></div>
     </div>
-    <div class="wp-hint" id="wp-cycle-hint"></div>
+    <div class="sys-hint" id="sys-cycle-hint"></div>
     <div class="modal-actions">
-      <button class="btn" onclick="closeWp()">Close</button>
-      <button class="btn btn-primary" id="wp-pow-btn" onclick="wpSavePower()">Save wake period</button>
+      <button class="btn btn-primary" id="sys-pow-btn" onclick="sysSavePower()">Save wake period</button>
     </div>
-    <div class="wp-status" id="wp-pow-status"></div>
+    <div class="sys-status" id="sys-pow-status"></div>
+
+    <div class="sys-div"></div>
+    <div class="sys-sec">Timezone</div>
+    <div class="sys-field"><label for="sys-tz">Schedule times are in</label>
+      <div class="sys-in"><select id="sys-tz" onchange="sysTzChanged()"></select></div></div>
+    <div class="sys-field" id="sys-tz-custom-f" style="display:none"><label for="sys-tz-custom">POSIX TZ string</label>
+      <div class="sys-in"><input id="sys-tz-custom" maxlength="63" autocomplete="off" autocapitalize="off" spellcheck="false" placeholder="e.g. EST5EDT,M3.2.0/2,M11.1.0/2"></div></div>
+    <div class="sys-hint" id="sys-tz-hint">&mdash;</div>
+    <div class="modal-actions">
+      <button class="btn" onclick="closeSys()">Close</button>
+      <button class="btn btn-primary" id="sys-tz-btn" onclick="sysSaveTz()">Save timezone</button>
+    </div>
+    <div class="sys-status" id="sys-tz-status"></div>
   </div>
 </div>
+
+<!-- Water modal -->
 
 <div id="modal-bg" onclick="if(event.target===this)closeModal()">
   <div id="modal">
@@ -493,91 +512,199 @@ function openModal(id, name){
 }
 function closeModal(){ document.getElementById('modal-bg').classList.remove('open'); }
 
-// ── WiFi & power modal ───────────────────────────────────────────────────────
+// ── System settings modal ────────────────────────────────────────────────────
 // Everything here is in SECONDS. Awake = how long the device stays up after the
 // last activity (web page, command, motor use); sleep = the deep-sleep nap
 // before it wakes again. A scheduled run always shortens the nap so it wakes
 // in time, and watering / calibration / OTA always hold it awake.
-let wpAlwaysOn=false, wpSsid0='';
-const wpEl=id=>document.getElementById(id);
-function wpClampS(v){ v=Math.round(+v); return isFinite(v)?Math.min(3600,Math.max(30,v)):300; }
-async function openWp(){
-  wpEl('wp-net-status').textContent=''; wpEl('wp-pow-status').textContent='';
-  wpEl('wp-bg').classList.add('open');
+let sysAlwaysOn=false, sysSsid0='';
+const sysEl=id=>document.getElementById(id);
+function sysClampS(v){ v=Math.round(+v); return isFinite(v)?Math.min(3600,Math.max(30,v)):300; }
+async function openSys(){
+  sysEl('sys-net-status').textContent=''; sysEl('sys-pow-status').textContent='';
+  sysEl('sys-bg').classList.add('open');
   try{
-    const d=await fetch('/api/wifi_power',{cache:'no-store'}).then(r=>r.json());
-    wpSsid0=d.ssid||'';
-    wpEl('wp-ssid').value=wpSsid0;
-    wpEl('wp-pass').value=d.password||'';
-    wpEl('wp-pass').type='password'; wpEl('wp-eye').textContent='show';
-    wpEl('wp-net-hint').textContent = d.connected
-      ? 'Connected to “'+wpSsid0+'” ('+d.rssi+' dBm).'
+    const d=await fetch('/api/system',{cache:'no-store'}).then(r=>r.json());
+    sysSsid0=d.ssid||'';
+    sysEl('sys-ssid').value=sysSsid0;
+    sysEl('sys-pass').value=d.password||'';
+    sysEl('sys-pass').type='password'; sysEl('sys-eye').textContent='show';
+    sysEl('sys-net-hint').textContent = d.connected
+      ? 'Connected to “'+sysSsid0+'” ('+d.rssi+' dBm).'
       : 'Not connected to a network right now.';
-    wpEl('wp-awake').value=d.awake_s; wpEl('wp-sleep').value=d.sleep_s;
-    wpAlwaysOn=!!d.always_on;
-    wpMarkPreset();
-  }catch(e){ wpEl('wp-net-hint').textContent='Could not read settings: '+e.message; }
+    sysEl('sys-awake').value=d.awake_s; sysEl('sys-sleep').value=d.sleep_s;
+    sysAlwaysOn=!!d.always_on;
+    sysMarkPreset();
+    sysTzLoad(d);
+  }catch(e){ sysEl('sys-net-hint').textContent='Could not read settings: '+e.message; }
 }
-function closeWp(){ wpEl('wp-bg').classList.remove('open'); }
-function wpEye(){
-  const p=wpEl('wp-pass'), show=p.type==='password';
-  p.type=show?'text':'password'; wpEl('wp-eye').textContent=show?'hide':'show';
+function closeSys(){ sysEl('sys-bg').classList.remove('open'); }
+function sysEye(){
+  const p=sysEl('sys-pass'), show=p.type==='password';
+  p.type=show?'text':'password'; sysEl('sys-eye').textContent=show?'hide':'show';
 }
-function wpPreset(p,awake,sleep){
-  if(p==='on'){ wpAlwaysOn=true; }
-  else { wpAlwaysOn=false; if(p!=='custom'){ wpEl('wp-awake').value=awake; wpEl('wp-sleep').value=sleep; } }
-  wpMarkPreset();
+function sysPreset(p,awake,sleep){
+  if(p==='on'){ sysAlwaysOn=true; }
+  else { sysAlwaysOn=false; if(p!=='custom'){ sysEl('sys-awake').value=awake; sysEl('sys-sleep').value=sleep; } }
+  sysMarkPreset();
 }
-function wpMarkPreset(){
-  const a=wpClampS(wpEl('wp-awake').value), s=wpClampS(wpEl('wp-sleep').value);
-  const cur = wpAlwaysOn ? 'on' : (a===300&&s===300 ? '300' : 'custom');
-  document.querySelectorAll('.wp-chips .btn').forEach(b=>b.classList.toggle('sel',b.dataset.p===cur));
-  wpEl('wp-cycle').style.opacity = wpAlwaysOn ? '.4' : '';
-  wpEl('wp-awake').disabled = wpEl('wp-sleep').disabled = wpAlwaysOn;
-  wpCycleHint();
+function sysMarkPreset(){
+  const a=sysClampS(sysEl('sys-awake').value), s=sysClampS(sysEl('sys-sleep').value);
+  const cur = sysAlwaysOn ? 'on' : (a===300&&s===300 ? '300' : 'custom');
+  document.querySelectorAll('.sys-chips .btn').forEach(b=>b.classList.toggle('sel',b.dataset.p===cur));
+  sysEl('sys-cycle').style.opacity = sysAlwaysOn ? '.4' : '';
+  sysEl('sys-awake').disabled = sysEl('sys-sleep').disabled = sysAlwaysOn;
+  sysCycleHint();
 }
-function wpCycleHint(){
-  const h=wpEl('wp-cycle-hint');
-  if(wpAlwaysOn){ h.textContent='Never sleeps. Reachable at any time, but uses several times more battery than a sleep cycle.'; return; }
-  const a=wpClampS(wpEl('wp-awake').value), s=wpClampS(wpEl('wp-sleep').value);
+function sysCycleHint(){
+  const h=sysEl('sys-cycle-hint');
+  if(sysAlwaysOn){ h.textContent='Never sleeps. Reachable at any time, but uses several times more battery than a sleep cycle.'; return; }
+  const a=sysClampS(sysEl('sys-awake').value), s=sysClampS(sysEl('sys-sleep').value);
   h.textContent='Awake at least '+a+' s after the last activity, then asleep '+s+' s. Awake about '+
     Math.round(100*a/(a+s))+'% of the time when idle. Each value 30–3600 seconds.';
-  document.querySelectorAll('.wp-chips .btn').forEach(b=>b.classList.toggle('sel',
+  document.querySelectorAll('.sys-chips .btn').forEach(b=>b.classList.toggle('sel',
     b.dataset.p===(a===300&&s===300?'300':'custom')));
 }
-async function wpSavePower(){
-  const st=wpEl('wp-pow-status'), btn=wpEl('wp-pow-btn');
-  const a=wpClampS(wpEl('wp-awake').value), s=wpClampS(wpEl('wp-sleep').value);
-  wpEl('wp-awake').value=a; wpEl('wp-sleep').value=s;
+async function sysSavePower(){
+  const st=sysEl('sys-pow-status'), btn=sysEl('sys-pow-btn');
+  const a=sysClampS(sysEl('sys-awake').value), s=sysClampS(sysEl('sys-sleep').value);
+  sysEl('sys-awake').value=a; sysEl('sys-sleep').value=s;
   btn.disabled=true; st.style.color=''; st.textContent='Saving…';
   try{
-    const d=await fetch('/api/wifi_power',{method:'POST',
+    const d=await fetch('/api/system',{method:'POST',
       headers:{'Content-Type':'application/x-www-form-urlencoded'},
-      body:'always_on='+(wpAlwaysOn?1:0)+'&awake_s='+a+'&sleep_s='+s}).then(r=>r.json());
-    wpAlwaysOn=!!d.always_on; wpEl('wp-awake').value=d.awake_s; wpEl('wp-sleep').value=d.sleep_s;
-    wpMarkPreset();
+      body:'always_on='+(sysAlwaysOn?1:0)+'&awake_s='+a+'&sleep_s='+s}).then(r=>r.json());
+    sysAlwaysOn=!!d.always_on; sysEl('sys-awake').value=d.awake_s; sysEl('sys-sleep').value=d.sleep_s;
+    sysMarkPreset();
     st.style.color='var(--green)';
     st.textContent = d.always_on ? 'Saved: always on.' : 'Saved: awake '+d.awake_s+' s, sleep '+d.sleep_s+' s.';
   }catch(e){ st.style.color='#f87171'; st.textContent='Save failed: '+e.message; }
   btn.disabled=false;
 }
-async function wpSaveNet(){
-  const st=wpEl('wp-net-status'), ssid=wpEl('wp-ssid').value.trim(), pass=wpEl('wp-pass').value;
+async function sysSaveNet(){
+  const st=sysEl('sys-net-status'), ssid=sysEl('sys-ssid').value.trim(), pass=sysEl('sys-pass').value;
   if(!ssid){ st.style.color='#f87171'; st.textContent='Enter a WiFi name.'; return; }
   if(pass && (pass.length<8 || pass.length>63)){ st.style.color='#f87171'; st.textContent='Password must be 8–63 characters (or empty for an open network).'; return; }
   if(!confirm('Save “'+ssid+'” and reboot?\n\nThe device will restart and join this network. '+
       'If it can’t connect, it opens its fallback hotspot after about a minute, '+
       'where you can enter the details again.')) return;
-  wpEl('wp-net-btn').disabled=true; st.style.color=''; st.textContent='Saving…';
+  sysEl('sys-net-btn').disabled=true; st.style.color=''; st.textContent='Saving…';
   try{
-    const r=await fetch('/api/wifi_power',{method:'POST',
+    const r=await fetch('/api/system',{method:'POST',
       headers:{'Content-Type':'application/x-www-form-urlencoded'},
       body:'ssid='+encodeURIComponent(ssid)+'&password='+encodeURIComponent(pass)});
     if(!r.ok) throw new Error(await r.text());
     st.style.color='var(--green)';
     st.textContent='Saved. Rebooting to join “'+ssid+'”. '+
-      (ssid===wpSsid0 ? 'This page reconnects in about 30 seconds.' : 'Open the device on that network once it’s up.');
-  }catch(e){ st.style.color='#f87171'; st.textContent='Save failed: '+e.message; wpEl('wp-net-btn').disabled=false; }
+      (ssid===sysSsid0 ? 'This page reconnects in about 30 seconds.' : 'Open the device on that network once it’s up.');
+  }catch(e){ st.style.color='#f87171'; st.textContent='Save failed: '+e.message; sysEl('sys-net-btn').disabled=false; }
+}
+// Timezone. The device keeps UTC and applies a POSIX TZ string to it, so each
+// choice here is an IANA name (saved as the label) plus its POSIX rule. The
+// first option clears the saved zone and returns to the one compiled into the
+// firmware (device_posix_tz). Ids after the first are aliases with the same rule.
+const SYS_TZ=[
+  ['America/New_York','Eastern (US & Canada)','EST5EDT,M3.2.0/2,M11.1.0/2',['America/Detroit','America/Toronto','America/Indiana/Indianapolis','America/Kentucky/Louisville']],
+  ['America/Chicago','Central (US & Canada)','CST6CDT,M3.2.0/2,M11.1.0/2',['America/Winnipeg','America/Indiana/Knox','America/Menominee']],
+  ['America/Denver','Mountain (US & Canada)','MST7MDT,M3.2.0/2,M11.1.0/2',['America/Edmonton','America/Boise']],
+  ['America/Phoenix','Arizona (no DST)','MST7',[]],
+  ['America/Los_Angeles','Pacific (US & Canada)','PST8PDT,M3.2.0/2,M11.1.0/2',['America/Vancouver','America/Tijuana']],
+  ['America/Anchorage','Alaska','AKST9AKDT,M3.2.0/2,M11.1.0/2',['America/Juneau']],
+  ['Pacific/Honolulu','Hawaii','HST10',[]],
+  ['America/Halifax','Atlantic (Canada)','AST4ADT,M3.2.0/2,M11.1.0/2',['America/Moncton']],
+  ['America/St_Johns','Newfoundland','NST3:30NDT,M3.2.0/2,M11.1.0/2',[]],
+  ['America/Puerto_Rico','Atlantic (no DST)','AST4',[]],
+  ['America/Mexico_City','Mexico City','CST6',['America/Monterrey']],
+  ['America/Sao_Paulo','Brasília','<-03>3',['America/Argentina/Buenos_Aires','America/Montevideo']],
+  ['Europe/London','UK','GMT0BST,M3.5.0/1,M10.5.0/2',['Europe/Dublin','Europe/Guernsey','Europe/Jersey','Europe/Isle_of_Man']],
+  ['Europe/Lisbon','Western Europe','WET0WEST,M3.5.0/1,M10.5.0',['Atlantic/Canary','Atlantic/Madeira']],
+  ['Europe/Berlin','Central Europe','CET-1CEST,M3.5.0,M10.5.0/3',['Europe/Paris','Europe/Madrid','Europe/Rome','Europe/Amsterdam','Europe/Brussels','Europe/Vienna','Europe/Zurich','Europe/Stockholm','Europe/Oslo','Europe/Copenhagen','Europe/Warsaw','Europe/Prague','Europe/Budapest']],
+  ['Europe/Athens','Eastern Europe','EET-2EEST,M3.5.0/3,M10.5.0/4',['Europe/Helsinki','Europe/Bucharest','Europe/Sofia','Europe/Riga','Europe/Vilnius','Europe/Tallinn','Europe/Kyiv','Europe/Kiev']],
+  ['Europe/Moscow','Moscow','MSK-3',[]],
+  ['Africa/Johannesburg','South Africa','SAST-2',[]],
+  ['Asia/Dubai','Gulf','<+04>-4',['Asia/Muscat']],
+  ['Asia/Kolkata','India','IST-5:30',['Asia/Calcutta']],
+  ['Asia/Singapore','Singapore','<+08>-8',['Asia/Kuala_Lumpur','Asia/Manila']],
+  ['Asia/Shanghai','China','CST-8',['Asia/Hong_Kong','Asia/Taipei']],
+  ['Asia/Tokyo','Japan','JST-9',[]],
+  ['Asia/Seoul','Korea','KST-9',[]],
+  ['Australia/Perth','Western Australia','AWST-8',[]],
+  ['Australia/Adelaide','South Australia','ACST-9:30ACDT,M10.1.0,M4.1.0/3',['Australia/Broken_Hill']],
+  ['Australia/Darwin','Northern Territory','ACST-9:30',[]],
+  ['Australia/Brisbane','Queensland','AEST-10',[]],
+  ['Australia/Sydney','Eastern Australia','AEST-10AEDT,M10.1.0,M4.1.0/3',['Australia/Melbourne','Australia/Canberra','Australia/Hobart']],
+  ['Pacific/Auckland','New Zealand','NZST-12NZDT,M9.5.0,M4.1.0/3',[]],
+  ['UTC','UTC','UTC0',['Etc/UTC','GMT','Etc/GMT']],
+];
+let sysTzDefault='';
+function sysTzFind(id){ return SYS_TZ.findIndex(z=>z[0]===id||z[3].includes(id)); }
+function sysTzOffStr(m){
+  const sg=m<0?'−':'+'; m=Math.abs(m);
+  return 'UTC'+sg+String(Math.floor(m/60)).padStart(2,'0')+':'+String(m%60).padStart(2,'0');
+}
+function sysTzLoad(d){
+  sysTzDefault=d.tz_default||'';
+  const dflt=SYS_TZ.find(z=>z[2]===sysTzDefault);
+  const sel=sysEl('sys-tz');
+  sel.innerHTML='<option value="default">Firmware default ('+(dflt?dflt[1]:sysTzDefault||'UTC')+')</option>'+
+    SYS_TZ.map((z,i)=>'<option value="'+i+'">'+z[1]+' — '+z[0]+'</option>').join('')+
+    '<option value="custom">Custom POSIX string…</option>';
+  let v='default';
+  if(d.tz_saved){
+    const i=sysTzFind(d.tz_name);
+    v = (i>=0 && SYS_TZ[i][2]===d.tz) ? String(i) : 'custom';
+  }
+  sel.value=v;
+  sysEl('sys-tz-custom').value = v==='custom' ? d.tz : '';
+  sysEl('sys-tz-status').textContent='';
+  sysTzShow(d);
+  sysTzChanged();
+}
+// Current device time and zone, plus a one-tap fix when the phone's zone differs.
+function sysTzShow(d){
+  const h=sysEl('sys-tz-hint');
+  const where = d.tz_saved ? (d.tz_name||'custom')+' ('+d.tz+')' : 'firmware default ('+d.tz+')';
+  const t = d.now>1700000000 ? fmtLocalEpoch(d.now, d.tz_offset_min)+' ' : 'Clock not set yet. ';
+  let msg='Device time: '+t+sysTzOffStr(d.tz_offset_min)+', '+where+'.';
+  const phone=(Intl.DateTimeFormat().resolvedOptions().timeZone)||'';
+  const pi=sysTzFind(phone);
+  h.innerHTML='';
+  h.appendChild(document.createTextNode(msg));
+  if(phone && pi>=0 && SYS_TZ[pi][2]!==d.tz){
+    h.appendChild(document.createTextNode(' This phone is on '+phone+'. '));
+    const b=document.createElement('button'); b.className='sys-link'; b.type='button';
+    b.textContent='Use it'; b.onclick=()=>{ sysEl('sys-tz').value=String(pi); sysTzChanged(); };
+    h.appendChild(b);
+  }
+}
+function sysTzChanged(){
+  sysEl('sys-tz-custom-f').style.display = sysEl('sys-tz').value==='custom' ? '' : 'none';
+}
+async function sysSaveTz(){
+  const st=sysEl('sys-tz-status'), btn=sysEl('sys-tz-btn'), v=sysEl('sys-tz').value;
+  let tz='', name='';
+  if(v==='custom'){
+    tz=sysEl('sys-tz-custom').value.trim();
+    if(!tz){ st.style.color='#f87171'; st.textContent='Enter a POSIX TZ string, e.g. EST5EDT,M3.2.0/2,M11.1.0/2.'; return; }
+    const phone=(Intl.DateTimeFormat().resolvedOptions().timeZone)||'';
+    name = sysTzFind(phone)<0 ? phone : '';
+  } else if(v!=='default'){
+    const z=SYS_TZ[+v]; tz=z[2];
+    const phone=(Intl.DateTimeFormat().resolvedOptions().timeZone)||'';
+    name = z[3].includes(phone) ? phone : z[0];
+  }
+  btn.disabled=true; st.style.color=''; st.textContent='Saving…';
+  try{
+    const r=await fetch('/api/system',{method:'POST',
+      headers:{'Content-Type':'application/x-www-form-urlencoded'},
+      body:'tz='+encodeURIComponent(tz)+'&tz_name='+encodeURIComponent(name)});
+    if(!r.ok) throw new Error(await r.text());
+    const d=await r.json();
+    sysTzLoad(d);
+    st.style.color='var(--green)';
+    st.textContent='Saved. Schedules now run on '+(d.tz_saved?(d.tz_name||d.tz):'the firmware default')+' time.';
+  }catch(e){ st.style.color='#f87171'; st.textContent='Save failed: '+e.message; }
+  btn.disabled=false;
 }
 function selMode(btn){
   document.querySelectorAll('.mode-btn').forEach(b=>b.classList.remove('sel'));

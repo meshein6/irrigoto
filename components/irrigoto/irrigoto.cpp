@@ -757,7 +757,7 @@ extern "C" void irrigoto_wifi_enable_component(void) {
 // it doesn't drop the live link or trigger the AP, which is why b396 never
 // showed an AP). clear_sta() is RAM-only and start() reloads the compiled creds
 // on the next BOOT, so a reboot/power-cycle reverts to the home network.
-// WiFi & power modal: persist new station credentials through ESPHome's own
+// System settings modal: persist new station credentials through ESPHome's own
 // store (the one the captive portal writes). WiFiComponent loads it at boot in
 // preference to the compiled !secret credentials, so the caller reboots after.
 extern "C" void irrigoto_wifi_save_sta(const char *ssid, const char *password) {
