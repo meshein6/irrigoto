@@ -510,7 +510,8 @@ R"PATHJS(
         '<button class="ipo-btn ipo-play" aria-label="Play">&#9654;</button>' +
         '<input type="range" min="0" max="1000" step="1" value="0" aria-label="Position along the path">' +
         '<span class="ipo-at">start</span>' +
-      '</div>';
+      '</div>' +
+      '<div class="ipo-note"></div>';
     var css = document.createElement('style');
     css.textContent =
       '#irr-path-ov{display:none;position:fixed;inset:0;background:rgba(0,0,0,.88);' +
@@ -527,7 +528,9 @@ R"PATHJS(
       '#irr-path-ov .ipo-btn.sel{border-color:var(--green);background:var(--green-dim);color:var(--green);}' +
       '#irr-path-ov .ipo-scrub input{flex:1;min-width:0;}' +
       '#irr-path-ov .ipo-at{font-family:"Courier New",monospace;font-size:11px;' +
-        'min-width:96px;text-align:right;}';
+        'min-width:96px;text-align:right;}' +
+      '#irr-path-ov .ipo-note{width:min(92vw,620px);font-size:11px;' +
+        'color:var(--text-mid);text-align:center;min-height:14px;}';
     document.head.appendChild(css);
     document.body.appendChild(el);
     ov = {
@@ -539,13 +542,14 @@ R"PATHJS(
       play: el.querySelector('.ipo-play'),
       range: el.querySelector('input'),
       at: el.querySelector('.ipo-at'),
+      note: el.querySelector('.ipo-note'),
       opts: null, mode: '7', passIdx: 0, t: 0, timer: null,
-      passes: 1, passesExact: true
+      variants: [], passNoteText: ''
     };
     el.addEventListener('click', function (e) { if (e.target === el) ovClose(); });
     ov.el.querySelector('.ipo-x').addEventListener('click', ovClose);
     ov.pass.addEventListener('click', function () {
-      ov.passIdx = (ov.passIdx + 1) % Math.max(1, ov.passes);
+      ov.passIdx = (ov.passIdx + 1) % Math.max(1, ov.variants.length);
       ovPassLabel();
       ovDraw();
     });
@@ -566,25 +570,45 @@ R"PATHJS(
     }, 33);
   }
 
-  /* b542: the stepper used to run 1..4, which is no mode's pass count. Pulse
-   * does exactly depth8 identical passes; Gentle caps at 20 and Smooth,
-   * Serpentine and Sections at 30, all exiting early once the rings meet
-   * target. So Pulse is exact and the rest are an upper bound -- say which,
-   * rather than implying a plan the run will not follow. It matters beyond
-   * labelling: serpentine and sections alternate sweep DIRECTION by pass, so
-   * a pass index the run never reaches draws the sweep the wrong way. */
-  function modePasses(modeKey, depth8) {
+  /* b544: show the DISTINCT pictures, not a pass count.
+   *
+   * b542 put the real caps on the button and they read as nonsense: "Pass 1
+   * of up to 30". Thirty is a safety ceiling on an adaptive loop that exits
+   * as soon as every ring meets target -- it is not a plan, and quoting it
+   * suggests the sprinkler intends thirty laps.
+   *
+   * It was also claiming variety that does not exist. Only two things change
+   * between passes: sweep direction, and for serpentine/sections whether the
+   * rings run outward or inward. Both flip every pass, so pass 3 is pass 1
+   * again. There are at most TWO different pictures for any mode, and Pulse
+   * repeats one picture depth8 times.
+   *
+   * So the control steps between those, labelled by what actually differs,
+   * and the repeat count is stated in words instead of as a fake total. */
+  function passVariants(modeKey) {
+    if (modeKey === 'chase' || modeKey === 'demo') return [];
+    if (modeKey === 'pulse') return [];               /* every pass identical */
+    if (modeKey === 'serpentine' || modeKey === 'sections')
+      return ['Outer \u2192 in', 'Inner \u2192 out'];
+    return ['Sweep one way', 'Sweep back'];           /* gentle, smooth */
+  }
+
+  /* What the run actually does with those, in plain words. */
+  function passNote(modeKey, depth8) {
     var d = (depth8 >= 1 && depth8 <= 8) ? depth8 : 1;
-    if (modeKey === 'pulse')  return { n: d,  exact: true };
-    if (modeKey === 'gentle') return { n: 20, exact: false };
-    if (modeKey === 'chase' || modeKey === 'demo') return { n: 1, exact: true };
-    return { n: 30, exact: false };      /* smooth, serpentine, sections */
+    if (modeKey === 'chase' || modeKey === 'demo') return '';
+    if (modeKey === 'pulse')
+      return d > 1 ? 'Repeats this pass ' + d + ' times' : 'One pass';
+    if (modeKey === 'smooth')
+      return 'Alternates until every ring reaches the target depth; the ring '
+           + 'order is chosen during the run';
+    return 'Alternates until every ring reaches the target depth';
   }
 
   function ovPassLabel() {
-    ov.pass.textContent = ov.passesExact
-      ? 'Pass ' + (ov.passIdx + 1) + ' of ' + ov.passes
-      : 'Pass ' + (ov.passIdx + 1) + ' of up to ' + ov.passes;
+    var v = ov.variants;
+    ov.pass.textContent = v.length ? v[ov.passIdx % v.length] : '';
+    if (ov.note) ov.note.textContent = ov.passNoteText || '';
   }
 
   function ovClose() {
@@ -617,11 +641,10 @@ R"PATHJS(
     ov.mode = MODES[opts.mode] ? opts.mode : '7';
     ov.passIdx = 0; ov.t = 0; ov.range.value = 0;
     var mk = (MODES[ov.mode] || MODES['1']).key;
-    var mp = modePasses(mk, opts.depth8);
-    ov.passes = mp.n; ov.passesExact = mp.exact;
-    /* One pass means nothing to step through -- hide the control rather than
-     * offer a stepper that cannot move. */
-    ov.pass.style.display = (ov.passes > 1) ? '' : 'none';
+    ov.variants = passVariants(mk);
+    ov.passNoteText = passNote(mk, opts.depth8);
+    /* Nothing to step through when every pass looks the same. */
+    ov.pass.style.display = ov.variants.length ? '' : 'none';
     ovPassLabel();
     /* Locked: the caller already chose the mode, so show it as a static chip
      * rather than letting the preview disagree with the run that will happen. */
@@ -640,10 +663,10 @@ R"PATHJS(
         b.addEventListener('click', function () {
           ov.mode = m;
           var k = (MODES[m] || MODES['1']).key;
-          var q = modePasses(k, ov.opts.depth8);
-          ov.passes = q.n; ov.passesExact = q.exact;
-          if (ov.passIdx >= ov.passes) ov.passIdx = 0;
-          ov.pass.style.display = (ov.passes > 1) ? '' : 'none';
+          ov.variants = passVariants(k);
+          ov.passNoteText = passNote(k, ov.opts.depth8);
+          if (ov.passIdx >= ov.variants.length) ov.passIdx = 0;
+          ov.pass.style.display = ov.variants.length ? '' : 'none';
           ovPassLabel();
           ov.modes.querySelectorAll('.ipo-btn').forEach(function (x) { x.classList.toggle('sel', x === b); });
           ovDraw();
