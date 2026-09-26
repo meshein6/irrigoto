@@ -48,7 +48,7 @@ number (see CONTRIBUTING.md). So fork branches must not claim build numbers:
 | Branch | Type | Status | Description |
 |---|---|---|---|
 | `feature/solution-dosing` | feature | **done**, in `combined` | [Three-bottle pump dosing](feature-solution-dosing.md) |
-| `feature/supply-regulated` | feature | planned | ["Supply regulated" setting to skip the 12 s pressure check](feature-supply-regulated.md) |
+| `feature/supply-regulated` | feature | planned | ["Regulated water supply": trust the pressure calibration during a run](feature-supply-regulated.md) |
 | `feature/manual-mode-depth` | feature | planned | [Manual run: pick mode and depth separately, mode tooltips](feature-manual-mode-depth.md) |
 | `fix/throw-cal-units` | fix | planned | [Say mm / feet on the throw calibration steps](fix-throw-cal-units.md) |
 | `feature/ring-order` | feature | planned | [Per-zone ring order](feature-ring-order.md) |

@@ -1,10 +1,10 @@
-# "Supply regulated" setting: skip the start-of-run pressure check
+# "Regulated water supply": trust the pressure calibration during a run
 
 **Branch:** `feature/supply-regulated` · **Type:** feature · **Status:** built, merged into `combined` and flashed to hardware (b535).
 
 ## Summary
 
-Add one device setting, **Supply regulated** (default **off**). When it's on,
+Add one device setting, **Regulated water supply** (default **off**). When on,
 watering runs skip the ~12 s full-open supply pressure check at the start and
 trust the pressure calibration. Regulated supplies (city mains, or anything
 behind a pressure regulator) don't vary meaningfully from run to run, so the
@@ -58,7 +58,7 @@ check adds nothing and costs 12 s of full-throw spray.
   and `/api/auto_sleep`. Add `"supply_regulated"` to the status JSON and `/api/all`.
 - Landing page Device card: a switch styled like Theme, with an ⓘ:
 
-  > **Supply regulated.** Turn on if your water comes from city mains or goes
+  > **Regulated water supply.** Turn on if your water comes from city mains or goes
   > through a pressure regulator. Pressure then stays about the same from run to
   > run, so the sprinkler skips the 12-second full-power pressure check at the
   > start of each run (which can spray past the edge of small zones) and trusts
@@ -85,3 +85,30 @@ already skip the check.
 - Water turned off, setting on: the run aborts as NO_SUPPLY within ~10–15 s,
   and HA reports MISSED.
 - Setting off: identical to today.
+
+## b543: it also skips the per-ring pressure hunt
+
+Shipped originally as "skip the 12 s check". A second, larger effect was
+identified afterwards from the symptom "the stream over- and undershoots for
+about half a second when the distance changes".
+
+`water_hold_pressure()` moves the valve to the angle the calibration says
+produces the target pressure (feedforward), and then corrects that angle
+against measured pressure up to `WATER_PRESSURE_ITER` (8) times, waiting
+500 ms after each nudge. That settling is the visible overshoot, and it
+happens at every distance change, not just at run start.
+
+On a regulated supply the calibrated angle is already right, so the loop is
+chasing noise -- its tolerance is 0.15 PSI against a supply measured cycling
+around 6.5 PSI. The correction is now gated: `water_hold_pressure_ex(...,
+correct)` takes the feedforward always and the loop only when asked. The two
+watering call sites (`phase_water_zone` ring 0, `water_cleanup_pass`) pass
+`!s_supply_regulated`; the five calibration call sites always correct, since
+measuring is the entire point there.
+
+So the setting now means one coherent thing: **trust the pressure calibration
+instead of measuring during the run.** Both effects follow from that.
+
+Renamed to "Regulated water supply" at the same time. The NVS key
+(`supply_reg`) and the endpoint (`/api/supply_regulated`) are unchanged, so
+no stored state or integration breaks.

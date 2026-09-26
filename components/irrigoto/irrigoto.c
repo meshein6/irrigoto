@@ -2249,6 +2249,8 @@ static void watering_log_capture_stop(void);
 static void watering_wifi_pause(void);
 static void watering_wifi_resume(void);
 static float water_hold_pressure(float target_psi, float psi_min, float psi_max);
+static float water_hold_pressure_ex(float target_psi, float psi_min, float psi_max,
+                                    bool correct);   // b543
 static float water_seat_valve_from_closed(float target_psi, float *out_psi);
 static void zone_web_start(void);
 static void phase_valve_jog_explore(void);
@@ -7279,7 +7281,22 @@ static bool zone_gap_is_empty(const zone_perimeter_t *z, float gap_lo,
 
 // Move valve to target_psi using feedforward + proportional correction.
 // Returns actual PSI achieved.
-static float water_hold_pressure(float target_psi, float psi_min, float psi_max)
+//
+// b543: `correct` selects whether the closed-loop part runs. The feedforward
+// -- go to the angle the calibration says produces this pressure -- always
+// does. The loop that follows then second-guesses that angle against measured
+// pressure, up to WATER_PRESSURE_ITER times with a 500 ms settle each, and
+// that is what makes the stream visibly over- and undershoot for about half a
+// second whenever the distance changes.
+//
+// On a well pump or pressure tank the supply really does differ from what
+// calibration saw, so the correction earns its keep. On a regulated supply
+// the calibrated angle is already right and the loop is chasing noise: the
+// tolerance is 0.15 PSI against a supply measured cycling around 6.5 PSI.
+// Calibration itself always corrects -- measuring is the whole point there --
+// so only the watering paths pass correct=false.
+static float water_hold_pressure_ex(float target_psi, float psi_min, float psi_max,
+                                    bool correct)
 {
     float deg = cal_pressure_to_valve_deg(target_psi);
     if (deg < 0) deg = VALVE_CAL_START_DEG;
@@ -7287,6 +7304,12 @@ static float water_hold_pressure(float target_psi, float psi_min, float psi_max)
     vTaskDelay(pdMS_TO_TICKS(800));
 
     float actual = target_psi;
+    if (!correct) {
+        // Trust the calibration. Read once so the caller still gets a real
+        // number back, but never move the valve again for this ring.
+        if (!mprls_read(&actual)) actual = target_psi;
+        return actual;
+    }
     for (int i = 0; i < WATER_PRESSURE_ITER; i++) {
         if (!mprls_read(&actual)) break;
         float err = target_psi - actual;
@@ -7300,6 +7323,12 @@ static float water_hold_pressure(float target_psi, float psi_min, float psi_max)
         vTaskDelay(pdMS_TO_TICKS(500));
     }
     return actual;
+}
+
+// Calibration and the manual valve controls keep the closed loop.
+static float water_hold_pressure(float target_psi, float psi_min, float psi_max)
+{
+    return water_hold_pressure_ex(target_psi, psi_min, psi_max, true);
 }
 
 // b367: pressure-feedback valve seating for low-pressure inner rings.
@@ -11921,7 +11950,8 @@ static void phase_water_zone(void)
     // meant to prevent. Reverted: when regulated, the valve is not forced open
     // here at all; each mode's own valve control opens it for the first ring.
     if (s_supply_regulated && !demo_mode && !serpentine_dry) {
-        INFO("Supply check skipped (regulated) -- no full-open spray");
+        INFO("Regulated water supply: skipping the full-open supply check "
+             "and the per-ring pressure hunt -- using calibration angles");
     }
     if (!s_supply_regulated && !demo_mode && !serpentine_dry && psi_max > 0.5f) {
         valve_goto(VALVE_OPEN_DEG, 1.0f, 8000, false);
@@ -13097,7 +13127,8 @@ static void phase_water_zone(void)
                     float _ap  = 0.0f;
                     if (ring == 0) {
                         if (_tp > 0.5f)
-                            _ap = water_hold_pressure(_tp, psi_min, psi_max);
+                            _ap = water_hold_pressure_ex(_tp, psi_min, psi_max,
+                                                         !s_supply_regulated);  // b543
                         else
                             vTaskDelay(pdMS_TO_TICKS(1500));
                     } else {
@@ -14032,7 +14063,8 @@ static void water_cleanup_pass(
                       valve_deg_r > VALVE_CLOSED_DEG ? 1 : -1);
         nozzle_goto(seg_origin, 1.5f, 10000, false);
         s_nozzle_last_dir = cw ? 1 : -1;
-        water_hold_pressure(target_psi_r, psi_min, psi_max);
+        water_hold_pressure_ex(target_psi_r, psi_min, psi_max,
+                               !s_supply_regulated);   // b543
         vTaskDelay(pdMS_TO_TICKS(300));
 
         speed_map_t spd = {0};
@@ -16439,7 +16471,7 @@ static esp_err_t api_supply_regulated_handler(httpd_req_t *req)
         if (n > 0 && httpd_query_key_value(b, "on", v, sizeof(v)) == ESP_OK) {
             s_supply_regulated = (atoi(v) != 0);
             pm_nvs_save_u8("supply_reg", s_supply_regulated ? 1 : 0);
-            INFO("Supply regulated %s (persisted)", s_supply_regulated ? "ON" : "off");
+            INFO("Regulated water supply %s (persisted)", s_supply_regulated ? "ON" : "off");
         }
     }
     char resp[48];

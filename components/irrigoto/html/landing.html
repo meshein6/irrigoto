@@ -313,10 +313,10 @@ section{margin-bottom:18px;}
           <span class="theme-slider"></span>
         </label>
       </div>
-      <div class="dev-row" title="Skip the start-of-run pressure check on a regulated supply">
-        <span class="dev-label">Supply regulated
+      <div class="dev-row" title="Trust the pressure calibration instead of measuring and correcting during a run">
+        <span class="dev-label">Regulated water supply
           <button class="info-btn" onclick="toggleSupplyHelp()" aria-expanded="false"
-                  aria-controls="supply-help" aria-label="What Supply regulated does">i</button>
+                  aria-controls="supply-help" aria-label="What Regulated water supply does">i</button>
         </span>
         <label class="theme-switch">
           <input type="checkbox" id="supply-cb" onchange="setSupplyRegulated(this.checked)">
@@ -324,13 +324,25 @@ section{margin-bottom:18px;}
         </label>
       </div>
       <div class="mode-help" id="supply-help" style="margin:0 0 10px">
-        <b>Supply regulated.</b> Turn on if your water comes from city mains or goes
-        through a pressure regulator. Pressure then stays about the same from run to
-        run, so the sprinkler skips the 12-second full-power pressure check at the
-        start of each run &mdash; which can spray past the edge of small zones &mdash;
-        and trusts the pressure calibration. Leave off for a well pump or pressure
-        tank, where pressure rises and falls as the pump cycles. If runs start landing
-        short or long after turning this on, recalibrate pressure or turn it back off.
+        <b>Regulated water supply.</b> Turn this on if your water comes from city
+        mains, or through a pressure regulator &mdash; anything where the pressure
+        is much the same from one run to the next. Leave it off for a well pump or
+        a pressure tank, where pressure rises and falls as the pump cycles.
+        <br><br>
+        <b>What it changes.</b> With it on, the sprinkler trusts your pressure
+        calibration instead of measuring as it goes. Two things stop happening:
+        <br>&bull; The <b>12-second full-power spray</b> at the start of every run,
+        which measures today's supply. On a small zone that sprays well past the
+        edge.
+        <br>&bull; The <b>pressure hunt at each distance</b>. Normally the valve
+        moves to the calibrated angle, then nudges itself up to eight times to hit
+        a target pressure, waiting half a second between nudges &mdash; which is
+        why the stream overshoots and settles when the distance changes. With this
+        on it goes to the calibrated angle and stays there.
+        <br><br>
+        Runs are quicker and steadier, but they are only as accurate as your
+        pressure calibration. If throws start landing short or long after turning
+        this on, recalibrate pressure &mdash; or turn it back off.
       </div>
       <div class="dev-row" title="Off-season hibernation: deep sleep with no wake timer">
         <span class="dev-label">Winter sleep</span><span class="dev-val" id="d-winter">Off</span>
@@ -898,7 +910,7 @@ function rssiLabel(rssi){
   return `<span style="color:${col};font-size:11px">${label} (${rssi}dBm)</span> `+barHtml;
 }
 
-// ── Supply regulated (b535) ─────────────────────────────────────────────────
+// ── Regulated water supply (b535, renamed b543) ─────────────────────────────
 async function setSupplyRegulated(on){
   try {
     const d = await fetch('/api/supply_regulated', {method:'POST',
