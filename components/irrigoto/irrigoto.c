@@ -16647,11 +16647,112 @@ static esp_err_t api_time_handler(httpd_req_t *req)
     return ESP_OK;
 }
 
-// WiFi & power modal. GET returns the station credentials the device is using
-// plus the wake cycle; POST changes either part.
-//   GET  /api/wifi_power -> {"ssid","password","connected","rssi",
-//                            "always_on","awake_s","sleep_s"}
+// ── Timezone (System settings modal) ───────────────────────────────────────
+// The compiled default is the POSIX string the ESPHome on_boot hook sets from
+// the device_posix_tz substitution (priority 800, before irrigoto_init). A zone
+// picked in the web UI is saved in NVS ("tz_posix" + display label "tz_name")
+// and applied over that default at boot. The system clock stays UTC; only
+// libc's TZ changes, so localtime_r()/mktime() in the schedule executor and the
+// tz_offset_min the pages use follow it. Clearing the override restores the
+// compiled default.
+static char s_tz_default[64];   // TZ as set by the on_boot hook (compiled)
+static char s_tz_posix[64];     // saved override ("" = use the default)
+static char s_tz_name[48];      // label for the override, e.g. America/Chicago
+
+// Cheap sanity check, not a full parser: newlib silently falls back to UTC on
+// a string it can't parse, so reject the obvious junk before it's saved.
+// Accepts e.g. "EST5EDT,M3.2.0/2,M11.1.0/2", "UTC0", "<+0530>-5:30".
+static bool tz_posix_valid(const char *s)
+{
+    size_t n = strlen(s);
+    if (n < 4 || n >= sizeof(s_tz_posix)) return false;
+    if (!(isalpha((unsigned char)s[0]) || s[0] == '<')) return false;
+    bool digit = false;
+    for (const char *c = s; *c; c++) {
+        if (isdigit((unsigned char)*c)) digit = true;
+        else if (!isalpha((unsigned char)*c) && !strchr("<>+-,./:", *c)) return false;
+    }
+    return digit;   // the standard-time offset is mandatory
+}
+
+static void tz_apply(const char *posix)
+{
+    setenv("TZ", posix, 1);
+    tzset();
+}
+
+// Called from irrigoto_init(), after the on_boot hook has set the default.
+static void tz_init(void)
+{
+    const char *cur = getenv("TZ");
+    strncpy(s_tz_default, (cur && cur[0]) ? cur : "UTC0", sizeof(s_tz_default) - 1);
+    nvs_handle_t h;
+    if (nvs_open(CAL_NVS_NAMESPACE, NVS_READONLY, &h) == ESP_OK) {
+        size_t sz = sizeof(s_tz_posix);
+        if (nvs_get_str(h, "tz_posix", s_tz_posix, &sz) != ESP_OK || !tz_posix_valid(s_tz_posix))
+            s_tz_posix[0] = '\0';
+        sz = sizeof(s_tz_name);
+        if (nvs_get_str(h, "tz_name", s_tz_name, &sz) != ESP_OK) s_tz_name[0] = '\0';
+        nvs_close(h);
+    }
+    if (s_tz_posix[0]) {
+        tz_apply(s_tz_posix);
+        INFO("Timezone: %s (%s) from saved setting; compiled default %s",
+             s_tz_posix, s_tz_name[0] ? s_tz_name : "custom", s_tz_default);
+    }
+}
+
+// Re-assert the saved zone if anything else rewrote libc's TZ (e.g. an ESPHome
+// time component applying its own compiled zone). Polled from
+// esphome_idle_task: a strcmp per call, and a setenv only on a mismatch.
+static void tz_guard(void)
+{
+    if (!s_tz_posix[0]) return;
+    const char *cur = getenv("TZ");
+    if (!cur || strcmp(cur, s_tz_posix) != 0) {
+        WARN("Timezone: TZ was changed to \"%s\" elsewhere; restoring %s",
+             cur ? cur : "", s_tz_posix);
+        tz_apply(s_tz_posix);
+    }
+}
+
+// posix "" clears the override and returns to the compiled default.
+static bool tz_set(const char *posix, const char *name)
+{
+    if (posix[0] && !tz_posix_valid(posix)) return false;
+    nvs_handle_t h;
+    if (nvs_open(CAL_NVS_NAMESPACE, NVS_READWRITE, &h) == ESP_OK) {
+        if (posix[0]) {
+            nvs_set_str(h, "tz_posix", posix);
+            nvs_set_str(h, "tz_name", name);
+        } else {
+            nvs_erase_key(h, "tz_posix");
+            nvs_erase_key(h, "tz_name");
+        }
+        nvs_commit(h); nvs_close(h);
+    }
+    strncpy(s_tz_posix, posix, sizeof(s_tz_posix) - 1);
+    s_tz_posix[sizeof(s_tz_posix) - 1] = '\0';
+    strncpy(s_tz_name, posix[0] ? name : "", sizeof(s_tz_name) - 1);
+    s_tz_name[sizeof(s_tz_name) - 1] = '\0';
+    tz_apply(posix[0] ? s_tz_posix : s_tz_default);
+    // The armed run is a UTC epoch derived under the old zone; drop it so the
+    // next sleep re-arms from the schedule table in the new one.
+    sched_fire_disarm();
+    INFO("Timezone set to %s (%s)", posix[0] ? s_tz_posix : s_tz_default,
+         posix[0] ? (s_tz_name[0] ? s_tz_name : "custom") : "compiled default");
+    return true;
+}
+
+// System settings modal. GET returns the station credentials the device is
+// using, the wake cycle and the timezone; POST changes any one part.
+//   GET  /api/system -> {"ssid","password","connected","rssi",
+//                        "always_on","awake_s","sleep_s",
+//                        "tz","tz_name","tz_default","tz_saved",
+//                        "now","tz_offset_min"}
 //   POST always_on=0|1&awake_s=30..3600&sleep_s=30..3600   (any subset)
+//   POST tz=<POSIX TZ>&tz_name=<label>   saves a zone (tz= empty -> back to
+//        the compiled default). Applies immediately, no reboot.
 //   POST ssid=..&password=..   saves the network through ESPHome's
 //        save_wifi_sta() (same store the captive portal uses; it overrides the
 //        compiled credentials from then on) and reboots to join it. If the new
@@ -16674,7 +16775,7 @@ static int json_escape(char *dst, size_t len, const char *src)
     return (int)j;
 }
 
-static esp_err_t api_wifi_power_handler(httpd_req_t *req)
+static esp_err_t api_system_handler(httpd_req_t *req)
 {
     WEB_TOUCH();
     HTTP_CONN_CLOSE(req);
@@ -16705,6 +16806,16 @@ static esp_err_t api_wifi_power_handler(httpd_req_t *req)
             esp_restart();
             return ESP_OK;   // not reached
         }
+        char tz[192] = {0}, tzn[192] = {0};
+        if (httpd_query_key_value(b, "tz", tz, sizeof(tz)) == ESP_OK) {
+            httpd_query_key_value(b, "tz_name", tzn, sizeof(tzn));
+            url_decode(tz, sizeof(s_tz_posix));
+            url_decode(tzn, sizeof(s_tz_name));
+            if (!tz_set(tz, tzn)) {
+                httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "invalid POSIX TZ string");
+                return ESP_OK;
+            }
+        }
         if (httpd_query_key_value(b, "always_on", v, sizeof(v)) == ESP_OK)
             irrigoto_set_auto_sleep_enabled(atoi(v) == 0);
         if (httpd_query_key_value(b, "awake_s", v, sizeof(v)) == ESP_OK)
@@ -16724,14 +16835,38 @@ static esp_err_t api_wifi_power_handler(httpd_req_t *req)
     wifi_ap_record_t ap = {0};
     bool connected = (esp_wifi_sta_get_ap_info(&ap) == ESP_OK);
 
-    char buf[768];
+    // Offset east of UTC in minutes, derived the same way as /api/schedule's
+    // tz_offset_min (wall-clock fields of localtime_r minus gmtime_r).
+    time_t now = time(NULL);
+    long off = 0;
+    {
+        struct tm lt, gt;
+        localtime_r(&now, &lt);
+        gmtime_r(&now, &gt);
+        int diff_days = lt.tm_yday - gt.tm_yday;
+        if (lt.tm_year != gt.tm_year) diff_days = (lt.tm_year > gt.tm_year) ? 1 : -1;
+        off = ((long)(lt.tm_hour - gt.tm_hour) * 3600 + (lt.tm_min - gt.tm_min) * 60
+               + (lt.tm_sec - gt.tm_sec) + (long)diff_days * 86400) / 60;
+    }
+    const char *tz_cur = s_tz_posix[0] ? s_tz_posix : s_tz_default;
+    char tz_js[140], tzn_js[100], tzd_js[140];
+    json_escape(tz_js, sizeof(tz_js), tz_cur);
+    json_escape(tzn_js, sizeof(tzn_js), s_tz_name);
+    json_escape(tzd_js, sizeof(tzd_js), s_tz_default);
+
+    char buf[1024];
     int n = snprintf(buf, sizeof(buf),
         "{\"ssid\":\"%s\",\"password\":\"%s\",\"connected\":%s,\"rssi\":%d,"
-        "\"always_on\":%s,\"awake_s\":%lu,\"sleep_s\":%lu}",
+        "\"always_on\":%s,\"awake_s\":%lu,\"sleep_s\":%lu,"
+        "\"tz\":\"%s\",\"tz_name\":\"%s\",\"tz_default\":\"%s\",\"tz_saved\":%s,"
+        "\"now\":%ld,\"tz_offset_min\":%ld}",
         ssid_js, pass_js, connected ? "true" : "false", connected ? ap.rssi : 0,
         irrigoto_get_auto_sleep_enabled() ? "false" : "true",
         (unsigned long)irrigoto_get_inactivity_s(),
-        (unsigned long)irrigoto_get_sleep_duration_s());
+        (unsigned long)irrigoto_get_sleep_duration_s(),
+        tz_js, tzn_js, tzd_js, s_tz_posix[0] ? "true" : "false",
+        (long)now, off);
+    if (n >= (int)sizeof(buf)) n = sizeof(buf) - 1;
     httpd_resp_send(req, buf, n);
     return ESP_OK;
 }
@@ -19143,7 +19278,7 @@ static void zone_web_start(void)
     httpd_config_t cfg   = HTTPD_DEFAULT_CONFIG();
     cfg.server_port      = ZONE_WEB_PORT;
     cfg.ctrl_port        = ZONE_WEB_CTRL_PORT;
-    cfg.max_uri_handlers  = 88;  // b535: 87 -> 88 (/path.js GET); 86 -> 87 (/api/runs GET); 84 -> 86 (/api/supply_regulated GET+POST); wifi & power modal: 82 -> 84 (/api/wifi_power GET+POST); solution dosing: 76 -> 82 (/bottle_cal, /api/solution_cal x2, /api/pump_jog x2, /api/solution_est); b525: 74 -> 76 (/api/winter GET+POST); b522: 72 -> 74 (/api/fault_hold GET+POST); b512: 70 -> 72 (/api/uart_log GET+POST); b489: 68 -> 70, keeping the 2-slot margin over
+    cfg.max_uri_handlers  = 88;  // b535: 87 -> 88 (/path.js GET); 86 -> 87 (/api/runs GET); 84 -> 86 (/api/supply_regulated GET+POST); system settings modal: 82 -> 84 (/api/system GET+POST, was /api/wifi_power); solution dosing: 76 -> 82 (/bottle_cal, /api/solution_cal x2, /api/pump_jog x2, /api/solution_est); b525: 74 -> 76 (/api/winter GET+POST); b522: 72 -> 74 (/api/fault_hold GET+POST); b512: 70 -> 72 (/api/uart_log GET+POST); b489: 68 -> 70, keeping the 2-slot margin over
                                  // the _Static_assert below.
                                  // MUST be set before httpd_start (cfg is copied there);
                                  // headroom over uris[] count -- _Static_assert below guards it.
@@ -19174,9 +19309,8 @@ static void zone_web_start(void)
         {.uri="/api/all",         .method=HTTP_GET,  .handler=api_all_handler},
         {.uri="/api/auto_sleep",  .method=HTTP_GET,  .handler=api_auto_sleep_handler},  // b447
         {.uri="/api/auto_sleep",  .method=HTTP_POST, .handler=api_auto_sleep_handler},  // b447
-        {.uri="/api/wifi_power",  .method=HTTP_GET,  .handler=api_wifi_power_handler},  // wifi & power modal
-        {.uri="/api/wifi_power",  .method=HTTP_POST, .handler=api_wifi_power_handler},  // wifi & power modal
-        {.uri="/path.js",         .method=HTTP_GET,  .handler=path_js_handler},   // b535
+        {.uri="/api/system",      .method=HTTP_GET,  .handler=api_system_handler},  // system settings modal
+        {.uri="/api/system",      .method=HTTP_POST, .handler=api_system_handler},  // system settings modal
         {.uri="/api/detail_log",  .method=HTTP_GET,  .handler=api_detail_log_handler},
         {.uri="/api/supply_regulated", .method=HTTP_GET,  .handler=api_supply_regulated_handler},  // b535
         {.uri="/api/supply_regulated", .method=HTTP_POST, .handler=api_supply_regulated_handler},  // b535
@@ -19249,7 +19383,7 @@ static void zone_web_start(void)
         {.uri="/fs/upload",             .method=HTTP_POST, .handler=fs_upload_handler},
         {.uri="/fs/delete",             .method=HTTP_POST, .handler=fs_delete_handler},
     };
-    _Static_assert(sizeof(uris)/sizeof(uris[0]) <= 86,   // b535: 85 -> 86 (/path.js GET); 84 -> 85 (/api/runs GET); 82 -> 84 (/api/supply_regulated GET+POST); wifi & power modal: 80 -> 82 (/api/wifi_power GET+POST); solution dosing: 74 -> 80 (see max_uri_handlers); b525: 72 -> 74 (/api/winter GET+POST); b522: 70 -> 72 (/api/fault_hold GET+POST); b512: 68 -> 70 (/api/uart_log GET+POST); b489: 66 -> 68
+    _Static_assert(sizeof(uris)/sizeof(uris[0]) <= 86,   // b535: 85 -> 86 (/path.js GET); 84 -> 85 (/api/runs GET); 82 -> 84 (/api/supply_regulated GET+POST); system settings modal: 80 -> 82 (/api/system GET+POST, was /api/wifi_power); solution dosing: 74 -> 80 (see max_uri_handlers); b525: 72 -> 74 (/api/winter GET+POST); b522: 70 -> 72 (/api/fault_hold GET+POST); b512: 68 -> 70 (/api/uart_log GET+POST); b489: 66 -> 68
                    "uris[] exceeds cfg.max_uri_handlers -- raise it before httpd_start");
     for (size_t i = 0; i < sizeof(uris)/sizeof(uris[0]); i++)
         httpd_register_uri_handler(s_zone_server, &uris[i]);
@@ -19442,6 +19576,7 @@ static void esphome_idle_task(void *arg)
     (void)arg;
     while (true) {
         check_inactivity();
+        tz_guard();
         vTaskDelay(pdMS_TO_TICKS(1000));
     }
 }
@@ -19454,6 +19589,7 @@ void irrigoto_init(void)
     // NOTE: wifi_init() / esp_event_loop_create_default() omitted — ESPHome owns those.
 
     pm_nvs_load();        // restore auto_sleep + thresholds + last reason
+    tz_init();            // saved timezone over the compiled on_boot default
     valve_offset_nvs_load();  // b389: per-unit valve frame, BEFORE boot valve-close
     check_battery_on_boot();   // b525: also the winter-wake battery gate --
                                // forever-sleeps below BATT_MIN_VOLTAGE_V
@@ -21782,7 +21918,7 @@ uint32_t irrigoto_get_inactivity_s(void)
     return s_inactivity_ms / 1000u;
 }
 
-// Seconds flavour of the inactivity setter, used by the web WiFi & power
+// Seconds flavour of the inactivity setter, used by the web System settings
 // modal. Same NVS key and the same 30-3600 s range the boot loader accepts.
 void irrigoto_set_inactivity_s(uint32_t seconds)
 {
