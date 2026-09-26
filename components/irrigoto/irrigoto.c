@@ -16816,6 +16816,12 @@ static esp_err_t api_system_handler(httpd_req_t *req)
                 return ESP_OK;
             }
         }
+        // NOTE: always_on is the INVERSE of /api/auto_sleep's `on`.
+        //   always_on=1 here        -> auto-sleep DISABLED (device stays up)
+        //   on=1 at /api/auto_sleep -> auto-sleep ENABLED  (device sleeps)
+        // A flash/maintenance routine that ends with a blanket `on=1` will
+        // silently override a deliberate "Always on" -- see push.sh, which
+        // reads the current state and restores that instead of assuming.
         if (httpd_query_key_value(b, "always_on", v, sizeof(v)) == ESP_OK)
             irrigoto_set_auto_sleep_enabled(atoi(v) == 0);
         if (httpd_query_key_value(b, "awake_s", v, sizeof(v)) == ESP_OK)
@@ -16883,6 +16889,8 @@ static esp_err_t api_auto_sleep_handler(httpd_req_t *req)
     if (req->method == HTTP_POST) {
         char b[24] = {0}; int n = httpd_req_recv(req, b, sizeof(b) - 1); char v[6] = {0};
         if (n > 0 && httpd_query_key_value(b, "on", v, sizeof(v)) == ESP_OK)
+            // on=1 ENABLES auto-sleep (device sleeps). This is the inverse
+            // of the System settings modal's always_on -- see that handler.
             irrigoto_set_auto_sleep_enabled(atoi(v) != 0);
     }
     char buf[40]; int n = snprintf(buf, sizeof(buf), "{\"auto_sleep\":%s}",
