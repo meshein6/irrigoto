@@ -19317,6 +19317,7 @@ static void zone_web_start(void)
         {.uri="/api/all",         .method=HTTP_GET,  .handler=api_all_handler},
         {.uri="/api/auto_sleep",  .method=HTTP_GET,  .handler=api_auto_sleep_handler},  // b447
         {.uri="/api/auto_sleep",  .method=HTTP_POST, .handler=api_auto_sleep_handler},  // b447
+        {.uri="/path.js",         .method=HTTP_GET,  .handler=path_js_handler},   // b535 shared browser code
         {.uri="/api/system",      .method=HTTP_GET,  .handler=api_system_handler},  // system settings modal
         {.uri="/api/system",      .method=HTTP_POST, .handler=api_system_handler},  // system settings modal
         {.uri="/api/detail_log",  .method=HTTP_GET,  .handler=api_detail_log_handler},
