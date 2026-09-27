@@ -1343,17 +1343,83 @@ function startLivePoll(){
       const st = await fetch('/api/status', {cache:'no-store'}).then(r => r.json());
       if (!st.watering) { stopLivePoll(); return; }
       _live = { deg: st.live_deg, throw_mm: st.live_throw_mm,
-                ring: st.live_ring, pass: st.live_pass, age_ms: st.live_age_ms };
-      renderPathThumb();
+                throw_act: st.live_throw_act, ring: st.live_ring,
+                pass: st.live_pass, passes_total: st.live_passes_total,
+                rings_total: st.live_rings_total, age_ms: st.live_age_ms };
+      renderPathThumb();   // modal thumbnail, if it happens to be open
+      drawLiveOnCard();    // b581: the one you can actually see
     } catch(e) { /* a dropped poll is not worth a visible error */ }
     if (_liveTimer) _liveTimer = setTimeout(tick, 1500);
   };
   _liveTimer = setTimeout(tick, 0);
 }
+// b581: the live run, drawn where you can actually see it.
+//
+// b570 put the live marker on the Water modal's path thumbnail -- which is
+// inside #modal-bg, closed during a run, and the Water Zone button is
+// disabled while watering. So the live view existed and was unreachable.
+// It now draws on the watering zone's own card radar on the main page, over
+// the planned path, and the "Watering..." bar carries the numbers.
+function drawLiveOnCard(){
+  if (!_live || activeWaterZoneId < 0) return;
+  const card = document.getElementById('zcard-' + activeWaterZoneId);
+  const cv = card && card.querySelector('.zone-radar');
+  if (!cv || typeof IrrigotoPath === 'undefined') return;
+  const z = _zoneCache && _zoneCache[activeWaterZoneId];
+  if (!z || !z.points || z.points.length < 2) return;
+
+  // Planned path first, then the planned ring, then where it really is.
+  const o = { mode: String(lastWaterMode || 9), pass: 0,
+              act_max_throw: z.act_max_throw || 10058,
+              act_min_throw: z.act_min_throw || 0,
+              coverage: z.coverage | 0,
+              ringPasses: _lastPlan && _lastPlan.ring_passes,
+              ringMm: _lastPlan && _lastPlan.ring_mm,
+              thumb: true };
+  try { IrrigotoPath.thumb(cv, z.points, o); } catch(e) { return; }
+
+  const S = cv.width, cx = S/2, cy = S/2, maxR = cx - 2;
+  const zmax = Math.max.apply(null, z.points.map(p => p.mm || p.throw_mm || 0));
+  const scale = Math.max(zmax * 1.12, 600);
+  const ctx = cv.getContext('2d');
+  // The ring the plan says it should be on -- a short throw then shows as
+  // the dot sitting inside this circle.
+  if (_live.throw_mm > 0) {
+    const r = (_live.throw_mm / scale) * maxR;
+    if (r > 0 && r < maxR * 1.05) {
+      ctx.beginPath(); ctx.arc(cx, cy, r, 0, Math.PI*2);
+      ctx.strokeStyle = 'rgba(120,200,255,.55)';
+      ctx.lineWidth = 1; ctx.setLineDash([3,3]); ctx.stroke(); ctx.setLineDash([]);
+    }
+  }
+  IrrigotoPath.drawLive(ctx,
+    { deg: _live.deg, throw_mm: _live.throw_act > 0 ? _live.throw_act : _live.throw_mm,
+      age_ms: _live.age_ms },
+    { cx: cx, cy: cy, maxR: maxR, scale_mm: scale });
+
+  const lbl = document.getElementById('wlabel-' + activeWaterZoneId);
+  if (lbl) {
+    const plan = _live.throw_mm > 0 ? (_live.throw_mm/304.8).toFixed(1) : '\u2014';
+    const act  = _live.throw_act > 0 ? (_live.throw_act/304.8).toFixed(1) : '\u2014';
+    const pass = (_live.passes_total > 0)
+      ? ('pass ' + ((_live.pass|0) || 1) + '/' + _live.passes_total + ' \u00b7 ') : '';
+    const ring = (_live.ring >= 0)
+      ? ('ring ' + (_live.ring + 1) + (_live.rings_total ? '/' + _live.rings_total : '') + ' \u00b7 ') : '';
+    lbl.textContent = pass + ring + 'plan ' + plan + "' \u00b7 actual " + act + "'";
+  }
+}
+
 function stopLivePoll(){
   if (_liveTimer) clearTimeout(_liveTimer);
   _liveTimer = null;
-  if (_live) { _live = null; renderPathThumb(); }
+  if (_live) {
+    _live = null;
+    renderPathThumb();
+    // b581: put the card radar back to the plain zone outline.
+    document.querySelectorAll('.zone-radar').forEach(function(cv){
+      if (cv._pts) drawRadar(cv, cv._pts);
+    });
+  }
 }
 
 function updateWateringState(watering, mode, estMin, waterZoneId, cleanupPass) {
