@@ -2014,16 +2014,39 @@ static inline bool valve_in_friction_zone(float deg);
 
 // pressure_map_t defined in irrigoto_types.h
 
+// b554: the pressure map is read constantly and changes almost never, so keep
+// one parsed copy in RAM. cal_load_primary() used to re-read and re-parse
+// /lfs/cal/pressure.json from LittleFS on EVERY call -- a malloc, a file read
+// and three JSON float-array parses of up to 48 points each time. Eight
+// different accessors call it (cal_valve_deg_to_throw_mm,
+// cal_throw_to_valve_deg, cal_get_min/max_throw_mm, cal_get_min_valve_deg,
+// cal_pressure_to_throw_mm, cal_throw_to_psi, cal_pressure_to_valve_deg), and
+// a single Zone Setup button press reaches them about a dozen times. Measured
+// before this change: a DRY pres_up_move -- no valve motion, no settle delay
+// -- took 234 ms against a 46 ms floor for a trivial endpoint. That was the
+// "really laggy" d-pad. Costs sizeof(pressure_map_t) = 577 bytes of DRAM.
+static pressure_map_t s_cal_cache;
+static bool           s_cal_cache_valid = false;
+
 static esp_err_t cal_save_primary(const pressure_map_t *map)
 {
+    s_cal_cache_valid = false;          // every write funnels through here
     if (storage_ready()) storage_cal_save(map);
     return cal_save_nvs_internal(map);
 }
 static esp_err_t cal_load_primary(pressure_map_t *map)
 {
+    if (s_cal_cache_valid) { *map = s_cal_cache; return ESP_OK; }
+    esp_err_t r;
     if (storage_ready() && storage_cal_load(map) == ESP_OK && map->num_points > 0)
-        return ESP_OK;
-    return cal_load_nvs_internal(map);
+        r = ESP_OK;
+    else
+        r = cal_load_nvs_internal(map);
+    if (r == ESP_OK && map->num_points > 0) {
+        s_cal_cache       = *map;
+        s_cal_cache_valid = true;
+    }
+    return r;
 }
 static esp_err_t spd_save_primary(const speed_map_t *m)
 {
@@ -14838,6 +14861,7 @@ static bool               s_web_water         = false;
 static float              s_web_valve_deg     = -1.0f;
 static float              s_web_meas_psi      = 0.0f;   // last measured PSI (0 when water off)
 static float              s_web_meas_throw_mm = 0.0f;   // last measured throw (0 when water off)
+static bool               s_web_hold_step     = false;  // b554: this request is one step of a d-pad hold
 static httpd_handle_t     s_zone_server     = NULL;
 static SemaphoreHandle_t  s_zone_mutex      = NULL;
 // b406: sized to hold the full state JSON for a max-size zone. The points
@@ -14921,9 +14945,20 @@ static int zone_build_json(char *buf, int maxlen)
     // Reading it here means the display self-corrects on every poll: pressure that
     // was still building when water first opened will catch up within a few polls
     // rather than staying frozen at the one-shot value from the toggle command.
+    // b554: only sample pressure when the reading can mean something.
+    //   water off  -- the valve is shut, so the sensor reads nothing useful,
+    //                 and the readout is showing the predicted throw anyway.
+    //                 This is the whole dial-it-in-before-turning-it-on case.
+    //   mid-hold   -- the hold-repeat path skips the settle on purpose, so the
+    //                 sample would be a transient, and since b553 the page
+    //                 displays cmd_throw_ft while a button is held and never
+    //                 looks at it.
+    // Either way it was an I2C transaction (with a documented busy-retry) on
+    // every poll and every button press, for a number nobody read.
     float live_psi = 0.0f;
     float actual_throw_mm = 0.0f;
-    if (mprls_read_quiet(&live_psi) && live_psi > 0.2f) {
+    if (s_web_water && !s_web_hold_step &&
+        mprls_read_quiet(&live_psi) && live_psi > 0.2f) {
         actual_throw_mm = cal_pressure_to_throw_mm(live_psi);
         // Extrapolate beyond cal table if supply pressure exceeds calibrated maximum.
         // Uses slope of last two cal segments so higher supply pressure yields a
@@ -15272,6 +15307,7 @@ static esp_err_t zone_act_handler(httpd_req_t *req)
     } else if (strcmp(cmd, "pres_up_move") == 0) {
         // Hold-repeat fast variant: move valve only, no PSI settle or read.
         // Used by JS for steps 2+ during hold so response is ~motor-time only.
+        s_web_hold_step = true;
         ZONE_STEP_VALVE(+1);
         if (s_web_water) {
             valve_goto_interactive(s_web_valve_deg, 1.0f, 4000);   // b550
@@ -15286,6 +15322,7 @@ static esp_err_t zone_act_handler(httpd_req_t *req)
 
     } else if (strcmp(cmd, "pres_dn_move") == 0) {
         // Hold-repeat fast variant: move valve only, no PSI settle or read.
+        s_web_hold_step = true;
         ZONE_STEP_VALVE(-1);
         if (s_web_water) {
             valve_goto_interactive(s_web_valve_deg, 1.0f, 4000);   // b550
@@ -15494,6 +15531,7 @@ static esp_err_t zone_act_handler(httpd_req_t *req)
     }
 
     zone_build_json(s_zone_json_buf, sizeof(s_zone_json_buf));
+    s_web_hold_step = false;            // b554: applies to this response only
     if (s_zone_mutex) xSemaphoreGive(s_zone_mutex);
     httpd_resp_set_type(req, "application/json");
     httpd_resp_set_hdr(req, "Cache-Control", "no-cache");
