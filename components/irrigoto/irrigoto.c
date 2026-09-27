@@ -54,6 +54,60 @@
 
 static const char *TAG = "irrigoto";
 
+// ── Local time ────────────────────────────────────────────────────────────
+//
+// b548: libc's localtime_r cannot be trusted on this build. Measured on the
+// unit running b547/b548 with TZ=PST8PDT,M3.2.0/2,M11.1.0/2 in the
+// environment, localtime_r labelled the result correctly -- tm_isdst=1 and
+// strftime("%Z") = "PDT" -- while the hour/minute fields it filled in were
+// Eastern, three hours out. Setting TZ to "UTC0" at runtime did not move its
+// answer at all, so the numeric rule it applies is frozen at whatever the
+// on_boot hook installed and no amount of setenv+tzset dislodges it. Every
+// timestamp the device rendered was therefore wrong by the difference
+// between the compiled default zone and the saved one.
+//
+// mktime, in the same binary, does follow TZ: it resolved a 06:00 schedule
+// entry to the correct Pacific epoch throughout. So local time is derived
+// from mktime and gmtime_r, and localtime_r is used only for the tm_isdst
+// flag, which was always right.
+//
+// Offset in minutes east of UTC at instant t (EDT -240, PDT -420).
+// Solved by fixed point: guess the local fields, ask mktime which instant
+// they name, and correct by the error. Converges in two passes away from a
+// DST transition and in three at one.
+int irrigoto_tz_offset_min_at(time_t t)
+{
+    if (t < 1700000000) return 0;        // clock not set -- no meaningful zone
+    long off = 0;
+    for (int i = 0; i < 4; i++) {
+        time_t shifted = t + (time_t)off;
+        struct tm lt;
+        gmtime_r(&shifted, &lt);         // candidate local wall-clock fields
+        lt.tm_isdst = -1;                // let libc pick DST for that date
+        time_t back = mktime(&lt);
+        if (back == (time_t)-1) return 0;
+        long err = (long)t - (long)back;
+        if (err == 0) break;
+        off += err;
+        if (off < -50400L || off > 50400L) return 0;   // past +-14h: nonsense
+    }
+    return (int)(off / 60);
+}
+
+// Drop-in replacement for localtime_r. Same contract: fills *out with the
+// local wall-clock decomposition of *t and returns out.
+struct tm *irrigoto_localtime_r(const time_t *t, struct tm *out)
+{
+    time_t shifted = *t + (time_t)irrigoto_tz_offset_min_at(*t) * 60;
+    gmtime_r(&shifted, out);
+    // gmtime_r always reports tm_isdst = 0. Take the real flag from libc,
+    // which gets this part right, so callers that hand the struct back to
+    // mktime or format it with %Z still behave.
+    struct tm probe;
+    if (localtime_r(t, &probe)) out->tm_isdst = probe.tm_isdst;
+    return out;
+}
+
 // ── GPIO assignments ──────────────────────────────────────────────────────────
 #define GPIO_3V3SEN     GPIO_NUM_4
 #define GPIO_9V_EN      GPIO_NUM_18
@@ -3910,11 +3964,11 @@ static void runs_csv_append(void)
     // blank rather than writing 1970; uptime_s keeps the rows ordered.
     char t0[24] = {0}, t1[24] = {0};
     if (s_run_start_epoch > 1700000000) {
-        struct tm lt; localtime_r(&s_run_start_epoch, &lt);
+        struct tm lt; irrigoto_localtime_r(&s_run_start_epoch, &lt);
         strftime(t0, sizeof(t0), "%Y-%m-%dT%H:%M:%S", &lt);
     }
     if (s_last_water_finish_epoch > 1700000000) {
-        struct tm lt; localtime_r(&s_last_water_finish_epoch, &lt);
+        struct tm lt; irrigoto_localtime_r(&s_last_water_finish_epoch, &lt);
         strftime(t1, sizeof(t1), "%Y-%m-%dT%H:%M:%S", &lt);
     }
 
@@ -14801,10 +14855,13 @@ static int zone_build_json(char *buf, int maxlen)
     // When water is OFF:
     //   s_web_valve_deg < 0  → fresh page load / valve never positioned this session:
     //                          show cal max as a preview (water_toggle opens to max).
-    //   s_web_valve_deg < VALVE_CAL_START_DEG  → valve returned to closed after water off:
-    //                          show 0 so the user sees the valve has shut.
+    //   s_web_valve_deg < VALVE_CAL_START_DEG  → dialed below the pressure
+    //                          threshold: show 0, that setting delivers nothing.
     //   s_web_valve_deg in cal range  → user manually adjusted with valve buttons:
-    //                          show interpolated throw for that position.
+    //                          show interpolated throw for that position. Since
+    //                          b548 the setpoint survives water-off, so this is
+    //                          also what the readout shows while the water is
+    //                          off -- i.e. the amount the Water button will give.
     float throw_mm;
     if (s_web_water && actual_throw_mm > 10.0f) {
         throw_mm = actual_throw_mm;             // live + extrapolated -- updates every poll
@@ -14819,9 +14876,15 @@ static int zone_build_json(char *buf, int maxlen)
     }
     float throw_ft = throw_mm / 304.8f;
 
-    // Limit indicators based on valve degree position
-    bool at_min = (s_web_valve_deg > 0.0f &&
-                   s_web_valve_deg <= VALVE_CAL_START_DEG + ZONE_WEB_VALVE_STEP_DEG);
+    // Limit indicators track the SETPOINT the arrows move, and the angles the
+    // arrows actually clamp at. b548 fixed two ways this lit the wrong arrow
+    // solid orange and left it stuck there:
+    //   - pres_dn clamps at VALVE_CLOSED_DEG, not VALVE_CAL_START_DEG, so the
+    //     old bound called "MIN" with ~32 deg of travel still to go;
+    //   - water-off used to park the setpoint at VALVE_CLOSED_DEG, so the down
+    //     arrow was orange the entire time the water was off.
+    bool at_min = (s_web_valve_deg >= 0.0f &&
+                   s_web_valve_deg <= VALVE_CLOSED_DEG + ZONE_WEB_VALVE_STEP_DEG);
     bool at_max = (s_web_valve_deg >= VALVE_OPEN_DEG - ZONE_WEB_VALVE_STEP_DEG);
 
     // b406: up to ZONE_MAX_PERIM_POINTS(36) points * ~56 bytes + brackets.
@@ -14923,9 +14986,15 @@ static esp_err_t zone_page_handler(httpd_req_t *req)
 static esp_err_t zone_state_handler(httpd_req_t *req)
 {
     WEB_TOUCH();
-    if (s_zone_mutex) xSemaphoreTake(s_zone_mutex, pdMS_TO_TICKS(500));
+    // b548: give ONLY if the take succeeded. s_zone_mutex is a real mutex, so
+    // giving it from a task that never owned it fails and leaves the actual
+    // holder's ownership intact -- the old unconditional give quietly papered
+    // over every timeout. Reading state uncontended is still better than
+    // stalling the poll, so a timeout falls through and builds the JSON.
+    bool locked = (s_zone_mutex == NULL) ||
+                  (xSemaphoreTake(s_zone_mutex, pdMS_TO_TICKS(500)) == pdTRUE);
     zone_build_json(s_zone_json_buf, sizeof(s_zone_json_buf));
-    if (s_zone_mutex) xSemaphoreGive(s_zone_mutex);
+    if (s_zone_mutex && locked) xSemaphoreGive(s_zone_mutex);
     httpd_resp_set_type(req, "application/json");
     httpd_resp_set_hdr(req, "Cache-Control", "no-cache");
     httpd_resp_set_hdr(req, "Connection", "close");
@@ -14955,7 +15024,15 @@ static esp_err_t zone_act_handler(httpd_req_t *req)
         return ESP_OK;
     }
 
-    if (s_zone_mutex) xSemaphoreTake(s_zone_mutex, pdMS_TO_TICKS(2000));
+    // b548: a timed-out take used to fall through and drive the valve motor
+    // and I2C bus alongside whoever held the lock -- which is what made a
+    // held arrow button go erratic once the 60 ms hold-repeat outran the
+    // hardware. Refuse instead; the UI just skips that step.
+    if (s_zone_mutex && xSemaphoreTake(s_zone_mutex, pdMS_TO_TICKS(2000)) != pdTRUE) {
+        httpd_resp_set_type(req, "application/json");
+        httpd_resp_sendstr(req, "{\"busy\":true}");
+        return ESP_OK;
+    }
 
     sensor_rail_on();
     motor_rail_on();
@@ -15046,15 +15123,27 @@ static esp_err_t zone_act_handler(httpd_req_t *req)
     } else if (strcmp(cmd, "water_toggle") == 0) {
         s_web_water = !s_web_water;
         if (s_web_water) {
-            // Open to full flow; user trims down with valve buttons.
-            // Use tight tolerance (1.0 deg) so predictive braking doesn't
-            // stop the motor 1-2 deg short of VALVE_OPEN_DEG.
-            s_web_pres_pct  = ZONE_WEB_PRES_MAX;
-            s_web_valve_deg = VALVE_OPEN_DEG;
-            valve_goto(VALVE_OPEN_DEG, 1.0f, 10000, false);
+            // Open at the amount already dialed in, not at full bore.
+            // s_web_valve_deg is the SETPOINT the arrows move, and it now
+            // survives water-off, so the stream comes back exactly where the
+            // user left it. Only a session that has never touched the arrows
+            // (the < 0 sentinel) opens wide -- which is what the throw
+            // readout is previewing in that state.
+            // b548: opening to VALVE_OPEN_DEG unconditionally threw the
+            // dialed angle away ("full strength whatever the button says"),
+            // pinned at_max so the up arrow latched orange, and left ~77 deg
+            // of travel to step back down half a degree at a time.
+            bool wide = (s_web_valve_deg < 0.0f);
+            if (wide) {
+                s_web_pres_pct  = ZONE_WEB_PRES_MAX;
+                s_web_valve_deg = VALVE_OPEN_DEG;
+            }
+            // Tight tolerance (1.0 deg) only at the hard stop, where
+            // predictive braking otherwise parks 1-2 deg short of it.
+            valve_goto(s_web_valve_deg, wide ? 1.0f : 2.0f, 10000, false);
             s_valve_last_dir = 1;
             // Read initial PSI so throw display is live from the start
-            vTaskDelay(pdMS_TO_TICKS(500));
+            vTaskDelay(pdMS_TO_TICKS(ZONE_WEB_SETTLE_MS));
             float psi = 0.0f;
             if (mprls_read_quiet(&psi) && psi > 0.1f) {
                 s_web_meas_psi      = psi;
@@ -15062,7 +15151,11 @@ static esp_err_t zone_act_handler(httpd_req_t *req)
             }
         } else {
             valve_goto(VALVE_CLOSED_DEG, 2.0f, 10000, false);
-            s_web_valve_deg     = VALVE_CLOSED_DEG;
+            s_valve_last_dir    = -1;
+            // s_web_valve_deg is deliberately NOT reset: it is the setpoint,
+            // not the physical position. Keeping it is what lets the next
+            // water-on return to the same throw, and what keeps the readout
+            // showing the amount that will be applied.
             s_web_meas_psi      = 0.0f;
             s_web_meas_throw_mm = 0.0f;
         }
@@ -16688,8 +16781,24 @@ static bool tz_posix_valid(const char *s)
 
 static void tz_apply(const char *posix)
 {
+    // b548: bounce through a different string before applying the real one.
+    // newlib's tzset() skips the parse entirely when TZ is byte-identical to
+    // the string it last parsed, so re-applying the saved zone over rules
+    // that were clobbered some other way was a silent no-op. The extra
+    // setenv/tzset pair costs microseconds and only runs at boot or on a
+    // deliberate change.
+    setenv("TZ", "UTC0", 1);
+    tzset();
     setenv("TZ", posix, 1);
     tzset();
+}
+
+// Minutes east of UTC right now (EDT = -240, PDT = -420), or 0 with no clock.
+// See irrigoto_tz_offset_min_at() near the top of this file for why this does
+// not difference localtime_r against gmtime_r.
+static int tz_offset_min_now(void)
+{
+    return irrigoto_tz_offset_min_at(time(NULL));
 }
 
 // Called from irrigoto_init(), after the on_boot hook has set the default.
@@ -16852,19 +16961,36 @@ static esp_err_t api_system_handler(httpd_req_t *req)
     wifi_ap_record_t ap = {0};
     bool connected = (esp_wifi_sta_get_ap_info(&ap) == ESP_OK);
 
-    // Offset east of UTC in minutes, derived the same way as /api/schedule's
-    // tz_offset_min (wall-clock fields of localtime_r minus gmtime_r).
     time_t now = time(NULL);
-    long off = 0;
-    {
+    long off = tz_offset_min_now();
+    // b548 diagnostics: report what libc ACTUALLY holds, not our copy of what
+    // we asked for. s_tz_posix only says what was saved -- on b547 it read
+    // Pacific while every rendered timestamp was Eastern, and nothing in the
+    // response could tell the two apart. tz_env is getenv("TZ"), tz_off_lt is
+    // the old localtime_r-vs-gmtime_r derivation: if it disagrees with
+    // tz_offset_min, localtime_r is running on stale rules.
+    long off_lt = 0;
+    int  lt_isdst = -1;
+    char abbr_buf[16] = {0};
+    const char *abbr = "";
+    if (now > 1700000000) {
         struct tm lt, gt;
         localtime_r(&now, &lt);
         gmtime_r(&now, &gt);
+        lt_isdst = lt.tm_isdst;
         int diff_days = lt.tm_yday - gt.tm_yday;
         if (lt.tm_year != gt.tm_year) diff_days = (lt.tm_year > gt.tm_year) ? 1 : -1;
-        off = ((long)(lt.tm_hour - gt.tm_hour) * 3600 + (lt.tm_min - gt.tm_min) * 60
-               + (lt.tm_sec - gt.tm_sec) + (long)diff_days * 86400) / 60;
+        off_lt = ((long)(lt.tm_hour - gt.tm_hour) * 3600 + (lt.tm_min - gt.tm_min) * 60
+                  + (lt.tm_sec - gt.tm_sec) + (long)diff_days * 86400) / 60;
+        // strftime("%Z") rather than tzname[]: newlib only declares tzname
+        // under __MISC_VISIBLE, and this tells us the same thing.
+        if (strftime(abbr_buf, sizeof(abbr_buf), "%Z", &lt) == 0) abbr_buf[0] = '\0';
+        abbr = abbr_buf;
     }
+    const char *tz_env = getenv("TZ");
+    char tze_js[140], abbr_js[24];
+    json_escape(tze_js, sizeof(tze_js), tz_env ? tz_env : "");
+    json_escape(abbr_js, sizeof(abbr_js), abbr);
     const char *tz_cur = s_tz_posix[0] ? s_tz_posix : s_tz_default;
     char tz_js[140], tzn_js[100], tzd_js[140];
     json_escape(tz_js, sizeof(tz_js), tz_cur);
@@ -16876,12 +17002,15 @@ static esp_err_t api_system_handler(httpd_req_t *req)
         "{\"ssid\":\"%s\",\"password\":\"%s\",\"connected\":%s,\"rssi\":%d,"
         "\"always_on\":%s,\"awake_s\":%lu,\"sleep_s\":%lu,"
         "\"tz\":\"%s\",\"tz_name\":\"%s\",\"tz_default\":\"%s\",\"tz_saved\":%s,"
+        "\"tz_env\":\"%s\",\"tz_abbr\":\"%s\",\"tz_isdst\":%d,"
+        "\"tz_offset_lt_min\":%ld,"
         "\"now\":%ld,\"tz_offset_min\":%ld}",
         ssid_js, pass_js, connected ? "true" : "false", connected ? ap.rssi : 0,
         irrigoto_get_auto_sleep_enabled() ? "false" : "true",
         (unsigned long)irrigoto_get_inactivity_s(),
         (unsigned long)irrigoto_get_sleep_duration_s(),
         tz_js, tzn_js, tzd_js, s_tz_posix[0] ? "true" : "false",
+        tze_js, abbr_js, lt_isdst, off_lt,
         (long)now, off);
     if (n >= (int)sizeof(buf)) n = sizeof(buf) - 1;
     httpd_resp_send(req, buf, n);
@@ -18646,31 +18775,29 @@ static esp_err_t api_schedule_handler(httpd_req_t *req)
     // DST rules (selected by localtime_r based on the date), unlike a
     // bare mktime call which has to be told the isdst flag externally.
     // Day-of-year wrap is the only edge case — handle it explicitly.
-    int tz_off_min = 0;
+    // b548: was derived by differencing localtime_r against gmtime_r, which
+    // on b547 reported Eastern while the saved zone was Pacific -- so the
+    // schedule page rendered every timestamp, including next run, three hours
+    // out. tz_offset_min_now() asks mktime instead; see its comment.
+    int tz_off_min = tz_offset_min_now();
     int diag_isdst = -2;
+    int diag_off_lt = 0;
     if (now > 1700000000) {
         struct tm lt, gt;
         localtime_r(&now, &lt);
         gmtime_r(&now, &gt);
         diag_isdst = lt.tm_isdst;
-        int diff_sec = (lt.tm_hour - gt.tm_hour) * 3600
-                     + (lt.tm_min  - gt.tm_min)  * 60
-                     + (lt.tm_sec  - gt.tm_sec);
-        // tm_yday wraps at year boundary; clamp to ±1 day delta which is
-        // the only physically possible difference between local and UTC
-        // decompositions of the same instant.
         int diff_days = lt.tm_yday - gt.tm_yday;
-        if (lt.tm_year != gt.tm_year) {
-            diff_days = (lt.tm_year > gt.tm_year) ? 1 : -1;
-        }
-        diff_sec += diff_days * 86400;
-        tz_off_min = diff_sec / 60;
+        if (lt.tm_year != gt.tm_year) diff_days = (lt.tm_year > gt.tm_year) ? 1 : -1;
+        diag_off_lt = ((lt.tm_hour - gt.tm_hour) * 3600 + (lt.tm_min - gt.tm_min) * 60
+                       + (lt.tm_sec - gt.tm_sec) + diff_days * 86400) / 60;
     }
-    // One-line diagnostic so we can verify libc TZ is honoring the
-    // POSIX DST rules. Logged at INFO so it shows up in standard logs
-    // — only fires on schedule-page loads, so it's not spammy.
-    ESP_LOGI(TAG, "schedule api: now=%ld isdst=%d tz_off_min=%d",
-             (long)now, diag_isdst, tz_off_min);
+    // One-line diagnostic so we can verify libc TZ is honoring the POSIX DST
+    // rules. lt_off is the localtime_r derivation: it should now agree with
+    // tz_off_min, and a standing disagreement means localtime_r is still on
+    // stale rules and every localtime_r caller is wrong by that much.
+    ESP_LOGI(TAG, "schedule api: now=%ld isdst=%d tz_off_min=%d lt_off=%d",
+             (long)now, diag_isdst, tz_off_min, diag_off_lt);
 
     char status[160] = {0};
     irrigoto_schedule_get_last_status(status, sizeof(status));
@@ -20622,7 +20749,7 @@ void irrigoto_schedule_set_delay_until(time_t t)
     schedule_delay_stamp_local();
     schedule_delay_save_nvs();
     // Log + status using local time so the user sees what they set.
-    struct tm lt; localtime_r(&t, &lt);
+    struct tm lt; irrigoto_localtime_r(&t, &lt);
     INFO("Schedule delay set: suspended until %04d-%02d-%02d %02d:%02d",
          lt.tm_year+1900, lt.tm_mon+1, lt.tm_mday, lt.tm_hour, lt.tm_min);
     snprintf(s_sched_last_status, sizeof(s_sched_last_status),
@@ -20698,7 +20825,7 @@ bool irrigoto_schedule_sync_delay(time_t until, time_t lm)
         snprintf(s_sched_last_status, sizeof(s_sched_last_status),
                  "delay cleared (HA)");
     } else {
-        struct tm lt; localtime_r(&until, &lt);
+        struct tm lt; irrigoto_localtime_r(&until, &lt);
         INFO("Schedule delay set (sync from HA): suspended until %04d-%02d-%02d %02d:%02d",
              lt.tm_year+1900, lt.tm_mon+1, lt.tm_mday, lt.tm_hour, lt.tm_min);
         snprintf(s_sched_last_status, sizeof(s_sched_last_status),
@@ -21514,12 +21641,12 @@ bool irrigoto_schedule_next_run(time_t now, time_t *out_t, int *out_zone)
         for (int d = 0; d < 15; d++) {
             time_t t = earliest + d * 86400;
             struct tm lt;
-            localtime_r(&t, &lt);
+            irrigoto_localtime_r(&t, &lt);
             lt.tm_hour = e->hour; lt.tm_min = e->minute; lt.tm_sec = 0;
             time_t fire_t = mktime(&lt);
             if (fire_t <= earliest) continue;  // already past or in delay
             // Re-check day-of-week of fire_t (DST shifts can reorder)
-            struct tm flt; localtime_r(&fire_t, &flt);
+            struct tm flt; irrigoto_localtime_r(&fire_t, &flt);
             if (!(e->days_mask & (1u << flt.tm_wday))) continue;
             if (best_t == 0 || fire_t < best_t) {
                 best_t = fire_t;
@@ -21551,11 +21678,11 @@ static bool schedule_next_run_full(time_t now, time_t *out_t,
         if (!e->enabled || e->days_mask == 0) continue;
         for (int d = 0; d < 15; d++) {
             time_t t = earliest + d * 86400;
-            struct tm lt; localtime_r(&t, &lt);
+            struct tm lt; irrigoto_localtime_r(&t, &lt);
             lt.tm_hour = e->hour; lt.tm_min = e->minute; lt.tm_sec = 0;
             time_t fire_t = mktime(&lt);
             if (fire_t <= earliest) continue;
-            struct tm flt; localtime_r(&fire_t, &flt);
+            struct tm flt; irrigoto_localtime_r(&fire_t, &flt);
             if (!(e->days_mask & (1u << flt.tm_wday))) continue;
             if (best_t == 0 || fire_t < best_t) { best_t = fire_t; best = e; }
             break;
@@ -21577,7 +21704,7 @@ static const schedule_entry_t *schedule_entry_for_run(uint32_t entry_id, uint8_t
 {
     for (uint8_t i = 0; entry_id && i < s_schedule.count; i++)
         if (s_schedule.entries[i].id == entry_id) return &s_schedule.entries[i];
-    time_t t = (time_t)epoch; struct tm lt; localtime_r(&t, &lt);
+    time_t t = (time_t)epoch; struct tm lt; irrigoto_localtime_r(&t, &lt);
     for (uint8_t i = 0; i < s_schedule.count; i++) {
         const schedule_entry_t *e = &s_schedule.entries[i];
         if (e->zone == zone && e->hour == lt.tm_hour && e->minute == lt.tm_min) return e;
@@ -21683,10 +21810,10 @@ static void schedule_task(void *arg)
             // that straddles midnight still finds a late-night slot.
             for (int doff = 0; doff >= -1; doff--) {
                 time_t base = now + doff * 86400;
-                struct tm lt; localtime_r(&base, &lt);
+                struct tm lt; irrigoto_localtime_r(&base, &lt);
                 lt.tm_hour = e->hour; lt.tm_min = e->minute; lt.tm_sec = 0;
                 time_t fire_t = mktime(&lt);
-                struct tm flt; localtime_r(&fire_t, &flt);
+                struct tm flt; irrigoto_localtime_r(&fire_t, &flt);
                 if (!(e->days_mask & (1u << flt.tm_wday))) continue;
                 if (now < fire_t) continue;                       // not yet due
                 if (now - fire_t >= (time_t)SCHED_CATCHUP_S) {

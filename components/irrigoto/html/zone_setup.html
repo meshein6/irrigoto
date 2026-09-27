@@ -293,7 +293,7 @@ header{
   </div>
   <div id="path-ctl">
     <button class="vbtn" id="btn-path-mode" onclick="cyclePathMode()" title="Which mode's path to draw">Smooth</button>
-    <button class="vbtn" id="btn-path-pass" onclick="cyclePathPass()" title="Which pass">Pass 1</button>
+    <button class="vbtn" id="btn-path-pass" onclick="cyclePathPass()" title="Which direction this pass sweeps">Outer &#8594; in</button>
     <button class="vbtn" onclick="openPathPreview()" title="Bigger view">&#9974;</button>
     <input type="range" id="zs-scrub" min="0" max="1000" step="1" value="0"
            oninput="zsScrub(+this.value/1000)" aria-label="Position along the path">
@@ -450,12 +450,29 @@ function cyclePathMode(){
   pathMode = order[(order.indexOf(pathMode) + 1) % order.length];
   document.getElementById('btn-path-mode').textContent =
     (IrrigotoPath.MODES[pathMode] || {label:'Path'}).label;
+  const pb = document.getElementById('btn-path-pass');
+  const k = (IrrigotoPath.MODES[pathMode] || {}).key;
+  const same = (k === 'pulse' || k === 'chase' || k === 'demo');
+  pb.style.display = same ? 'none' : '';
+  if (!same) pb.textContent = passLabelFor(pathMode, pathPass);
   draw();
 }
+// b548: this chip still said "Pass 1..4" -- the same nonsense b544 removed
+// from the shared overlay, left behind because the concept lives in two
+// controls and only one was fixed. Only two pictures exist: the direction
+// flips every pass, so pass 3 is pass 1 again.
 function cyclePathPass(){
-  pathPass = (pathPass + 1) % 4;
-  document.getElementById('btn-path-pass').textContent = 'Pass ' + (pathPass + 1);
+  pathPass = (pathPass + 1) % 2;
+  document.getElementById('btn-path-pass').textContent = passLabelFor(pathMode, pathPass);
   draw();
+}
+function passLabelFor(mode, idx){
+  const k = (typeof IrrigotoPath !== 'undefined' && IrrigotoPath.MODES[mode])
+            ? IrrigotoPath.MODES[mode].key : 'smooth';
+  if (k === 'pulse' || k === 'chase' || k === 'demo') return '\u2014';
+  return (k === 'serpentine' || k === 'sections')
+    ? (idx ? 'Inner \u2192 out' : 'Outer \u2192 in')
+    : (idx ? 'Sweep back' : 'Sweep one way');
 }
 function zsScrub(t){ pathT = t; draw(); }
 // b536: the shared overlay, UNLOCKED here -- Zone Setup is where you compare
@@ -1024,8 +1041,12 @@ async function doAct(cmd){
     }
     const r=await fetch(url,{method:'POST'});
     if(!r.ok) throw new Error(r.status);
-    applyState(await r.json());
+    const j=await r.json();
     setConn(true);
+    // b548: the device refuses a step it can't serialise rather than driving
+    // the valve twice at once. Skip it -- the next repeat or the poll catches up.
+    if(j.busy) return;
+    applyState(j);
     if(cmd==='save'){
       toast('Zone saved ✓');
       // Zone geometry changed -- clear cached heatmap data so stale coverage
@@ -1043,15 +1064,19 @@ async function doAct(cmd){
 //   Steps 2+      : pres_up/dn_move (motor only, ~250ms) with acceleration 0.5->1.0->1.5 deg.
 //   After release : poll() fires after settle delay to refresh the throw display.
 // Nozzle buttons: sequential, same command every repeat.
-let _hTimer=null, _hBtn=null, _hActive=false, _hStep=0, _hIsValve=false;
-function _holdDeg(n){ return n<=4?0.5:n<=8?1.0:1.5; }
+let _hTimer=null, _hBtn=null, _hActive=false, _hStep=0, _hIsValve=false, _hGen=0;
+// Acceleration: 0.5 deg taps at first for fine work, opening out to the 2.0
+// the firmware will accept, so crossing the full ~77 deg valve range doesn't
+// take 150 presses.
+function _holdDeg(n){ return n<=4?0.5:n<=8?1.0:n<=16?1.5:2.0; }
 function holdStart(cmd,el){
   holdStop();
+  var gen=++_hGen;          // b548: stamps this loop; holdStop invalidates it
   _hBtn=el; el.classList.add('held');
   _hActive=true; _hStep=0;
   _hIsValve=(cmd==='pres_up'||cmd==='pres_dn');
   (async function loop(){
-    if(!_hActive) return;
+    if(gen!==_hGen || !_hActive) return;
     _hStep++;
     if(_hStep>180){ holdStop(); toast('hold auto-stopped'); return; }  // ~11s hard cap vs a stuck button
     var act;
@@ -1062,11 +1087,16 @@ function holdStart(cmd,el){
       act=cmd;
     }
     await doAct(act).catch(()=>{});
-    if(_hActive) _hTimer=setTimeout(loop,60);
+    // b548: without the generation check, a request still in flight when the
+    // button was released and re-pressed would resume into the NEW hold,
+    // leaving two loops sharing _hStep and _hTimer -- so releasing only ever
+    // cancelled one of them and the steps came out doubled and erratic.
+    if(gen===_hGen && _hActive) _hTimer=setTimeout(loop,60);
   })();
 }
 function holdStop(){
   var wasValve=_hIsValve;
+  _hGen++;                  // any loop still awaiting a fetch retires on resume
   _hActive=false; _hStep=0; _hIsValve=false;
   if(_hTimer){clearTimeout(_hTimer);_hTimer=null;}
   if(_hBtn){_hBtn.classList.remove('held');_hBtn=null;}
@@ -1195,6 +1225,7 @@ _paintZoomBtn();   // b535: reflect the zoom restored from localStorage
 if (typeof IrrigotoPath !== 'undefined') {
   document.getElementById('btn-path-mode').textContent =
     (IrrigotoPath.MODES[pathMode] || {label:'Path'}).label;
+  document.getElementById('btn-path-pass').textContent = passLabelFor(pathMode, pathPass);
 }
 // Mark name field edited when user types so polling won't overwrite it
 document.getElementById('zone-name').addEventListener('input',function(){

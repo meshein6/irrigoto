@@ -1,7 +1,14 @@
 # Fix: the preview's pass selector doesn't match what the run does
 
-**Branch:** `fix/preview-pass-count` · **Type:** fix · **Status:** planned.
-Reported after watching a real run against the preview (2026-09-25).
+**Branch:** `fix/preview-pass-count` · **Type:** fix · **Status:** FIXED in
+b544 (shared overlay) and b548 (the Zone Setup chip, which was missed the
+first time because the concept lives in two separate controls). Reported
+after watching a real run against the preview (2026-09-25).
+
+Both controls now show the only thing that actually varies between passes --
+the sweep direction ("Outer -> in" / "Inner -> out", or "Sweep one way" /
+"Sweep back") -- and hide themselves entirely for Pulse, Chase and Demo,
+where every pass draws the same picture.
 
 ## Problem
 
