@@ -14900,6 +14900,16 @@ static int zone_build_json(char *buf, int maxlen)
     // throw, not VALVE_OPEN_DEG. On this unit the valve frame says fully open
     // is 381.6 deg while the throw cal ends at 369.6, so the up arrow never
     // lit even sitting at the real maximum the d-pad can reach.
+    // b553: the throw the valve has been COMMANDED to, independent of what the
+    // pressure sensor currently reads. While the user is holding an arrow the
+    // live reading is a mid-transient sample -- the hold-repeat path skips the
+    // settle on purpose -- so feeding it to the readout made the number jump
+    // around under their thumb. The page shows this while a button is held and
+    // the measured throw once it is released.
+    float cmd_throw_ft = (s_web_valve_deg >= zone_display_floor_deg())
+                       ? cal_valve_deg_to_throw_mm(s_web_valve_deg) / 304.8f
+                       : 0.0f;
+
     float cal_hi_deg = cal_throw_to_valve_deg(cal_get_max_throw_mm());
     if (cal_hi_deg <= 0.0f || cal_hi_deg > VALVE_OPEN_DEG) cal_hi_deg = VALVE_OPEN_DEG;
     bool at_max = (s_web_valve_deg >= cal_hi_deg - ZONE_WEB_VALVE_STEP_DEG);
@@ -14937,7 +14947,7 @@ static int zone_build_json(char *buf, int maxlen)
     return snprintf(buf, maxlen,
         "{\"bearing\":%.1f,\"throw_mm\":%.0f,\"throw_ft\":%.2f,"
         "\"pressure_pct\":%.1f,\"water\":%s,"
-        "\"at_min\":%s,\"at_max\":%s,\"points\":%s,"
+        "\"at_min\":%s,\"at_max\":%s,\"cmd_throw_ft\":%.2f,\"points\":%s,"
         "\"act_max_throw\":%.0f,\"fw_build\":%d,"
         "\"actual_throw_mm\":%.0f,\"act_min_throw\":%.0f,"
         "\"name\":\"%s\"}",
@@ -14945,6 +14955,7 @@ static int zone_build_json(char *buf, int maxlen)
         s_web_water ? "true" : "false",
         at_min ? "true" : "false",
         at_max ? "true" : "false",
+        cmd_throw_ft,
         pts, act_max_throw_mm, FW_BUILD,
         actual_throw_mm, act_min_throw_mm,
         s_web_zone_name);
@@ -15082,7 +15093,15 @@ static esp_err_t zone_act_handler(httpd_req_t *req)
     #define ZONE_STEP_VALVE(_dir) do {                                        \
         if (s_web_valve_deg < zone_floor_deg) s_web_valve_deg = zone_floor_deg;\
         if (step_ft > 0.0f) {                                                 \
-            float _cur = cal_valve_deg_to_throw_mm(s_web_valve_deg);          \
+            /* b553: with the water ON the readout shows the MEASURED throw   \
+               (pressure -> throw) while this stepped from the PREDICTED one  \
+               (valve -> throw). Those are different curves whenever supply   \
+               pressure has drifted from cal time, so "+0.25 ft" did not move \
+               the number on screen by 0.25 ft -- it jumped. Step from        \
+               whatever is being displayed. */                                \
+            float _cur = (s_web_water && s_web_meas_throw_mm > 10.0f)         \
+                         ? s_web_meas_throw_mm                                \
+                         : cal_valve_deg_to_throw_mm(s_web_valve_deg);        \
             float _tgt = _cur + (_dir) * step_ft * 304.8f;                    \
             float _lo  = cal_get_min_throw_mm(), _hi = cal_get_max_throw_mm();\
             if (_tgt < _lo) _tgt = _lo;                                       \
@@ -15174,13 +15193,29 @@ static esp_err_t zone_act_handler(httpd_req_t *req)
         // Hold-repeat fast variant: move valve only, no PSI settle or read.
         // Used by JS for steps 2+ during hold so response is ~motor-time only.
         ZONE_STEP_VALVE(+1);
-        if (s_web_water) { valve_goto_interactive(s_web_valve_deg, 1.0f, 4000); s_valve_last_dir =  1; }  // b550
+        if (s_web_water) {
+            valve_goto_interactive(s_web_valve_deg, 1.0f, 4000);   // b550
+            s_valve_last_dir =  1;
+            // b553: advance the measured base by the step we just commanded.
+            // No PSI read here on purpose -- this is the hold-repeat path and
+            // the pressure is still swinging; sampling it would feed the
+            // transient straight back into the next step's arithmetic.
+            s_web_meas_throw_mm = cal_valve_deg_to_throw_mm(s_web_valve_deg);
+        }
         else { s_web_meas_throw_mm = cal_valve_deg_to_throw_mm(s_web_valve_deg); }
 
     } else if (strcmp(cmd, "pres_dn_move") == 0) {
         // Hold-repeat fast variant: move valve only, no PSI settle or read.
         ZONE_STEP_VALVE(-1);
-        if (s_web_water) { valve_goto_interactive(s_web_valve_deg, 1.0f, 4000); s_valve_last_dir = -1; }  // b550
+        if (s_web_water) {
+            valve_goto_interactive(s_web_valve_deg, 1.0f, 4000);   // b550
+            s_valve_last_dir = -1;
+            // b553: advance the measured base by the step we just commanded.
+            // No PSI read here on purpose -- this is the hold-repeat path and
+            // the pressure is still swinging; sampling it would feed the
+            // transient straight back into the next step's arithmetic.
+            s_web_meas_throw_mm = cal_valve_deg_to_throw_mm(s_web_valve_deg);
+        }
         else { s_web_meas_throw_mm = cal_valve_deg_to_throw_mm(s_web_valve_deg); }
 
     } else if (strcmp(cmd, "water_toggle") == 0) {
@@ -15210,6 +15245,9 @@ static esp_err_t zone_act_handler(httpd_req_t *req)
             // pulsed approach, drop the excursion.
             // Tight tolerance (1.0 deg) only at the hard stop, where
             // predictive braking otherwise parks 1-2 deg short of it.
+            // What the readout promised while the water was off.
+            float want_mm = wide ? cal_get_max_throw_mm()
+                                 : cal_valve_deg_to_throw_mm(s_web_valve_deg);
             valve_goto_interactive(s_web_valve_deg, wide ? 1.0f : 2.0f, 10000);
             s_valve_last_dir = 1;
             // Read initial PSI so throw display is live from the start
@@ -15218,6 +15256,35 @@ static esp_err_t zone_act_handler(httpd_req_t *req)
             if (mprls_read_quiet(&psi) && psi > 0.1f) {
                 s_web_meas_psi      = psi;
                 s_web_meas_throw_mm = cal_pressure_to_throw_mm(psi);
+
+                // b553: land on the dialed DISTANCE, not just the dialed valve
+                // angle. Dry, the readout predicts throw from the valve angle;
+                // wet, it measures it from pressure. Those are different cal
+                // curves and they only agree if supply pressure still matches
+                // what it was at calibration -- so turning the water on moved
+                // the stream a few feet from what the user had set. One bounded
+                // correction, never a loop: the b543 finding was that repeated
+                // hunting is what makes the stream visibly overshoot.
+                float err_mm = want_mm - s_web_meas_throw_mm;
+                if (want_mm > 10.0f && fabsf(err_mm) > 152.0f) {   // > 0.5 ft out
+                    float corr_deg = cal_throw_to_valve_deg(want_mm);
+                    if (corr_deg > 0.0f) {
+                        float lo = cal_get_min_valve_deg();
+                        if (corr_deg < lo)             corr_deg = lo;
+                        if (corr_deg > VALVE_OPEN_DEG) corr_deg = VALVE_OPEN_DEG;
+                        INFO("Zone water on: dialed %.1f ft, measured %.1f ft -- "
+                             "correcting valve %.2f -> %.2f deg",
+                             want_mm / 304.8f, s_web_meas_throw_mm / 304.8f,
+                             s_web_valve_deg, corr_deg);
+                        s_web_valve_deg = corr_deg;
+                        valve_goto_interactive(corr_deg, 1.0f, 6000);
+                        vTaskDelay(pdMS_TO_TICKS(ZONE_WEB_SETTLE_MS));
+                        if (mprls_read_quiet(&psi) && psi > 0.1f) {
+                            s_web_meas_psi      = psi;
+                            s_web_meas_throw_mm = cal_pressure_to_throw_mm(psi);
+                        }
+                    }
+                }
             }
         } else {
             valve_goto(VALVE_CLOSED_DEG, 2.0f, 10000, false);

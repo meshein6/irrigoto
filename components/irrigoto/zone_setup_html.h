@@ -1004,7 +1004,14 @@ function applyState(s){
   document.getElementById('btn-dn').classList.toggle('at-limit', !!s.at_min);
   document.getElementById('btn-up').classList.toggle('at-limit', !!s.at_max);
   const limHint = s.at_min ? ' MIN' : s.at_max ? ' MAX' : '';
-  document.getElementById('v-throw').textContent = s.throw_ft.toFixed(1)+'ft'+limHint;
+  // b553: while an arrow is held, show the COMMANDED distance. The hold-repeat
+  // path skips the pressure settle on purpose, so every reading that comes back
+  // mid-hold is a transient sample and the number jumped around under the
+  // thumb. Releasing triggers the settle fetch, which shows what is actually
+  // being delivered.
+  const shownFt = (_hActive && typeof s.cmd_throw_ft === 'number')
+                  ? s.cmd_throw_ft : s.throw_ft;
+  document.getElementById('v-throw').textContent = shownFt.toFixed(1)+'ft'+limHint;
   document.getElementById('btn-trim').classList.toggle('water-off', !s.water);
   draw();
 }
