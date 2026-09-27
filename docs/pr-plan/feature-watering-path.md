@@ -298,7 +298,7 @@ Still to do:
 - Wet test of Fine / Finest and of the suggested pass counts, checked against
   the heatmap.
 - Before upstreaming: drop the fork `bNNN` labels in the new comments (see
-  `README.md` in this folder).
+  the versioning rules in the PR-plan index on `combined`).
 
 ## Open work
 
