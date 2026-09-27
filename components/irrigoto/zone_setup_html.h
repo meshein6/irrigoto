@@ -516,6 +516,7 @@ function openPathPreview(){
     points: ST.points,
     act_max_throw: ST.act_max_throw, act_min_throw: ST.act_min_throw,
     mode: pathMode, lockMode: false, depth8: 1,
+    coverage: ST.coverage | 0,   // b564: draw the zone's real ring pitch
     title: document.getElementById('zone-name').value || 'Zone',
   });
 }

@@ -240,7 +240,7 @@
     var inward = !(serpish && (pass % 2) === 1);
     for (i = 0; i < nRings; i++) idx.push(inward ? i : nRings - 1 - i);
 
-    var cw = [], dryReturn = [];
+    var cw = [];
     for (i = 0; i < nRings; i++) {
       var d;
       if (sequential)                    d = (i % 2) === 0;
@@ -248,11 +248,14 @@
       else if (modeKey === 'pulse')      d = true;
       else                               d = (pass % 2) === 0;  /* gentle, smooth */
       cw.push(d);
-      /* A ring that sweeps the same direction as the last one has to travel
-       * back to its start with the valve shut. */
-      dryReturn.push(i > 0 && cw[i] === cw[i - 1]);
     }
-    return { idx: idx, cw: cw, dryReturn: dryReturn, orderVaries: (modeKey === 'smooth' && !sequential) };
+    /* b564: dryReturn used to be computed here and consumed by draw(). It was
+     * a guess -- "same direction as the last ring, so it must travel back
+     * dry" -- and it was wrong for Serpentine and Sections, where the
+     * firmware rides the boundary with the stream ON. Whether a connector is
+     * wet is now decided in build() by the same point-in-polygon test the
+     * firmware uses, per connector, not inferred from sweep direction. */
+    return { idx: idx, cw: cw, orderVaries: (modeKey === 'smooth' && !sequential) };
   }
 
   /* Do two circular bearing ranges overlap? Mirrors serp_arc_overlaps() in
@@ -297,10 +300,6 @@
                    cw: (out.length % 2) === 0, lobe: L, spans: sub });
       }
     }
-    /* A hop is dry whenever the next visit is a different ring or lobe. */
-    for (i = 0; i < out.length; i++)
-      out[i].dryReturn = (i > 0) && (out[i].lobe !== out[i - 1].lobe ||
-                                     out[i].cw === out[i - 1].cw);
     return out.length ? out : null;
   }
 
@@ -327,7 +326,6 @@
         visit: v,
         throw_mm: thr[ri],
         cw: plan.cw[v],
-        dryReturn: plan.dryReturn[v],
         spans: ringSpans(points, arc, thr[ri])
       });
     }
@@ -337,7 +335,45 @@
     var sectioned = (modeKey === 'sections') ? orderSections(rings) : null;
     if (sectioned) rings = sectioned;
 
+    /* b564: the moves the nozzle actually makes, in order, including what it
+     * does BETWEEN arcs. Serpentine and Sections never shut the stream off at
+     * a turn -- serpentine_build_pass_plan rides the polygon boundary instead
+     * (b426) -- and those boundary-hug waypoints are the majority of the legs
+     * in a real plan. Drawing only the ring arcs left most of the path out,
+     * which is why Serpentine looked like "a different path approach
+     * entirely" next to the real thing.
+     *
+     * Every other mode closes the valve between arcs, which is what the
+     * shared ring loop does ("closing valve for nozzle transit"), so their
+     * connectors stay dry. */
+    var serpish = (modeKey === 'serpentine' || modeKey === 'sections');
+    var turnFloor = Math.max(actMin || 0, 500);
+    var moves = [], prev = null;
+    for (var mi = 0; mi < rings.length; mi++) {
+      var MR = rings[mi];
+      var ord = MR.spans.slice().sort(function (a, b) {
+        return MR.cw ? (a.lo - b.lo) : (b.lo - a.lo);
+      });
+      for (var mj = 0; mj < ord.length; mj++) {
+        var msp = ord[mj];
+        var mfrom = MR.cw ? msp.lo : (msp.lo + msp.span);
+        var mto   = MR.cw ? (msp.lo + msp.span) : msp.lo;
+        if (prev) {
+          var turn = serpish
+            ? buildTurn(points, prev.deg, prev.r, mfrom, MR.throw_mm, turnFloor)
+            : { wet: false };
+          if (turn.wet) moves.push({ type: 'turn', from: prev, wps: turn.wps });
+          else moves.push({ type: 'hop', from: prev,
+                            to: { deg: mfrom, r: MR.throw_mm } });
+        }
+        moves.push({ type: 'sweep', ring: MR.ring, visit: mi, r: MR.throw_mm,
+                     from: mfrom, to: mto, cw: MR.cw });
+        prev = { r: MR.throw_mm, deg: mto };
+      }
+    }
+
     return {
+      moves: moves,
       modeKey: modeKey,
       modeLabel: (MODES[opts.mode] || MODES['1']).label,
       arc: arc,
@@ -377,26 +413,42 @@
         ctx.stroke();
         if (!thin && sp.span > 8) arrow(ctx, cx, cy, r, sp, R.cw);
       }
-      /* Dry return to the next ring's start, when the direction repeats. */
-      if (!thin && i + 1 < n && geom.rings[i + 1].dryReturn && R.spans.length) {
-        var nx = geom.rings[i + 1];
-        var nr = (nx.throw_mm / scale) * maxR;
-        if (nx.spans.length) {
-          var from = R.cw ? R.spans[R.spans.length - 1] : R.spans[0];
-          var fb = R.cw ? (from.lo + from.span) : from.lo;
-          var to = nx.cw ? nx.spans[0] : nx.spans[nx.spans.length - 1];
-          var tb = nx.cw ? to.lo : (to.lo + to.span);
-          ctx.beginPath();
-          ctx.moveTo(cx + Math.cos(rad(fb)) * r, cy + Math.sin(rad(fb)) * r);
-          ctx.lineTo(cx + Math.cos(rad(tb)) * nr, cy + Math.sin(rad(tb)) * nr);
-          ctx.strokeStyle = 'rgba(150,150,150,.35)';
-          ctx.lineWidth = 1;
-          ctx.setLineDash([2, 4]);
-          ctx.stroke();
-          ctx.setLineDash([]);
-        }
-      }
     }
+
+    /* b564: connectors, from the same ordered move list the scrubber walks --
+     * so the picture and the animation cannot disagree. A wet boundary-hug
+     * turn (Serpentine/Sections) is drawn solid, because the stream is on for
+     * all of it; a dry hop stays dotted grey. The old code inferred a dry
+     * return from a dryReturn flag on the ring and drew a straight radial
+     * line, which was wrong for both: it never drew the boundary-hug turns at
+     * all, and it drew a straight chord where the nozzle rides an arc. */
+    if (!geom.moves) return;
+    geom.moves.forEach(function (mv) {
+      if (mv.type === 'turn') {
+        ctx.beginPath();
+        ctx.moveTo(cx + Math.cos(rad(mv.from.deg)) * (mv.from.r / scale) * maxR,
+                   cy + Math.sin(rad(mv.from.deg)) * (mv.from.r / scale) * maxR);
+        mv.wps.forEach(function (w) {
+          ctx.lineTo(cx + Math.cos(rad(w.deg)) * (w.r / scale) * maxR,
+                     cy + Math.sin(rad(w.deg)) * (w.r / scale) * maxR);
+        });
+        ctx.strokeStyle = 'rgba(80,180,255,.42)';
+        ctx.lineWidth = thin ? 1.0 : 1.4;
+        ctx.setLineDash([]);
+        ctx.stroke();
+      } else if (mv.type === 'hop' && !thin) {
+        ctx.beginPath();
+        ctx.moveTo(cx + Math.cos(rad(mv.from.deg)) * (mv.from.r / scale) * maxR,
+                   cy + Math.sin(rad(mv.from.deg)) * (mv.from.r / scale) * maxR);
+        ctx.lineTo(cx + Math.cos(rad(mv.to.deg)) * (mv.to.r / scale) * maxR,
+                   cy + Math.sin(rad(mv.to.deg)) * (mv.to.r / scale) * maxR);
+        ctx.strokeStyle = 'rgba(150,150,150,.35)';
+        ctx.lineWidth = 1;
+        ctx.setLineDash([2, 4]);
+        ctx.stroke();
+        ctx.setLineDash([]);
+      }
+    });
   }
 
   /* Flatten the plan into the ordered list of moves the nozzle makes, so a
@@ -404,29 +456,31 @@
    * valve-closed hops between them. Lengths are real distances in mm, so the
    * dot moves at a believable speed rather than jumping ring to ring. */
   function flatten(geom) {
-    if (!geom || geom.noPath || !geom.rings.length) return { segs: [], total: 0 };
-    var segs = [], prev = null;
-    for (var i = 0; i < geom.rings.length; i++) {
-      var R = geom.rings[i];
-      /* Sweep each span in travel order. */
-      var order = R.spans.slice().sort(function (a, b) {
-        return R.cw ? (a.lo - b.lo) : (b.lo - a.lo);
-      });
-      for (var j = 0; j < order.length; j++) {
-        var sp = order[j];
-        var from = R.cw ? sp.lo : (sp.lo + sp.span);
-        var to   = R.cw ? (sp.lo + sp.span) : sp.lo;
-        if (prev) {
-          var dl = polarDist(prev.r, prev.deg, R.throw_mm, from);
-          if (dl > 1) segs.push({ dry: true, r0: prev.r, d0: prev.deg,
-                                  r1: R.throw_mm, d1: from, len: dl });
-        }
-        var len = R.throw_mm * (sp.span * Math.PI / 180);
-        segs.push({ dry: false, ring: R.ring, visit: i, r: R.throw_mm,
-                    from: from, to: to, cw: R.cw, len: Math.max(len, 1) });
-        prev = { r: R.throw_mm, deg: to };
+    if (!geom || geom.noPath || !geom.moves || !geom.moves.length)
+      return { segs: [], total: 0 };
+    var segs = [];
+    geom.moves.forEach(function (mv) {
+      if (mv.type === 'sweep') {
+        var len = mv.r * (Math.abs(angDelta(mv.from, mv.to)) * Math.PI / 180);
+        segs.push({ dry: false, ring: mv.ring, visit: mv.visit, r: mv.r,
+                    from: mv.from, to: mv.to, cw: mv.cw, len: Math.max(len, 1) });
+      } else if (mv.type === 'turn') {
+        /* Wet, and followed waypoint by waypoint so the scrubber traces the
+         * boundary the way the glide engine does. */
+        var pr = mv.from.r, pd = mv.from.deg;
+        mv.wps.forEach(function (w) {
+          var dl = polarDist(pr, pd, w.r, w.deg);
+          if (dl > 1) segs.push({ dry: false, turn: true, ring: -1, r: w.r,
+                                  r0: pr, d0: pd, r1: w.r, d1: w.deg,
+                                  from: pd, to: w.deg, len: dl });
+          pr = w.r; pd = w.deg;
+        });
+      } else {
+        var dh = polarDist(mv.from.r, mv.from.deg, mv.to.r, mv.to.deg);
+        if (dh > 1) segs.push({ dry: true, r0: mv.from.r, d0: mv.from.deg,
+                                r1: mv.to.r, d1: mv.to.deg, len: dh });
       }
-    }
+    });
     var total = segs.reduce(function (a, sg) { return a + sg.len; }, 0);
     return { segs: segs, total: total };
   }
@@ -447,10 +501,10 @@
       if (acc + sg.len >= want || i === flat.segs.length - 1) {
         var f = sg.len > 0 ? (want - acc) / sg.len : 0;
         f = Math.max(0, Math.min(1, f));
-        if (sg.dry) {
+        if (sg.dry || sg.turn) {
           return { r_mm: sg.r0 + (sg.r1 - sg.r0) * f,
                    bearing: sg.d0 + angDelta(sg.d0, sg.d1) * f,
-                   dry: true, ring: -1 };
+                   dry: !!sg.dry, turn: !!sg.turn, ring: -1 };
         }
         return { r_mm: sg.r, bearing: sg.from + (sg.to - sg.from) * f,
                  dry: false, ring: sg.ring, visit: sg.visit, cw: sg.cw };
@@ -689,13 +743,19 @@
   function ovDraw() {
     var o = {
       mode: ov.mode, pass: ov.passIdx, scrub: ov.t,
-      act_max_throw: ov.opts.act_max_throw, act_min_throw: ov.opts.act_min_throw
+      act_max_throw: ov.opts.act_max_throw, act_min_throw: ov.opts.act_min_throw,
+      /* b564: without this the overlay drew Standard ring spacing whatever
+       * the zone was set to -- the Sections preview in particular looked
+       * unaffected by coverage because the lobe ordering runs on top of a
+       * ring list that was built at the wrong pitch. */
+      coverage: ov.opts.coverage | 0
     };
     var at = thumb(ov.cv, ov.opts.points, o);
     var label = (MODES[ov.mode] || {}).label || '';
     ov.title.textContent = (ov.opts.title ? ov.opts.title + ' \u00b7 ' : '') + label;
     ov.at.textContent = (at && at.r_mm !== undefined)
       ? (at.dry ? 'moving \u00b7 dry'
+                : at.turn ? 'turning \u00b7 wet'
                 : 'ring ' + (at.ring + 1) + ' \u00b7 ' + (at.r_mm / 304.8).toFixed(1) + "'")
       : (ov.t <= 0 ? 'start' : '');
   }

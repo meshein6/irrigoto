@@ -17472,6 +17472,29 @@ static esp_err_t api_system_handler(httpd_req_t *req)
 // what to change, and it keeps the arithmetic in the firmware where the
 // pressure cal and speed map already live rather than duplicating the flow
 // model in JavaScript.
+// b565: the arc of one ring that is actually inside the zone.
+//
+// run_plan used to hand every ring the zone's whole bearing span. On the
+// measured zone that summed 20.8 m2 of ring area against a 5.71 m2 zone -- a
+// 3.6x over-count -- so it demanded 3.6x more water than the zone needs,
+// asked for a sweep 3.6x too slow, and then reported that one pass reaches
+// only a quarter of target and the run needs four passes and half an hour.
+// All of that was the arc assumption, not the hardware. Rings are clipped to
+// the polygon by the planner (zone_clip_arc_to_polygon), and the preview's
+// ringSpans() already samples the same way, so do that here too and the three
+// finally agree.
+static float run_plan_active_deg(const zone_perimeter_t *z, float ring_throw,
+                                 float zone_arc_deg)
+{
+    if (!z) return zone_arc_deg;
+    const float STEP = 2.0f;
+    float inside = 0.0f;
+    for (float b = 0.0f; b < 360.0f; b += STEP)
+        if (zone_contains_point(z, b, ring_throw)) inside += STEP;
+    if (inside > zone_arc_deg) inside = zone_arc_deg;
+    return inside;
+}
+
 // Walk the ring ladder phase_water_zone would build and accumulate the speed
 // the solver asks for on each one. A macro rather than a function so the two
 // call sites -- the requested pass count, and the search for one that works --
@@ -17482,13 +17505,15 @@ static esp_err_t api_system_handler(httpd_req_t *req)
         float _sp = pitch * (_t / act_max);                                   \
         if (_sp < WATER_MIN_RING_SPACING) _sp = WATER_MIN_RING_SPACING;       \
         float _in = _t - _sp; if (_in < 0.0f) _in = 0.0f;                     \
-        float _d = serpentine_ring_dps(_t, _in, active, (_ppm), &spd, have_spd);\
+        float _ad = run_plan_active_deg(have_zone ? &z : NULL, _t, active);   \
+        if (_ad < 1.0f) { (_rings)++; _t -= _sp; continue; }  /* ring misses */\
+        float _d = serpentine_ring_dps(_t, _in, _ad, (_ppm), &spd, have_spd); \
         if (_d < min_dps) _d = min_dps;      /* judge against the real floor */\
         if (_d >= max_dps - 0.01f) (_nfast)++;                                \
         if (_d <= min_dps + 0.01f) (_nslow)++;                                \
         if (_d < (_lo)) (_lo) = _d;                                           \
         if (_d > (_hi)) (_hi) = _d;                                           \
-        (_ests) += active / _d;                                               \
+        (_ests) += _ad / _d;                                                  \
         (_rings)++;                                                           \
         _t -= _sp;                                                            \
     }                                                                         \
@@ -17581,8 +17606,10 @@ static esp_err_t api_run_plan_handler(httpd_req_t *req)
             float sp = pitch * (t / act_max);
             if (sp < WATER_MIN_RING_SPACING) sp = WATER_MIN_RING_SPACING;
             float in = t - sp; if (in < 0.0f) in = 0.0f;
+            float ad = run_plan_active_deg(have_zone ? &z : NULL, t, active);
+            if (ad < 1.0f) { r2++; t -= sp; continue; }
             float want = 0.0f;
-            float got  = serpentine_ring_dps_ex(t, in, active, per_pass_mm,
+            float got  = serpentine_ring_dps_ex(t, in, ad, per_pass_mm,
                                                 &spd, have_spd, &want);
             if (got < min_dps) got = min_dps;
             // Deposit scales inversely with speed, so a ring forced to sweep
@@ -20799,11 +20826,27 @@ float irrigoto_last_water_target_depth_mm(void) { return s_last_depth_mm; }
 // This is the honest "did we hit target?" number -- compare against
 // irrigoto_last_water_target_depth_mm(). 0 if zone polygon area is unknown
 // (zone not loaded, < 3 points, etc.).
+// NOTE the denominator: this is volume over the WHOLE zone polygon, so it
+// folds coverage and depth into one number. It is NOT comparable with
+// target_depth_mm, which is a per-ring depth. Comparing them says a run
+// missed badly when it may simply not have reached part of the zone --
+// on the measured run, 1.53 vs 3.175 looked like 48% of target when the
+// ground the rings did cover got 2.63 mm, i.e. 83%. Use
+// irrigoto_last_water_watered_avg_depth_mm() for that comparison.
 float irrigoto_last_water_actual_avg_depth_mm(void)
 {
     float zone_area = irrigoto_last_water_zone_area_m2();
     if (zone_area <= 0.01f) return 0.0f;
     return irrigoto_last_water_volume_l() / zone_area;
+}
+
+// b565: depth over the ground the rings actually covered -- the number that
+// IS comparable with target_depth_mm.
+float irrigoto_last_water_watered_avg_depth_mm(void)
+{
+    float a = irrigoto_last_water_area_m2();
+    if (a <= 0.01f) return 0.0f;
+    return irrigoto_last_water_volume_l() / a;
 }
 
 // Sort zone perimeter points by walk_idx and convert to Cartesian. Used
