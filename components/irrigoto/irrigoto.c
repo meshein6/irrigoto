@@ -17921,14 +17921,29 @@ static esp_err_t api_run_plan_handler(httpd_req_t *req)
             float got  = serpentine_ring_dps_ex(t, in, ad, per_pass_mm,
                                                 &spd, have_spd, &want);
             if (got < min_dps) got = min_dps;
-            // Deposit scales inversely with speed, so a ring forced to sweep
-            // faster than asked lays down want/got of what was requested.
-            float frac = (got > 0.01f && want > 0.0f) ? (want / got) : 1.0f;
+            // b584: count passes with the EXACT expression the run uses --
+            // nozzle_precip_depth_mm at the commanded speed -- not a clamp
+            // ratio.
+            //
+            // The ratio form (want/got) is only algebraically equal to it
+            // while serpentine_ring_dps takes the plain annulus area. Below
+            // WATER_MIN_ELLIPSE_THROW_MM it substitutes a splash-band area
+            // instead, so the two drift apart on the inner rings and the
+            // preview predicted about four passes where the firmware
+            // scheduled two. Sharing one expression is the whole point of
+            // the deterministic model; two of them is how the preview and
+            // the run disagreed in the first place.
+            //
+            // pressure_scale is 1.0 here: it is measured at full open during
+            // a run and a regulated supply leaves it at 1.0 anyway (b535).
+            float psi_r = cal_throw_to_psi(t);
+            float d1    = nozzle_precip_depth_mm(t, in, got, psi_r);
+            float frac  = (d1 > 0.0005f) ? (d1 / depth_mm) : 1.0f;
             if (frac > 1.0f) frac = 1.0f;       // pinned fast = over-applies, not short
             if (frac < 0.02f) frac = 0.02f;
             if (frac < worst_frac) worst_frac = frac;
             if (frac < 0.99f) n_short++;
-            int rp = (int)ceilf(1.0f / frac);
+            int rp = (d1 > 0.0005f) ? (int)ceilf(depth_mm / d1) : 1;
             if (rp < 1) rp = 1;
             if (rp > need_passes) need_passes = rp;
             est_s_total += (ad / got) * (float)rp;   // this ring's own time
