@@ -288,6 +288,11 @@ static volatile int  s_exp_section = 0;        // 1 = A (dry dead-time), 2 = B (
 // (1..8 = 1/8".. 1"). 0 = use the legacy digit-encoded depth. Set on each
 // start path; consumed (reset to 0) by the water task.
 static int           s_web_water_depth_eighths = 0;
+// b557: how many passes to spread the target depth over. A property of the
+// RUN, unlike coverage which belongs to the zone. 0 = let the mode pick, which
+// is exactly what every build before this one did. Consumed once by
+// phase_water_zone, like the depth above it.
+static int           s_web_water_passes        = 0;
 // b423: serpentine-mode web params, consumed once by phase_water_zone like
 // depth_eighths. dps 0 = default; dry runs the motion with the valve held.
 static float         s_web_serpentine_dps = 0.0f;
@@ -414,6 +419,9 @@ static TickType_t    s_water_vol_t0     = 0;     // b506: run start tick for the
 static FILE         *s_water_csv_f    = NULL; // watering CSV log (/lfs/water/water_000.csv)
 static uint8_t       s_csv_pass_type  = 1;    // 1=initial pass, 2+=cleanup pass
 static bool          s_water_detail_log = false; // when true: write per-pass rows (disables smooth aggregate)
+// b536: set by the Sections mode (web digit 9) -- serpentine, but the plan is
+// lobe-major: finish one side of the zone outer -> inner before crossing.
+static bool          s_sections_mode = false;
 // b288: in smooth-aggregate mode the wbin file is created at run-END, not at start,
 // so the file is never held open during the loop (avoids LittleFS metadata-relocation
 // races against WiFi PHY work that caused the b285-b287 mid-run crashes).
@@ -3943,6 +3951,11 @@ static esp_err_t zone_load_nvs(zone_perimeter_t *z)
     nvs_handle_t h;
     esp_err_t r = nvs_open(CAL_NVS_NAMESPACE, NVS_READONLY, &h);
     if (r != ESP_OK) return r;
+    // b555: zero first. The blob grew by the coverage byte, and nvs_get_blob
+    // happily returns a shorter pre-b555 blob into the larger struct -- this
+    // is what makes the tail read as ZONE_COVERAGE_STANDARD instead of stack
+    // garbage.
+    memset(z, 0, sizeof(*z));
     size_t sz = sizeof(*z);
     r = nvs_get_blob(h, "zone_perimeter", z, &sz);
     nvs_close(h);
@@ -6954,8 +6967,35 @@ static void check_inactivity(void)
 #define WATER_SECTOR_DEG            10.0f
 #define WATER_SECTORS               36
 #define WATER_MAX_RINGS_CAL         36
+#define WATER_MAX_PASSES_REQ         8   // b557: upper bound on a requested pass count
 #define WATER_RING_SPACING         700.0f
 #define WATER_MIN_RING_SPACING      80.0f
+
+// b555: per-zone coverage scales the ring pitch. Finer coverage lays the rings
+// closer together, which costs run time and buys uniformity on a small or
+// awkwardly shaped zone. The same factor MUST scale the assumed footprint
+// width used for depth accounting -- see s_ring_footprint_mm.
+static inline float zone_coverage_scale(uint8_t c)
+{
+    switch (c) {
+        case ZONE_COVERAGE_FINE:   return 0.75f;
+        case ZONE_COVERAGE_FINEST: return 0.50f;
+        default:                   return 1.00f;
+    }
+}
+static inline const char *zone_coverage_name(uint8_t c)
+{
+    switch (c) {
+        case ZONE_COVERAGE_FINE:   return "Fine";
+        case ZONE_COVERAGE_FINEST: return "Finest";
+        default:                   return "Standard";
+    }
+}
+// Ring pitch and footprint width in force for the run being planned or the run
+// being displayed. Set at the top of phase_water_zone from the zone's setting,
+// and restored from the run file when a heatmap is drawn for an earlier run.
+static float s_ring_pitch_mm     = WATER_RING_SPACING;
+static float s_ring_footprint_mm = WATER_RING_SPACING;
 #define WATER_PRESSURE_TOL           0.15f
 #define WATER_PRESSURE_ITER          8
 #define WATER_MAX_THROW_MM        8534.0f
@@ -7521,12 +7561,34 @@ static bool nozzle_sweep_pulse(
         as5600_read(ADDR_AS5600, &n_raw_b, NULL, NULL);
         float pos_before = n_raw_b * (360.0f / 4096.0f);
 
+        // b550: shorten the final pulse so the sweep lands ON the arc bound
+        // instead of sailing past it. The loop condition only asks whether
+        // 0.3 deg remains, but a pulse is a fixed shove: with the default
+        // cal (jog_pulse_duty/ms unset -> duty 200 for 80 ms, ~49 dps) that
+        // shove is ~3.9 deg, so every arc used to finish up to ~3.6 deg
+        // outside the polygon with the valve still open -- about 200 mm past
+        // the boundary at a 3.2 m throw, on every arc end, in both
+        // directions. Visible as the stream stepping over the zone edge.
+        uint32_t this_ms = pulse_ms;
+        if (deg_per_pulse > 0.1f) {
+            float frac = (arc_deg - progress) / deg_per_pulse;
+            if (frac < 1.0f) {
+                // Below roughly a third of a pulse the motor won't break
+                // static friction, so a scaled pulse would just stall three
+                // times and log a false stall. Stop instead: a sub-degree
+                // shortfall is invisible, an overshoot waters the path.
+                if (frac < 0.35f) break;
+                this_ms = (uint32_t)(pulse_ms * frac);
+                if (this_ms < 15) this_ms = 15;
+            }
+        }
+
         // Fire pulse
         mcpwm_comparator_set_compare_value(n_cmpr, pulse_duty);
-        vTaskDelay(pdMS_TO_TICKS(pulse_ms));
+        vTaskDelay(pdMS_TO_TICKS(this_ms));
         mcpwm_comparator_set_compare_value(n_cmpr, 0);
         vTaskDelay(pdMS_TO_TICKS(SETTLE_MS));
-        elapsed += pulse_ms + SETTLE_MS;
+        elapsed += this_ms + SETTLE_MS;
 
         uint16_t n_raw_a = 0;
         as5600_read(ADDR_AS5600, &n_raw_a, NULL, NULL);
@@ -7544,14 +7606,18 @@ static bool nozzle_sweep_pulse(
             continue;
         }
         stall_count = 0;
-        deg_per_pulse = (deg_per_pulse < 0.1f)
-            ? delta : (0.8f*deg_per_pulse + 0.2f*delta);
+        // Only learn the pulse size from full-length pulses -- a deliberately
+        // shortened final pulse would drag the estimate down and make the
+        // next arc's last pulse overshoot again.
+        if (this_ms == pulse_ms)
+            deg_per_pulse = (deg_per_pulse < 0.1f)
+                ? delta : (0.8f*deg_per_pulse + 0.2f*delta);
         progress += delta;
 
         // Dwell so total time per step = delta / target_dps
         float   step_ms_ideal = delta / target_dps * 1000.0f;
         int32_t dwell_ms      = (int32_t)step_ms_ideal
-                              - (int32_t)(pulse_ms + SETTLE_MS);
+                              - (int32_t)(this_ms + SETTLE_MS);
 
         // Pressure P-control: nudge valve to maintain target_psi.
         // Valve uses GPIO (not MCPWM) so no conflict with nozzle timer.
@@ -8814,7 +8880,14 @@ typedef struct {
 // 36 rings x (turn + sweep) + boundary-hug waypoint (b426) and multi-arc
 // slack. Static: the water task stack is 16 KB and has history of running
 // close (b285).
-#define SERPENTINE_MAX_LEGS 256
+// b547: 256 -> 384. The measured run on a 20-ring zone hit the cap at ring 13
+// and truncated, so the outer third was planned but never watered -- and it
+// said so in one INFO line that is easy to miss. A boundary-hug turn alone
+// emits ~33 legs, so ~20 legs/ring average; 20 rings needs ~400. 384 covers
+// the measured case with the dry-hop saving from b541, and costs 4 KB of the
+// 8.5 KB freed by shrinking mr_buf. It is NOT enough for finer coverage
+// (29 rings would want ~580); that needs the shared-arena work first.
+#define SERPENTINE_MAX_LEGS 384
 // b426: boundary-hugging turns. Waypoint pitch along the connector, and how
 // far inside the polygon's radial extent the hug path rides. The hug radius
 // at each waypoint is min(linear glide, perimeter extent - margin); a turn
@@ -8873,7 +8946,7 @@ static int serpentine_arc_bounds(const zone_perimeter_t *zone, bool have_zone,
     bool active[WATER_SECTORS];
     int  active_count = 0;
     for (int s = 0; s < WATER_SECTORS; s++) {
-        float tol = WATER_RING_SPACING * (ring_throw / act_max_throw) * 0.5f;
+        float tol = s_ring_footprint_mm * (ring_throw / act_max_throw) * 0.5f;
         active[s] = (ring_throw <= sector_throw[s] + tol);
         if (active[s]) active_count++;
     }
@@ -9022,6 +9095,24 @@ static float serpentine_ring_dps(float ring_throw, float inner_throw,
 // in the loop), then swept to its far bound, direction alternating per
 // ring. The valve closes only when a connector crosses a true exclusion
 // (polygon extent below the waterable floor). Returns the leg count.
+// b536: do two circular bearing ranges overlap? Both are [lo, hi] swept CW,
+// so a range may wrap through 0. Used to decide which section (lobe) an arc
+// on an inner ring belongs to.
+static bool serp_arc_overlaps(float alo, float ahi, float blo, float bhi)
+{
+    float aspan = fmodf(ahi - alo + 360.0f, 360.0f);
+    float bspan = fmodf(bhi - blo + 360.0f, 360.0f);
+    if (aspan <= 0.0f) aspan = 360.0f;
+    if (bspan <= 0.0f) bspan = 360.0f;
+    // Walk A in small steps and test containment in B -- robust across wrap,
+    // and an arc is at most a few tens of degrees here.
+    for (float t = 0.0f; t <= aspan; t += 2.0f) {
+        float off = fmodf(fmodf(alo + t, 360.0f) - blo + 360.0f, 360.0f);
+        if (off <= bspan) return true;
+    }
+    return false;
+}
+
 static int serpentine_build_pass_plan(
     const zone_perimeter_t *zone, bool have_zone,
     const float *sector_throw,
@@ -9034,7 +9125,8 @@ static int serpentine_build_pass_plan(
     const speed_map_t *spd, bool have_spd,
     float serpentine_dps,            // > 0 = manual override; 0 = flow-solved (b429)
     float depth_mm,             // b429: per-pass deposit target for the solver
-    const float *valve_corr)    // b429: per-ring lookup-throw multiplier
+    const float *valve_corr,    // b429: per-ring lookup-throw multiplier
+    bool  sections)             // b536: finish one lobe before crossing to the next
 {
     int  n     = 0;
     bool cw    = start_cw;
@@ -9047,7 +9139,11 @@ static int serpentine_build_pass_plan(
 
 #define SERPENTINE_EMIT(_b, _v, _duty, _dps, _ring, _dir, _kind, _throw) do {      \
         if (n >= SERPENTINE_MAX_LEGS) {                                            \
-            INFO("Serpentine plan: leg cap (%d) hit -- truncating", SERPENTINE_MAX_LEGS);\
+            /* b547: this silently watered part of the zone. Say so loudly --
+               it is a coverage failure, not a formatting detail. */          \
+            WARN("Serpentine plan TRUNCATED at the %d-leg cap -- the rest of " \
+                 "this zone will NOT be watered this pass. Use coarser "      \
+                 "coverage, or a smaller zone.", SERPENTINE_MAX_LEGS);        \
             return n;                                                         \
         }                                                                     \
         s_serpentine_legs[n++] = (serpentine_leg_t){ .b1_deg=(_b), .v1_deg=(_v),        \
@@ -9056,6 +9152,49 @@ static int serpentine_build_pass_plan(
             .ring_throw=(_throw), .leg_throw=(_throw) };                      \
     } while (0)
 
+    // b536: section-by-section. Without it the plan is ring-major: sweep the
+    // left arc of a ring, hop across the zone with the valve shut to the right
+    // arc, step inward, cross back -- every ring, both ways. Sections make it
+    // lobe-major instead: finish one side outer -> inner, then ONE hop to the
+    // next. Jumps drop from (lobes-1) x rings to (lobes-1).
+    //
+    // Lobes are defined by the OUTERMOST waterable ring's arcs. Going inward
+    // the lobes merge (a smaller ring's arc spans both); such an arc is
+    // assigned to the lowest-index lobe it overlaps, so the merged rings are
+    // swept exactly once, under the first section.
+    float lobe_lo[WATER_MAX_ARCS_PER_RING], lobe_hi[WATER_MAX_ARCS_PER_RING];
+    int   n_lobes = 1;
+    if (sections) {
+        // b541: take the lobes from the ring with the MOST arcs, not the
+        // outermost. A zone can split either way: a sprinkler inside a
+        // rectangle splits at the OUTER rings and merges inward, but a zone
+        // with a waist (the measured case) is a single arc at the outer rings
+        // and splits INWARD. Reading the outermost ring found one arc there,
+        // set n_lobes = 1, and silently turned sections off -- which is why it
+        // ran identically to serpentine with no section-by-section log line.
+        float tl[WATER_MAX_ARCS_PER_RING], th[WATER_MAX_ARCS_PER_RING];
+        for (int ri = 0; ri < num_rings && ri < WATER_RUN_MAX_RINGS; ri++) {
+            int ring = out_to_in ? ri : (num_rings - 1 - ri);
+            if (ring >= WATER_RUN_MAX_RINGS || skip[ring]) continue;
+            int na0 = serpentine_arc_bounds(zone, have_zone, ring_throws[ring],
+                          sector_throw, act_max_throw, zone_arc_start,
+                          zone_arc_end, zone_arc_deg, tl, th);
+            if (na0 > n_lobes) {
+                n_lobes = na0;
+                for (int L = 0; L < na0 && L < WATER_MAX_ARCS_PER_RING; L++) {
+                    lobe_lo[L] = tl[L]; lobe_hi[L] = th[L];
+                }
+            }
+        }
+        if (n_lobes > 1)
+            INFO("Serpentine: section-by-section, %d lobe(s)", n_lobes);
+        else
+            sections = false;   // single lobe: ring-major already never crosses
+    }
+
+    int  prev_sec = -1;   // b541: which section the last emitted arc belonged to
+    for (int sec = 0; sec < (sections ? n_lobes : 1); sec++) {
+    if (sections && sec > 0) cw = start_cw;   // each section starts consistently
     for (int ri = 0; ri < num_rings && ri < WATER_RUN_MAX_RINGS; ri++) {
         int ring = out_to_in ? ri : (num_rings - 1 - ri);
         if (ring >= WATER_RUN_MAX_RINGS || skip[ring]) continue;
@@ -9090,6 +9229,23 @@ static int serpentine_build_pass_plan(
         // Arcs in physical sweep order for this ring's direction.
         for (int k = 0; k < na; k++) {
             int   ai    = cw ? k : (na - 1 - k);
+            // b536: in section mode sweep only the arcs of the current lobe.
+            if (sections) {
+                int owner = -1;
+                for (int L = 0; L < n_lobes; L++)
+                    if (serp_arc_overlaps(lo[ai], hi[ai], lobe_lo[L], lobe_hi[L])) { owner = L; break; }
+                if (owner < 0) owner = 0;      // no overlap: fall to the first
+                if (owner != sec) continue;
+                // b541: the move to a NEW section crosses the whole zone.
+                // Serpentine's connector would hug the boundary with the valve
+                // OPEN -- a 30-odd waypoint traverse that waters its way across
+                // (and eats the leg budget). Across sections that is exactly
+                // the wandering this mode exists to remove, so force it dry by
+                // dropping the previous exit: the connector below then takes
+                // its "no previous sweep" path.
+                if (sec != prev_sec) { prev_exit_b = -1.0f; prev_throw = 0.0f; }
+                prev_sec = sec;
+            }
             float entry = cw ? lo[ai] : hi[ai];
             float exitb = cw ? hi[ai] : lo[ai];
 
@@ -9174,6 +9330,7 @@ static int serpentine_build_pass_plan(
         }
         cw = !cw;
     }
+    }   // b536: section loop
 #undef SERPENTINE_EMIT
     return n;
 }
@@ -10044,7 +10201,7 @@ static void water_serpentine_passes(
     float act_max_throw, float act_min_throw, bool have_throw_cal,
     float pressure_scale, float psi_min, float psi_max,
     const speed_map_t *spd, bool have_spd,
-    float depth_mm, int passes, float serpentine_dps, bool dry,
+    float depth_mm, float per_pass_target, int passes, float serpentine_dps, bool dry,
     int *ring_sweeps_out, float *run_psi_sum, int *run_psi_n,
     TickType_t t_start)
 {
@@ -10121,7 +10278,10 @@ static void water_serpentine_passes(
                                       zone_arc_start, zone_arc_end, zone_arc_deg,
                                       act_max_throw, have_throw_cal,
                                       pressure_scale, psi_min, psi_max,
-                                      spd, have_spd, serpentine_dps, depth_mm, corr);
+                                      spd, have_spd, serpentine_dps,
+                                      /* b557 */ (per_pass_target > 0.0f) ? per_pass_target : depth_mm,
+                                      corr,
+                                      /*sections=*/s_sections_mode);   // b536
         if (n == 0) {
             // b434: the only rings left are polygon-clipped to zero width
             // (e.g. the outermost ring on a spike-shaped zone) -- they can
@@ -10214,7 +10374,7 @@ static void water_serpentine_passes(
                 if (_ro < 1.0f || ring_unwaterable[i]) continue;
                 float _ri = (i == num_rings - 1) ? _ro * 0.92f : ring_throws[i + 1];
                 if (_ri >= _ro) continue;
-                float _tol = WATER_RING_SPACING * (_ro / act_max_throw) * 0.5f;
+                float _tol = s_ring_footprint_mm * (_ro / act_max_throw) * 0.5f;
                 int _ac = 0;
                 for (int s = 0; s < WATER_SECTORS; s++)
                     if (_ro <= sector_throw[s] + _tol) _ac++;
@@ -11307,7 +11467,23 @@ static void phase_water_zone(void)
     // --- Load zone perimeter ---
     zone_perimeter_t zone = {0};
     bool have_zone = (zone_load_primary(s_water_zone_id, &zone) == ESP_OK && zone.num_points >= 2);
+    // b536: section-by-section -- finish one lobe outer->inner before crossing
+    // to the next, instead of crossing the zone on every ring. Implemented for
+    // serpentine (its planner emits an ordered leg list, so the order can be
+    // changed without touching the shared ring loop's depth accounting).
     if (have_zone) zone_sort_walk_order(&zone);
+    // b555: per-zone coverage. Pitch and footprint move together -- see
+    // zone_coverage_scale(). A zone saved before b555 reads as Standard, so
+    // this is a no-op for everything that already exists.
+    {
+        uint8_t cov = have_zone ? zone.coverage : ZONE_COVERAGE_STANDARD;
+        float   sc  = zone_coverage_scale(cov);
+        s_ring_pitch_mm     = WATER_RING_SPACING * sc;
+        s_ring_footprint_mm = WATER_RING_SPACING * sc;
+        if (cov != ZONE_COVERAGE_STANDARD)
+            INFO("Coverage: %s -- ring pitch x%.2f (%.0f mm at full throw)",
+                 zone_coverage_name(cov), sc, s_ring_pitch_mm);
+    }
     INFO("Firmware build: %d", FW_BUILD);
     if (have_zone) INFO("Zone perimeter: %d points.", zone.num_points);
     else           INFO("No zone defined -- watering full circle at max throw.");
@@ -11391,7 +11567,7 @@ static void phase_water_zone(void)
             ring_direct[num_rings]    = false;
             ring_ref_throw[num_rings] = max_throw;
             num_rings++;
-            float sp = WATER_RING_SPACING * (t / act_max_throw);
+            float sp = s_ring_pitch_mm * (t / act_max_throw);
             if (sp < WATER_MIN_RING_SPACING) sp = WATER_MIN_RING_SPACING;
             t -= sp;
         }
@@ -11411,7 +11587,7 @@ static void phase_water_zone(void)
                 ring_ref_throw[num_rings] = max_throw;
                 num_rings++;
                 added++;
-                float sp = WATER_RING_SPACING * (t / act_max_throw);
+                float sp = s_ring_pitch_mm * (t / act_max_throw);
                 if (sp < WATER_MIN_RING_SPACING) sp = WATER_MIN_RING_SPACING;
                 t -= sp;
             }
@@ -11444,7 +11620,7 @@ static void phase_water_zone(void)
         // VALVE_CLOSED_DEG and produced no water (the dry center hole).
         float cal_min_throw = cal_get_min_throw_mm();
         if (ref_valve > 0.0f && act_min_throw > WATER_MIN_THROW_MM) {
-            float sp = WATER_RING_SPACING * (act_min_throw / act_max_throw);
+            float sp = s_ring_pitch_mm * (act_min_throw / act_max_throw);
             if (sp < WATER_MIN_RING_SPACING) sp = WATER_MIN_RING_SPACING;
             float t = act_min_throw - sp;
             int added = 0, added_cal = 0;
@@ -11456,7 +11632,7 @@ static void phase_water_zone(void)
                 num_rings++;
                 added++;
                 if (!below_cal) added_cal++;
-                sp = WATER_RING_SPACING * (t / act_max_throw);
+                sp = s_ring_pitch_mm * (t / act_max_throw);
                 if (sp < WATER_MIN_RING_SPACING) sp = WATER_MIN_RING_SPACING;
                 t -= sp;
             }
@@ -11539,8 +11715,10 @@ static void phase_water_zone(void)
     // Web-triggered: s_web_water_mode already set, skip interactive prompt
     int sel;
     if (s_web_water_mode > 0) {
-        // 0=idle, 1-4=metered, 5-6=gentle, 7=smooth, 8=serpentine (b423), 99=demo
+        // 0=idle, 1-4=metered, 5-6=gentle, 7=smooth, 8=serpentine (b423),
+        // 9=sections (b536, serpentine with a lobe-major plan), 99=demo
         sel = (s_web_water_mode == 99) ? 'd' :
+              (s_web_water_mode == 9)  ? 'e' :
               (s_web_water_mode == 8)  ? 'n' :
               (s_web_water_mode == 7)  ? 's' : ('0' + s_web_water_mode);
         INFO("Web mode: %c", sel);
@@ -11556,7 +11734,13 @@ static void phase_water_zone(void)
     bool  demo_mode   = (sel == 'd' || sel == 'D');
     bool  gentle_mode = (sel == '5' || sel == '6');
     bool  smooth_mode = (sel == 's' || sel == 'S');
-    bool  serpentine_mode  = (sel == 'n' || sel == 'N');   // b423: web-only mode 8
+    // b536: Sections is serpentine motion with a lobe-major plan -- finish one
+    // side of the zone outer -> inner, then ONE dry hop to the next, instead of
+    // crossing the zone on every ring. It shares every serpentine code path;
+    // only serpentine_build_pass_plan's emission order differs.
+    bool  sections_mode    = (sel == 'e' || sel == 'E');   // b536: web mode 9
+    bool  serpentine_mode  = (sel == 'n' || sel == 'N') || sections_mode;   // b423: mode 8
+    s_sections_mode = sections_mode;
     // b423: serpentine params, consumed once like depth_eighths below.
     float serpentine_dps = s_web_serpentine_dps; s_web_serpentine_dps = 0.0f;
     bool  serpentine_dry = s_web_serpentine_dry; s_web_serpentine_dry = false;
@@ -11570,12 +11754,35 @@ static void phase_water_zone(void)
     bool  use_eighths = (depth8 >= 1 && depth8 <= 8) && !demo_mode;
     float depth_mm    = use_eighths ? (float)depth8 * 3.175f :
                         (sel == '2' || sel == '4' || sel == '6') ? 6.35f : 3.175f;
+    bool  use_pulse_mode_sel = !demo_mode && !gentle_mode && !smooth_mode
+                               && !serpentine_mode;
     int   passes      = gentle_mode ? GENTLE_MAX_PASSES :
                         use_eighths  ? depth8 :                 // pulse: N x 1/8"
                         (sel == '3' || sel == '4') ? 2 : 1;
     if (demo_mode)   { depth_mm = 0.0f; passes = 1; }
     if (smooth_mode) { passes = 30; } // adaptive; depth_mm target set above
     if (serpentine_mode)  { passes = 30; } // b429: adaptive, exits when all rings satisfied
+
+    // b557: user-chosen pass count. Depth says how much water; passes says how
+    // it is spread. per_pass_target = depth_mm / passes goes to the speed
+    // solver, so MORE passes means each sweep deposits less and therefore runs
+    // FASTER, and fewer passes means a slower, heavier sweep. Speed is not a
+    // knob -- it is the consequence of these two, and the solver already
+    // existed; all that was missing was the ability to say how many passes.
+    // 0 keeps each mode's own behaviour, so an unspecified run is unchanged.
+    int req_passes = s_web_water_passes;
+    s_web_water_passes = 0;
+    if (req_passes < 1 || req_passes > WATER_MAX_PASSES_REQ) req_passes = 0;
+    if (demo_mode) req_passes = 0;
+    float per_pass_target = (req_passes > 0) ? depth_mm / (float)req_passes : 0.0f;
+    if (req_passes > 0) {
+        // Pulse's pass IS its depth unit, so the request sets its pass count
+        // outright. The adaptive modes keep their cap and simply finish early
+        // once the rings meet target.
+        if (use_pulse_mode_sel) passes = req_passes;
+        INFO("Passes: %d requested -- %.2f mm per pass of a %.2f mm target",
+             req_passes, per_pass_target, depth_mm);
+    }
 
     // b283: arm pressure trace recorder for smooth/gentle runs only (pulse
     // mode's per-arc valve PID would make valve_deg snapshots meaningless).
@@ -11993,7 +12200,7 @@ static void phase_water_zone(void)
             if (_ro < 1.0f) continue;
             float _ri = (r == num_rings - 1) ? _ro * 0.92f : ring_throws[r + 1];
             if (_ri >= _ro) continue;
-            float _tol = WATER_RING_SPACING * (_ro / act_max_throw) * 0.5f;
+            float _tol = s_ring_footprint_mm * (_ro / act_max_throw) * 0.5f;
             int _ac = 0;
             for (int s = 0; s < WATER_SECTORS; s++)
                 if (_ro <= sector_throw[s] + _tol) _ac++;
@@ -12157,7 +12364,7 @@ static void phase_water_zone(void)
                            zone_arc_start, zone_arc_end, zone_arc_deg,
                            act_max_throw, act_min_throw, have_throw_cal,
                            pressure_scale, psi_min, psi_max, &spd, have_spd,
-                           depth_mm, passes, serpentine_dps, serpentine_dry,
+                           depth_mm, per_pass_target, passes, serpentine_dps, serpentine_dry,
                            &_serpentine_sweeps, &_spsi_sum, &_spsi_n, t_start);
         rings_done += _serpentine_sweeps;
         (void)_spsi_sum; (void)_spsi_n;
@@ -12498,9 +12705,10 @@ static void phase_water_zone(void)
             //   gentle: GENTLE_PER_PASS_DEPTH_MM (~0.635mm, seed-safe; adaptive multi-pass)
             //   pulse:  depth_mm / passes (1- or 2-pass open-loop hits target exactly)
             float per_pass_depth;
-            if (smooth_mode)       per_pass_depth = depth_mm;
-            else if (gentle_mode)  per_pass_depth = GENTLE_PER_PASS_DEPTH_MM;
-            else                   per_pass_depth = depth_mm / (float)(passes > 0 ? passes : 1);
+            if (per_pass_target > 0.0f) per_pass_depth = per_pass_target;  // b557
+            else if (smooth_mode)       per_pass_depth = depth_mm;
+            else if (gentle_mode)       per_pass_depth = GENTLE_PER_PASS_DEPTH_MM;
+            else                        per_pass_depth = depth_mm / (float)(passes > 0 ? passes : 1);
 
             // Flow-model dps: dps = Q[mL/min]*active_deg / (per_pass_depth*60000*ring_area[m2])
             // delivers per_pass_depth in one sweep at the reference PSI.
@@ -13591,6 +13799,7 @@ abort:
         s_last_water_run.arc_start_deg = zone_arc_start;
         s_last_water_run.arc_span_deg  = zone_arc_deg;
         s_last_water_run.target_depth_mm = depth_mm;  // N x 1/8" target (heatmap baseline)
+        s_last_water_run.ring_footprint_mm = s_ring_footprint_mm;  // b555
         // Record actual wall-clock duration even for aborted runs so HA
         // can report partial run time. (Previously: 0 for aborted runs
         // so it didn't poison the UI's "estimated time" cache — the UI
@@ -14446,6 +14655,13 @@ static const char s_schedule_html[] =
 #include "schedule_html.h"
 ;
 
+// b535: shared browser code, served as its own file so zone_setup, landing
+// and schedule all use ONE copy of the path geometry instead of embedding a
+// duplicate each.
+static const char s_path_js[] =
+#include "path_js.h"
+;
+
 // Open-loop valve move using calibration table
 #define ZONE_VALVE_OPEN_LOOP() do { \
     if (s_web_water) { \
@@ -14552,7 +14768,8 @@ static int zone_build_json(char *buf, int maxlen)
     return snprintf(buf, maxlen,
         "{\"bearing\":%.1f,\"throw_mm\":%.0f,\"throw_ft\":%.2f,"
         "\"pressure_pct\":%.1f,\"water\":%s,"
-        "\"at_min\":%s,\"at_max\":%s,\"points\":%s,"
+        "\"at_min\":%s,\"at_max\":%s,"
+        "\"coverage\":%u,\"points\":%s,"
         "\"act_max_throw\":%.0f,\"fw_build\":%d,"
         "\"actual_throw_mm\":%.0f,\"act_min_throw\":%.0f,"
         "\"name\":\"%s\"}",
@@ -14560,6 +14777,7 @@ static int zone_build_json(char *buf, int maxlen)
         s_web_water ? "true" : "false",
         at_min ? "true" : "false",
         at_max ? "true" : "false",
+        (unsigned)s_web_zone.coverage,
         pts, act_max_throw_mm, FW_BUILD,
         actual_throw_mm, act_min_throw_mm,
         s_web_zone_name);
@@ -14760,6 +14978,21 @@ static esp_err_t zone_act_handler(httpd_req_t *req)
             s_web_valve_deg     = VALVE_CLOSED_DEG;
             s_web_meas_psi      = 0.0f;
             s_web_meas_throw_mm = 0.0f;
+        }
+
+    } else if (strcmp(cmd, "set_coverage") == 0) {
+        // b556: ring spacing for THIS zone. A zone property, not a run
+        // property -- it follows the zone's size and shape, so it lives here
+        // and not in the Water modal. Written to the zone file by the next
+        // Save, same as a perimeter edit.
+        char cv[8] = "";
+        if (httpd_query_key_value(query, "v", cv, sizeof(cv)) == ESP_OK) {
+            int v = atoi(cv);
+            if (v >= ZONE_COVERAGE_STANDARD && v <= ZONE_COVERAGE_FINEST) {
+                s_web_zone.coverage = (uint8_t)v;
+                INFO("Zone %u coverage -> %s", s_web_zone_id,
+                     zone_coverage_name(s_web_zone.coverage));
+            }
         }
 
     } else if (strcmp(cmd, "trim_pres") == 0) {
@@ -15040,6 +15273,7 @@ static esp_err_t zone_water_handler(httpd_req_t *req)
     int mode = mode_s[0]>'0'&&mode_s[0]<='6' ? mode_s[0]-'0' :
                mode_s[0]=='7'                 ? 7  :
                mode_s[0]=='8'                 ? 8  :
+               mode_s[0]=='9'                 ? 9  :   // b536: Sections
                mode_s[0]=='c'||mode_s[0]=='C' ? WATER_MODE_CHASE :
                mode_s[0]=='d'||mode_s[0]=='D' ? 99 : 0;
     uint16_t zone_id = (uint16_t)atoi(id_s);
@@ -15075,6 +15309,13 @@ static esp_err_t zone_water_handler(httpd_req_t *req)
     int depth8_req = atoi(depth_q);
     s_web_water_depth_eighths = (mode == WATER_MODE_CHASE || depth8_req < 1 || depth8_req > 8)
                                   ? 0 : depth8_req;
+    // b557: how many passes to spread that depth over. Absent -> 0 -> each
+    // mode keeps its own behaviour, so an old client is unaffected.
+    char passes_q[4]={0};
+    httpd_query_key_value(body,"passes",passes_q,sizeof(passes_q));
+    int passes_req = atoi(passes_q);
+    s_web_water_passes = (mode == WATER_MODE_CHASE || passes_req < 1
+                          || passes_req > WATER_MAX_PASSES_REQ) ? 0 : passes_req;
     // b423: serpentine tuning params. speed = nozzle dps (3..20; absent/0 ->
     // default 8). dry=1 runs the full serpentine with the valve held
     // closed -- a polygon-containment rehearsal before water flows.
@@ -16126,6 +16367,20 @@ static esp_err_t api_detail_log_handler(httpd_req_t *req)
     return ESP_OK;
 }
 
+static esp_err_t path_js_handler(httpd_req_t *req)
+{
+    httpd_resp_set_type(req, "application/javascript");
+    // b538: must NOT be cached hard. b535 served this with max-age=86400 on
+    // the reasoning that it only changes with a firmware update -- but that
+    // is exactly when it changes, and a browser holding yesterday's copy then
+    // runs old code against new pages (a new mode is missing from the preview
+    // and nothing explains why). The file is ~23 KB over LAN; revalidating is
+    // cheap, and the pages themselves are already no-store.
+    httpd_resp_set_hdr(req, "Cache-Control", "no-cache, must-revalidate");
+    httpd_resp_sendstr(req, s_path_js);
+    return ESP_OK;
+}
+
 static int wifi_get_rssi(void) {
     if (!s_wifi_connected) return 1;  // 1 = disconnected sentinel (RSSI always negative when connected)
     wifi_ap_record_t ap;
@@ -16247,6 +16502,193 @@ static esp_err_t api_time_handler(httpd_req_t *req)
 // the HA switch; this lets the OTA flow re-enable it without HA. Wake-safe
 // (HTTP handler -- doesn't touch the boot/wake path the regression lives in).
 // GET /api/auto_sleep -> {"auto_sleep":bool}; POST on=0|1 sets it.
+// b557: GET /api/run_plan?zone=&depth=&passes=
+//   -> {"ok":true,"depth_mm":,"passes":,"per_pass_mm":,"rings":,
+//       "dps_min":,"dps_max":,"clamp":"none"|"fast"|"slow",
+//       "est_min":,"advice":"..."}
+//
+// Passes and depth are only meaningful if the sprinkler can actually sweep at
+// the speed they imply, and the clamp in serpentine_ring_dps fails silently in
+// BOTH directions:
+//
+//   dps pinned at max  -- the sweep cannot go FAST enough to lay down as
+//                         little as asked, so every pass over-applies and the
+//                         run overshoots its target. Too many passes for too
+//                         little depth.
+//   dps pinned at min  -- the sweep cannot go SLOW enough to lay down as much
+//                         as asked, so the target is never met, and near the
+//                         floor the nozzle stalls rather than crawling. Too
+//                         few passes for too much depth, and this is also
+//                         where runoff lives.
+//
+// Neither was visible anywhere: a run just quietly missed. This answers the
+// question before the run starts, so the UI can say which way it is wrong and
+// what to change, and it keeps the arithmetic in the firmware where the
+// pressure cal and speed map already live rather than duplicating the flow
+// model in JavaScript.
+// Walk the ring ladder phase_water_zone would build and accumulate the speed
+// the solver asks for on each one. A macro rather than a function so the two
+// call sites -- the requested pass count, and the search for one that works --
+// cannot drift apart.
+#define RUN_PLAN_WALK(_ppm, _rings, _nfast, _nslow, _lo, _hi, _ests) do {     \
+    float _t = zmax;                                                          \
+    while (_t >= act_min && (_rings) < WATER_MAX_RINGS_CAL) {                 \
+        float _sp = pitch * (_t / act_max);                                   \
+        if (_sp < WATER_MIN_RING_SPACING) _sp = WATER_MIN_RING_SPACING;       \
+        float _in = _t - _sp; if (_in < 0.0f) _in = 0.0f;                     \
+        float _d = serpentine_ring_dps(_t, _in, active, (_ppm), &spd, have_spd);\
+        if (_d < min_dps) _d = min_dps;      /* judge against the real floor */\
+        if (_d >= max_dps - 0.01f) (_nfast)++;                                \
+        if (_d <= min_dps + 0.01f) (_nslow)++;                                \
+        if (_d < (_lo)) (_lo) = _d;                                           \
+        if (_d > (_hi)) (_hi) = _d;                                           \
+        (_ests) += active / _d;                                               \
+        (_rings)++;                                                           \
+        _t -= _sp;                                                            \
+    }                                                                         \
+} while (0)
+
+static esp_err_t api_run_plan_handler(httpd_req_t *req)
+{
+    WEB_TOUCH();
+    HTTP_CONN_CLOSE(req);
+    httpd_resp_set_type(req, "application/json");
+
+    char q[96] = "", v[12] = "";
+    int zone_id = 0, depth8 = 1, passes = 1;
+    if (httpd_req_get_url_query_str(req, q, sizeof(q)) == ESP_OK) {
+        if (httpd_query_key_value(q, "zone",   v, sizeof(v)) == ESP_OK) zone_id = atoi(v);
+        if (httpd_query_key_value(q, "depth",  v, sizeof(v)) == ESP_OK) depth8  = atoi(v);
+        if (httpd_query_key_value(q, "passes", v, sizeof(v)) == ESP_OK) passes  = atoi(v);
+    }
+    if (depth8 < 1) depth8 = 1;
+    if (depth8 > 8) depth8 = 8;
+    if (passes < 1) passes = 1;
+    if (passes > WATER_MAX_PASSES_REQ) passes = WATER_MAX_PASSES_REQ;
+
+    float depth_mm    = (float)depth8 * 3.175f;
+    float per_pass_mm = depth_mm / (float)passes;
+
+    zone_perimeter_t z = {0};
+    bool have_zone = (zone_load_primary((uint16_t)zone_id, &z) == ESP_OK && z.num_points >= 2);
+    if (have_zone) zone_sort_walk_order(&z);
+    float act_max = cal_get_max_throw_mm();
+    float act_min = have_zone ? zone_get_min_throw_mm(&z) : cal_get_min_throw_mm();
+    float zmax    = act_max;
+    if (have_zone) {
+        zmax = 0.0f;
+        for (int i = 0; i < z.num_points; i++)
+            if (z.points[i].throw_mm > zmax) zmax = z.points[i].throw_mm;
+    }
+    speed_map_t spd = {0};
+    bool have_spd = (spd_load_primary(&spd) == ESP_OK && spd.num_points > 0);
+    float max_dps = (have_spd && spd.num_points > 0)
+                    ? spd.deg_per_sec[spd.num_points - 1] : 118.0f;
+    // The slow-speed floor is the whole safety story on the "too few passes"
+    // side, and this unit reports min_continuous_dps = 0.00 -- the speed
+    // calibration never established one. With a zero floor
+    // serpentine_ring_dps clamps nothing below, so the solver will happily
+    // command a sweep slower than the nozzle can sustain and it stalls instead
+    // of crawling. Judge against a conservative default and SAY the cal is
+    // missing, rather than quietly reporting that everything is fine.
+    bool  floor_cal = (have_spd && spd.min_continuous_dps > 0.01f);
+    float min_dps   = floor_cal ? spd.min_continuous_dps : 10.9f;
+
+    // Active arc per ring. 360 is the upper bound and badly overestimates a
+    // zone that occupies a wedge -- it made the run-time estimate about 5x the
+    // measured one. Use the zone's own span, found the same way the planner
+    // does: the largest gap between vertex bearings is the excluded sector.
+    float active = 360.0f;
+    if (have_zone && z.num_points >= 3) {
+        float b[ZONE_MAX_PERIM_POINTS];
+        for (int i = 0; i < z.num_points; i++) b[i] = z.points[i].nozzle_deg;
+        for (int i = 1; i < z.num_points; i++)          // insertion sort, n <= 36
+            for (int j = i; j > 0 && b[j] < b[j-1]; j--) { float t2=b[j]; b[j]=b[j-1]; b[j-1]=t2; }
+        float gap = 0.0f;
+        for (int i = 0; i < z.num_points; i++) {
+            float nx = (i < z.num_points - 1) ? b[i+1] : b[0] + 360.0f;
+            if (nx - b[i] > gap) gap = nx - b[i];
+        }
+        if (gap > 45.0f) active = 360.0f - gap;
+        if (active < 10.0f) active = 10.0f;
+    }
+
+    // Walk the same ring ladder phase_water_zone builds, at this zone's
+    // coverage, and ask the solver for each ring's speed.
+    float pitch = WATER_RING_SPACING * zone_coverage_scale(have_zone ? z.coverage : 0);
+    int   rings = 0, n_fast = 0, n_slow = 0;
+    float est_s = 0.0f, lo_dps = 1e6f, hi_dps = 0.0f;
+    RUN_PLAN_WALK(per_pass_mm, rings, n_fast, n_slow, lo_dps, hi_dps, est_s);
+    if (rings == 0) { lo_dps = hi_dps = 0.0f; }
+    float est_min = est_s * (float)passes / 60.0f;
+
+    // The smallest pass count that actually clears the clamp. Suggesting
+    // "double it" was wrong often enough to be useless -- on this zone a 1/8"
+    // target needs 4 passes, not 2 -- and the user should not have to find the
+    // edge by trial when the firmware can just solve for it.
+    int suggest = 0;
+    for (int c = 1; c <= WATER_MAX_PASSES_REQ; c++) {
+        int r2 = 0, f2 = 0, s2 = 0; float l2 = 1e6f, h2 = 0.0f, e2 = 0.0f;
+        RUN_PLAN_WALK(depth_mm / (float)c, r2, f2, s2, l2, h2, e2);
+        if (r2 > 0 && f2 <= r2 / 2 && s2 <= r2 / 2) { suggest = c; break; }
+    }
+
+    const char *clamp = "none";
+    char advice[220];
+    advice[0] = '\0';
+    if (n_fast > rings / 2 && rings > 0) {
+        clamp = "fast";
+        if (suggest > 0)
+            snprintf(advice, sizeof(advice),
+                     "Too many passes for this depth -- the sprinkler cannot sweep "
+                     "fast enough, so each pass applies more than intended and the "
+                     "run overshoots. Try %d pass%s.",
+                     suggest, suggest == 1 ? "" : "es");
+        else
+            snprintf(advice, sizeof(advice),
+                     "No pass count works for this depth on this zone -- every "
+                     "choice sweeps faster than the target needs. Water less "
+                     "deeply, or space the rings finer in Zone Setup.");
+    } else if (n_slow > rings / 2 && rings > 0) {
+        clamp = "slow";
+        if (suggest > 0)
+            snprintf(advice, sizeof(advice),
+                     "Too few passes for this depth -- the sprinkler cannot sweep "
+                     "slowly enough, so the target is never reached and water "
+                     "pools. Try %d passes.%s", suggest,
+                     floor_cal ? "" : " Slow-speed limit is not calibrated "
+                                      "(assuming 10.9 dps) -- run the speed cal.");
+        else
+            snprintf(advice, sizeof(advice),
+                     "This depth cannot be reached on this zone at any pass count "
+                     "up to %d -- the sweep cannot go slow enough. Water less "
+                     "deeply, or run it twice.%s", WATER_MAX_PASSES_REQ,
+                     floor_cal ? "" : " Slow-speed limit is not calibrated "
+                                      "(assuming 10.9 dps) -- run the speed cal.");
+    }
+    // advice is built only from the fixed strings above -- no quotes,
+    // backslashes or control characters -- so it is valid JSON as it stands.
+
+    char buf[560];
+    int n = snprintf(buf, sizeof(buf),
+        "{\"ok\":true,\"zone\":%d,\"depth8\":%d,\"depth_mm\":%.2f,"
+        "\"passes\":%d,\"per_pass_mm\":%.3f,\"rings\":%d,"
+        "\"dps_min\":%.1f,\"dps_max\":%.1f,"
+        "\"limit_dps_min\":%.1f,\"limit_dps_max\":%.1f,"
+        "\"rings_at_max\":%d,\"rings_at_min\":%d,"
+        "\"clamp\":\"%s\",\"est_min\":%.1f,\"coverage\":%u,"
+        "\"active_deg\":%.0f,\"speed_floor_cal\":%s,\"suggest_passes\":%d,"
+        "\"advice\":\"%s\"}",
+        zone_id, depth8, depth_mm, passes, per_pass_mm, rings,
+        (double)lo_dps, (double)hi_dps, (double)min_dps, (double)max_dps,
+        n_fast, n_slow, clamp, (double)est_min,
+        (unsigned)(have_zone ? z.coverage : 0),
+        (double)active, floor_cal ? "true" : "false", suggest, advice);
+    if (n >= (int)sizeof(buf)) n = sizeof(buf) - 1;
+    httpd_resp_send(req, buf, n);
+    return ESP_OK;
+}
+
 static esp_err_t api_auto_sleep_handler(httpd_req_t *req)
 {
     HTTP_CONN_CLOSE(req);
@@ -18527,7 +18969,7 @@ static void zone_web_start(void)
     httpd_config_t cfg   = HTTPD_DEFAULT_CONFIG();
     cfg.server_port      = ZONE_WEB_PORT;
     cfg.ctrl_port        = ZONE_WEB_CTRL_PORT;
-    cfg.max_uri_handlers  = 76;  // b525: 74 -> 76 (/api/winter GET+POST); b522: 72 -> 74 (/api/fault_hold GET+POST); b512: 70 -> 72 (/api/uart_log GET+POST); b489: 68 -> 70, keeping the 2-slot margin over
+    cfg.max_uri_handlers  = 78;  // watering path: 76 -> 78 (/path.js GET, /api/run_plan GET); b525: 74 -> 76 (/api/winter GET+POST); b522: 72 -> 74 (/api/fault_hold GET+POST); b512: 70 -> 72 (/api/uart_log GET+POST); b489: 68 -> 70, keeping the 2-slot margin over
                                  // the _Static_assert below.
                                  // MUST be set before httpd_start (cfg is copied there);
                                  // headroom over uris[] count -- _Static_assert below guards it.
@@ -18557,8 +18999,10 @@ static void zone_web_start(void)
         {.uri="/zone/water_trace", .method=HTTP_GET,  .handler=zone_water_trace_handler}, // b283
         {.uri="/zone/last_log",    .method=HTTP_GET,  .handler=zone_last_log_handler},   // b292
         {.uri="/api/all",         .method=HTTP_GET,  .handler=api_all_handler},
+        {.uri="/api/run_plan",    .method=HTTP_GET,  .handler=api_run_plan_handler}, // b557
         {.uri="/api/auto_sleep",  .method=HTTP_GET,  .handler=api_auto_sleep_handler},  // b447
         {.uri="/api/auto_sleep",  .method=HTTP_POST, .handler=api_auto_sleep_handler},  // b447
+        {.uri="/path.js",         .method=HTTP_GET,  .handler=path_js_handler},   // b535 shared browser code
         {.uri="/api/detail_log",  .method=HTTP_GET,  .handler=api_detail_log_handler},
         {.uri="/api/uart_log",    .method=HTTP_GET,  .handler=api_uart_log_handler},   // b512
         {.uri="/api/uart_log",    .method=HTTP_POST, .handler=api_uart_log_handler},   // b512
@@ -18622,7 +19066,7 @@ static void zone_web_start(void)
         {.uri="/fs/upload",             .method=HTTP_POST, .handler=fs_upload_handler},
         {.uri="/fs/delete",             .method=HTTP_POST, .handler=fs_delete_handler},
     };
-    _Static_assert(sizeof(uris)/sizeof(uris[0]) <= 74,   // b525: 72 -> 74 (/api/winter GET+POST); b522: 70 -> 72 (/api/fault_hold GET+POST); b512: 68 -> 70 (/api/uart_log GET+POST); b489: 66 -> 68
+    _Static_assert(sizeof(uris)/sizeof(uris[0]) <= 76,   // watering path: 74 -> 76 (/path.js GET, /api/run_plan GET); b525: 72 -> 74 (/api/winter GET+POST); b522: 70 -> 72 (/api/fault_hold GET+POST); b512: 68 -> 70 (/api/uart_log GET+POST); b489: 66 -> 68
                    "uris[] exceeds cfg.max_uri_handlers -- raise it before httpd_start");
     for (size_t i = 0; i < sizeof(uris)/sizeof(uris[0]); i++)
         httpd_register_uri_handler(s_zone_server, &uris[i]);
@@ -18977,8 +19421,10 @@ int irrigoto_get_zone(void)
 
 int irrigoto_get_mode(void)
 {
-    // s_web_water_mode: 0=idle, 1-4=metered/pulse, 5-6=gentle, 7=smooth, 8=serpentine
-    // Map to HA options: 0=Pulse, 1=Gentle, 2=Smooth, 3=Serpentine (b431)
+    // s_web_water_mode: 0=idle, 1-4=metered/pulse, 5-6=gentle, 7=smooth,
+    // 8=serpentine, 9=sections (b536)
+    // Map to HA options: 0=Pulse, 1=Gentle, 2=Smooth, 3=Serpentine, 4=Sections
+    if (s_web_water_mode == 9)                     return 4;  // sections (b536)
     if (s_web_water_mode == 8)                     return 3;  // serpentine
     if (s_web_water_mode == 7)                     return 2;  // smooth
     if (s_web_water_mode == 5 || s_web_water_mode == 6) return 1; // gentle
@@ -18989,6 +19435,7 @@ void irrigoto_get_status(char *buf, size_t len)
 {
     if (s_web_water_mode != 0) {
         const char *mname =
+            (s_web_water_mode == 9)                    ? "sections"    :   // b536
             (s_web_water_mode == 8)                    ? "serpentine"  :   // b423
             (s_web_water_mode == 7)                    ? "smooth" :
             (s_web_water_mode >= 5)                    ? "gentle" : "pulse";
@@ -19114,6 +19561,7 @@ void irrigoto_last_water_mode_label(char *buf, size_t len)
         case 6:  l = "Gentle 1/4 in";     break;
         case 7:  l = "Smooth 1/8 in";     break;
         case 8:  l = "Serpentine";             break;   // b431: depth via depth= param
+        case 9:  l = "Sections";               break;   // b536
         default: l = "unknown";           break;
     }
     snprintf(buf, len, "%s", l);
@@ -19338,7 +19786,12 @@ static bool ring_covers(const water_ring_data_t *r, float bearing_deg, float r_m
         float ratio = r->actual_throw_mm / r->throw_mm;
         if (ratio >= 0.75f && ratio <= 1.25f) ref = r->actual_throw_mm;
     }
-    float half = (float)WATER_RING_SPACING * 0.5f;
+    // b555: the footprint has to match the pitch the run actually used, or a
+    // Finest-coverage run double-counts its overlap and reports depth it never
+    // applied. Pre-b555 runs record 0 and keep the old fixed width.
+    float half = (s_last_water_run.ring_footprint_mm > 1.0f
+                  ? s_last_water_run.ring_footprint_mm
+                  : (float)WATER_RING_SPACING) * 0.5f;
     return (r_mm >= ref - half && r_mm <= ref + half);
 }
 
@@ -19560,6 +20013,7 @@ static int schedule_web_mode(uint8_t mode)
         case 0:  return 1;  // Pulse
         case 1:  return 5;  // Gentle
         case 3:  return 8;  // Serpentine (b431)
+        case 4:  return 9;  // Sections (b536)
         default: return 7;  // Smooth
     }
 }
@@ -20137,6 +20591,7 @@ static int schedule_estimate_duration_min(uint8_t zone, uint8_t mode, uint8_t de
     int base;
     switch (mode) {
         case 3:  base = 12; break;  // serpentine (b435: Edge measured ~10.5 min/eighth)
+        case 4:  base = 12; break;  // sections (b536: serpentine motion, same rate)
         case 2:  base = 30; break;  // smooth (adaptive)
         case 1:  base = 15; break;  // gentle, per 1/8"
         default: base = 8;  break;  // pulse, per 1/8"
@@ -20266,7 +20721,7 @@ bool irrigoto_schedule_set_text(const char *text)
             ESP_LOGW(TAG, "%s", s_sched_last_status);
             return false;
         }
-        if (z < 1 || z > 250 || m < 0 || m > 3 || d < 0 || d > 8 ||   // b435: 3=Serpentine
+        if (z < 1 || z > 250 || m < 0 || m > 4 || d < 0 || d > 8 ||   // b536: 4=Sections
             hh < 0 || hh > 23 || mm < 0 || mm > 59 ||
             days < 0 || days > 127 || en < 0 || en > 1) {
             snprintf(s_sched_last_status, sizeof(s_sched_last_status),
@@ -20396,7 +20851,7 @@ bool irrigoto_schedule_sync_text(const char *text)
             return false;
         }
         if (tomb == 0) {
-            if (z < 1 || z > 250 || m < 0 || m > 3 || d < 0 || d > 8 ||   // b435: 3=Serpentine
+            if (z < 1 || z > 250 || m < 0 || m > 4 || d < 0 || d > 8 ||   // b536: 4=Sections
                 hh < 0 || hh > 23 || mm < 0 || mm > 59 ||
                 days < 0 || days > 127 || en < 0 || en > 1 ||
                 src < 0 || src > 3) {

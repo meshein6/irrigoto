@@ -4,6 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no">
 <title>Schedule &mdash; irrigoto</title>
+<script src="/path.js"></script>
 <script>
 // Apply theme before body renders to avoid flash. localStorage = instant
 // cache; /api/theme = source of truth (NVS-backed).
@@ -142,6 +143,13 @@ select:focus,input[type="time"]:focus{outline:1px solid var(--green);}
 .add-btn:disabled{opacity:.4;cursor:not-allowed;}
 
 .hint{font-size:11px;color:var(--text-mid);margin-top:4px;line-height:1.4;}
+/* Per-entry path preview (b535) */
+.ent-path{display:flex;gap:10px;align-items:center;margin-top:10px;
+  padding-top:10px;border-top:1px solid var(--border);}
+.ent-path canvas{flex-shrink:0;border-radius:50%;cursor:pointer;}
+.ent-path .ep-note{flex:1;min-width:0;font-size:11px;color:var(--text-mid);line-height:1.45;}
+.ent-path .ep-note b{color:var(--text);display:block;font-size:12px;margin-bottom:2px;}
+.ent-path .ep-btn{flex:0 0 auto;margin-top:6px;padding:5px 10px;font-size:11px;display:inline-block;}
 </style>
 </head>
 <body>
@@ -203,7 +211,7 @@ select:focus,input[type="time"]:focus{outline:1px solid var(--green);}
 
 <script>
 const DAY_LABELS = ['Sun','Mon','Tue','Wed','Thu','Fri','Sat'];
-const MODE_LABELS = ['Pulse','Gentle','Smooth','Serpentine'];
+const MODE_LABELS = ['Pulse','Gentle','Smooth','Serpentine','Sections'];
 // Depth is eighths of an inch, indexed by the stored value (1..8); index 0 is
 // an unused placeholder. Deeper targets are achieved as multiple 1/8" passes
 // (same as the other modes), so Smooth is no longer 1/8"-only.
@@ -237,6 +245,7 @@ async function init() {
     state.tzOffsetMin = (typeof d.tz_offset_min === 'number') ? d.tz_offset_min : 0;
     state.delayUntil = d.delay_until || 0;
     renderAll();
+    loadZoneGeom();   // b535
   } catch (e) {
     document.getElementById('entries').innerHTML =
       '<div class="empty" style="color:var(--red)">Load failed: ' + (e.message||e) + '</div>';
@@ -253,6 +262,82 @@ function normalizeEntry(e) {
     days_mask: +e.days_mask || 0,
     enabled: e.enabled ? 1 : 0,
   };
+}
+
+// ── Path preview per entry (b535) ───────────────────────────────────────────
+// /api/schedule's zone list carries only {id,name}, so geometry comes from
+// one /api/all fetch, cached for the page. Thumbnails draw lazily -- there
+// can be 32 entries and each one clips its rings against the polygon.
+let zoneGeom = {};   // zone id (0-based) -> {points, act_max_throw, ...}
+let pathObserver = null;
+
+async function loadZoneGeom(){
+  try {
+    const d = await fetch('/api/all', {cache:'no-store'}).then(r => r.json());
+    (d.zones || []).forEach(z => { zoneGeom[z.id] = z; });
+    drawVisiblePaths();
+  } catch(e){}
+}
+
+function entryPathOpts(e){
+  const z = zoneGeom[e.zone - 1] || {};
+  return { mode: String(SCHED_MODE_DIGIT[e.mode] || '1'), pass: 0,
+           act_max_throw: z.act_max_throw || 10058,
+           act_min_throw: z.act_min_throw || 0,
+           thumb: true };
+}
+// Schedule numbering (0 Pulse, 1 Gentle, 2 Smooth, 3 Serpentine) -> web digit.
+const SCHED_MODE_DIGIT = {0:'1', 1:'5', 2:'7', 3:'8', 4:'9'};
+
+// b536: same overlay as Zone Setup and the Water modal, with the mode LOCKED
+// to this entry's -- the preview must match the run the entry will do.
+function openEntryPreview(idx){
+  const e = state.entries[idx];
+  const z = e && zoneGeom[e.zone - 1];
+  if (!e || !z || !z.points || z.points.length < 2 || typeof IrrigotoPath === 'undefined') return;
+  IrrigotoPath.openPreview({
+    points: z.points, act_max_throw: z.act_max_throw, act_min_throw: z.act_min_throw,
+    mode: String(SCHED_MODE_DIGIT[e.mode] || '1'), lockMode: true, depth8: e.depth,
+    title: z.name || ('Zone ' + e.zone),
+  });
+}
+
+function drawEntryPath(cv){
+  if (typeof IrrigotoPath === 'undefined' || !cv || cv.dataset.drawn) return;
+  const idx = +cv.dataset.idx;
+  const e = state.entries[idx];
+  if (!e) return;
+  const z = zoneGeom[e.zone - 1];
+  const wrap = cv.parentElement;
+  if (!z || !z.points || z.points.length < 2) {
+    if (wrap) wrap.style.display = 'none';
+    return;
+  }
+  if (wrap) wrap.style.display = 'flex';
+  const o = entryPathOpts(e);
+  IrrigotoPath.thumb(cv, z.points, o);
+  cv.dataset.drawn = '1';
+  const g = IrrigotoPath.build(z.points, o);
+  const note = wrap && wrap.querySelector('.ep-note b');
+  if (note) note.textContent = (MODE_LABELS[e.mode] || 'Path') + ' path'
+    + (g && g.rings.length ? ' \u00b7 ' + g.rings.length + ' rings' : '');
+}
+
+function drawVisiblePaths(){
+  document.querySelectorAll('#entries canvas.ent-thumb').forEach(cv => {
+    cv.dataset.drawn = '';
+    drawEntryPath(cv);
+  });
+}
+
+function observeEntryPath(cv){
+  if (!('IntersectionObserver' in window)) { drawEntryPath(cv); return; }
+  if (!pathObserver) {
+    pathObserver = new IntersectionObserver(entries => {
+      entries.forEach(en => { if (en.isIntersecting) drawEntryPath(en.target); });
+    }, {rootMargin: '120px'});
+  }
+  pathObserver.observe(cv);
 }
 
 // ── Render ───────────────────────────────────────────────────────────────────
@@ -434,6 +519,7 @@ function renderEntry(e, idx) {
           '<option value="1"' + (e.mode===1?' selected':'') + '>Gentle</option>' +
           '<option value="2"' + (e.mode===2?' selected':'') + '>Smooth</option>' +
           '<option value="3"' + (e.mode===3?' selected':'') + '>Serpentine</option>' +
+          '<option value="4"' + (e.mode===4?' selected':'') + '>Sections</option>' +
         '</select></div>' +
       '<div class="col"><label>Depth</label>' +
         '<select data-k="depth">' +
@@ -459,6 +545,14 @@ function renderEntry(e, idx) {
         '<button class="day-preset" data-preset="0">None</button>' +
       '</div>' +
     '</div>' +
+    '<div class="ent-path">' +
+      '<canvas class="ent-thumb" width="96" height="96" data-idx="' + idx + '" ' +
+        'onclick="openEntryPreview(' + idx + ')" title="Tap for a bigger view"></canvas>' +
+      '<div class="ep-note"><b>Path</b>Rings this mode will sweep, in order. ' +
+      'Blue and orange show the sweep direction.' +
+      '<button class="day ep-btn" onclick="openEntryPreview(' + idx + ')">&#9974; Preview</button>' +
+      '</div>' +
+    '</div>' +
     '<div class="toggle-row" style="margin-top:12px;">' +
       '<span class="toggle-lbl">Enabled</span>' +
       '<label class="theme-switch">' +
@@ -471,6 +565,8 @@ function renderEntry(e, idx) {
   // saveAll() always sends the visible state.
   card.querySelector('[data-k="zone"]').addEventListener('change', ev => {
     state.entries[idx].zone = +ev.target.value || 1;
+    const c = card.querySelector('canvas.ent-thumb');   // b535
+    if (c) { c.dataset.drawn = ''; drawEntryPath(c); }
   });
   card.querySelector('[data-k="time"]').addEventListener('change', ev => {
     const [h,m] = ev.target.value.split(':').map(Number);
@@ -491,7 +587,7 @@ function renderEntry(e, idx) {
     card.classList.toggle('disabled', !ev.target.checked);
     updateEntryPreview(card, state.entries[idx]);
   });
-  card.querySelectorAll('.day').forEach(btn => {
+  card.querySelectorAll('[data-k="days"] .day').forEach(btn => {
     btn.addEventListener('click', () => {
       const bit = +btn.dataset.bit;
       state.entries[idx].days_mask ^= (1 << bit);
@@ -503,7 +599,7 @@ function renderEntry(e, idx) {
     btn.addEventListener('click', () => {
       const mask = +btn.dataset.preset;
       state.entries[idx].days_mask = mask;
-      card.querySelectorAll('.day').forEach(d => {
+      card.querySelectorAll('[data-k="days"] .day').forEach(d => {
         const bit = +d.dataset.bit;
         d.classList.toggle('sel', !!(mask & (1<<bit)));
       });
@@ -511,6 +607,8 @@ function renderEntry(e, idx) {
     });
   });
 
+  const _cv = card.querySelector('canvas.ent-thumb');
+  if (_cv) observeEntryPath(_cv);          // b535
   return card;
 }
 

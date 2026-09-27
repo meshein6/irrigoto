@@ -7,6 +7,7 @@ R"ZONEHTML(
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no">
 <title>irrigoto · Zone Setup</title>
+<script src="/path.js"></script>
 <script>
 (function(){
   try{var t=localStorage.getItem('irrigoto_theme');
@@ -101,6 +102,19 @@ header{
   flex:1;display:flex;align-items:center;justify-content:center;
   padding:12px 16px;min-height:0;position:relative;
 }
+/* b535: map view controls + path scrubber, overlaid on the map */
+#view-ctl{position:absolute;top:14px;left:16px;display:flex;gap:6px;z-index:5;}
+.vbtn{background:rgba(6,12,16,.78);border:1px solid var(--border);color:var(--text-mid);
+  font-size:11px;font-weight:600;padding:6px 9px;border-radius:6px;cursor:pointer;
+  font-family:inherit;backdrop-filter:blur(2px);}
+.vbtn.on{color:var(--green);border-color:var(--green);background:var(--green-dim);}
+#path-ctl{display:none;position:absolute;left:16px;right:16px;bottom:10px;z-index:5;
+  gap:8px;align-items:center;background:rgba(6,12,16,.78);border:1px solid var(--border);
+  border-radius:8px;padding:6px 10px;backdrop-filter:blur(2px);}
+#path-ctl.on{display:flex;}
+#path-ctl input[type=range]{flex:1;min-width:0;}
+#zs-at{font-family:'Courier New',monospace;font-size:10px;color:var(--text-mid);
+  min-width:78px;text-align:right;}
 #heat-legend{
   display:none;flex-direction:column;align-items:flex-start;
   gap:4px;position:absolute;right:10px;top:50%;transform:translateY(-50%);
@@ -143,6 +157,19 @@ header{
 }
 
 /* ── D-Pad ── */
+/* b556: zone coverage picker */
+#coverage-row{flex-shrink:0;padding:2px 16px 8px;}
+.cov-label{font-size:10px;letter-spacing:.08em;color:var(--text-dim);
+  text-transform:uppercase;margin-bottom:5px;}
+.cov-btns{display:flex;gap:6px;}
+.covb{flex:1;padding:8px 0;background:var(--btn);
+  border:1px solid var(--border);border-radius:var(--radius-sm);
+  color:var(--text-mid);font-size:12px;font-family:inherit;cursor:pointer;
+  transition:all .1s;}
+.covb.sel{color:var(--green);border-color:var(--green);
+  background:var(--green-dim);box-shadow:0 0 10px var(--green-glow);}
+.cov-note{font-size:10px;color:var(--text-dim);margin-top:5px;min-height:12px;}
+
 #dpad-section{
   flex-shrink:0;display:flex;align-items:center;
   justify-content:center;gap:16px;padding:12px 16px;
@@ -271,6 +298,20 @@ header{
 </header>
 
 <div id="map-wrap"><canvas id="map"></canvas>
+  <!-- b535: view controls live over the map, not in the action row below. -->
+  <div id="view-ctl">
+    <button class="vbtn" id="btn-zoom" onclick="toggleZoom()" title="Fit the map to this zone, or show the full reach">&#9974; Zoom</button>
+    <button class="vbtn" id="btn-path" onclick="togglePath()" title="Show the watering path; tap the mode chip to change mode">&#9678; Path</button>
+    <button class="vbtn" id="btn-heatmap" onclick="toggleHeatmap()">&#127777; Depth</button>
+  </div>
+  <div id="path-ctl">
+    <button class="vbtn" id="btn-path-mode" onclick="cyclePathMode()" title="Which mode's path to draw">Smooth</button>
+    <button class="vbtn" id="btn-path-pass" onclick="cyclePathPass()" title="Which direction this pass sweeps">Outer &#8594; in</button>
+    <button class="vbtn" onclick="openPathPreview()" title="Bigger view">&#9974;</button>
+    <input type="range" id="zs-scrub" min="0" max="1000" step="1" value="0"
+           oninput="zsScrub(+this.value/1000)" aria-label="Position along the path">
+    <span id="zs-at">start</span>
+  </div>
   <div id="heat-legend">
     <div style="display:flex;gap:5px;align-items:stretch">
       <div class="hl-bar" style="height:90px"></div>
@@ -284,6 +325,20 @@ header{
   <div class="rcel"><div class="rlabel">Bearing</div><div class="rval" id="v-bearing">--.-°</div></div>
   <div class="rcel" style="position:relative;"><div class="rlabel">Throw</div><div class="rval" id="v-throw">-- ft</div><button id="btn-trim" class="water-off" onclick="doTrim()" title="Trim to actual">⊙ trim</button></div>
   <div class="rcel"><div class="rlabel">Points</div><div class="rval" id="v-points">0 / 36</div></div>
+</div>
+
+<!-- b556: coverage is a property of the ZONE -- how close together the
+     watering rings sit, which follows the zone's size and shape and does not
+     change run to run. Depth and passes belong to a run and live in the Water
+     modal instead. Saved with the zone. -->
+<div id="coverage-row">
+  <div class="cov-label">Ring coverage</div>
+  <div class="cov-btns">
+    <button class="covb" data-cov="0" onclick="setCoverage(0)">Standard</button>
+    <button class="covb" data-cov="1" onclick="setCoverage(1)">Fine</button>
+    <button class="covb" data-cov="2" onclick="setCoverage(2)">Finest</button>
+  </div>
+  <div class="cov-note" id="cov-note">&nbsp;</div>
 </div>
 
 <div id="dpad-section">
@@ -310,8 +365,6 @@ header{
   <button class="sbtn" id="btn-water" onclick="doAct('water_toggle')">💧 Water</button>
   <button class="sbtn" onclick="doAct('undo')">⌫ Undo</button>
   <button class="sbtn" onclick="doAct('clear')">✕ Clear</button>
-  <button class="sbtn" id="btn-path" onclick="togglePath()">◎ Path</button>
-  <button class="sbtn" id="btn-heatmap" onclick="toggleHeatmap()">🌡 Depth</button>
   <button class="sbtn" id="btn-edit" onclick="toggleEdit()">✎ Edit</button>
 </div>
 <!-- b400: edit-mode toolbar (drag/delete interior points). Shown only while
@@ -345,11 +398,40 @@ let _editMode=false, _selPt=-1, _dragging=false, _cx=0, _cy=0, _maxR=1;
 // Display scale (mm at canvas rim): device's reported max throw (calibrated
 // reach, or live throw if pressure exceeds the cal table) + 3ft (914mm) buffer.
 // Tracks calibration, so the radar stays correctly scaled at any water pressure.
-function _edScale(){ return (ST.act_max_throw||10058) + 914; }
+// b535: zoom. 'full' keeps the historic behaviour (whole calibrated reach);
+// 'zone' fits the map to the zone's own extent so a small zone isn't a
+// cluster in the middle. Every draw path goes through _edScale(), so the zoom
+// is almost entirely this one function.
+let _zoom = 'full';
+try { const z = localStorage.getItem('irrigoto_map_zoom'); if (z === 'zone' || z === 'full') _zoom = z; } catch(_){}
+function _fullScale(){ return (ST.act_max_throw||10058) + 914; }
+// Zone extent x 1.15, floored so a 1-2 point zone can't collapse the scale.
+function _zoneScale(){
+  let m = 0;
+  for (const p of (ST.points||[])) if (p.throw_mm > m) m = p.throw_mm;
+  if (!(m > 0)) return _fullScale();
+  return Math.max(m * 1.15, 1200);
+}
+function _edScale(){ return _zoom === 'zone' ? Math.min(_zoneScale(), _fullScale()) : _fullScale(); }
+function _zoomed(){ return _zoom === 'zone' && _zoneScale() < _fullScale(); }
+// Reflect the restored zoom on the button once the DOM is up.
+function _paintZoomBtn(){
+  const b = document.getElementById('btn-zoom');
+  if (b) b.classList.toggle('on', _zoomed());
+}
+function toggleZoom(){
+  _zoom = (_zoom === 'zone') ? 'full' : 'zone';
+  try { localStorage.setItem('irrigoto_map_zoom', _zoom); } catch(_){}
+  _paintZoomBtn();
+  draw();
+}
 const TRAIL_MAX = 120;
 let waterTrail = [];
 let lastWaterBearing = null;
 let showPath = false;
+let pathMode = '7';  // b535: which mode the Path view draws (web digit)
+let pathPass = 0;    // b535: which pass (serpentine/gentle alternate by pass)
+let pathT = 0;       // b535: scrub position, 0..1 along the path
 let heatPasses = 0;
 let lastRun = null;
 let waterCSVRows = null;
@@ -384,11 +466,55 @@ fetch('/zone/last_water?id='+_zoneIdParam).then(r=>r.json()).then(d=>{
 
 function togglePath(){
   showPath = !showPath;
-  const btn = document.getElementById('btn-path');
-  btn.style.color = showPath ? 'var(--green)' : '';
-  btn.style.borderColor = showPath ? 'var(--green)' : '';
+  document.getElementById('btn-path').classList.toggle('on', showPath);
+  // The scrubber only makes sense while the path is up.
+  document.getElementById('path-ctl').classList.toggle('on', showPath);
   draw();
 }
+// b535: which mode's path to draw, and which pass.
+function cyclePathMode(){
+  const order = ['1','5','7','8','9'];
+  pathMode = order[(order.indexOf(pathMode) + 1) % order.length];
+  document.getElementById('btn-path-mode').textContent =
+    (IrrigotoPath.MODES[pathMode] || {label:'Path'}).label;
+  const pb = document.getElementById('btn-path-pass');
+  const k = (IrrigotoPath.MODES[pathMode] || {}).key;
+  const same = (k === 'pulse' || k === 'chase' || k === 'demo');
+  pb.style.display = same ? 'none' : '';
+  if (!same) pb.textContent = passLabelFor(pathMode, pathPass);
+  draw();
+}
+// b548: this chip still said "Pass 1..4" -- the same nonsense b544 removed
+// from the shared overlay, left behind because the concept lives in two
+// controls and only one was fixed. Only two pictures exist: the direction
+// flips every pass, so pass 3 is pass 1 again.
+function cyclePathPass(){
+  pathPass = (pathPass + 1) % 2;
+  document.getElementById('btn-path-pass').textContent = passLabelFor(pathMode, pathPass);
+  draw();
+}
+function passLabelFor(mode, idx){
+  const k = (typeof IrrigotoPath !== 'undefined' && IrrigotoPath.MODES[mode])
+            ? IrrigotoPath.MODES[mode].key : 'smooth';
+  if (k === 'pulse' || k === 'chase' || k === 'demo') return '\u2014';
+  return (k === 'serpentine' || k === 'sections')
+    ? (idx ? 'Inner \u2192 out' : 'Outer \u2192 in')
+    : (idx ? 'Sweep back' : 'Sweep one way');
+}
+function zsScrub(t){ pathT = t; draw(); }
+// b536: the shared overlay, UNLOCKED here -- Zone Setup is where you compare
+// a zone across modes, so the mode chips stay live.
+function openPathPreview(){
+  if (typeof IrrigotoPath === 'undefined' || ST.points.length < 2) return;
+  IrrigotoPath.openPreview({
+    points: ST.points,
+    act_max_throw: ST.act_max_throw, act_min_throw: ST.act_min_throw,
+    mode: pathMode, lockMode: false, depth8: 1,
+    title: document.getElementById('zone-name').value || 'Zone',
+  });
+}
+// b536: Sections joins the mode cycle.
+
 
 function toggleHeatmap(){
   heatPasses = (heatPasses + 1) % 3;
@@ -711,81 +837,26 @@ function drawHeatMap(W, H, cx, cy, maxR) {
 
 }
 
+// b535: the ring/arc geometry moved to the shared /path.js module, so this
+// page, the Water modal and each schedule entry all draw from one copy. The
+// old local version also alternated direction every ring, which is only true
+// for Serpentine -- IrrigotoPath.planOrder gets it right per mode.
 function drawPath(W, H, cx, cy, maxR) {
-  if (ST.points.length < 2) return;
-  function pointInZone(bearing, r_mm) {
-    const px=r_mm*Math.sin(bearing*Math.PI/180),py=r_mm*Math.cos(bearing*Math.PI/180);
-    let crosses=0;
-    const n=ST.points.length;
-    for(let i=0;i<n;i++){
-      const j=(i+1)%n,pi=ST.points[i],pj=ST.points[j];
-      const x1=pi.throw_mm*Math.sin(pi.deg*Math.PI/180)-px,y1=pi.throw_mm*Math.cos(pi.deg*Math.PI/180)-py;
-      const x2=pj.throw_mm*Math.sin(pj.deg*Math.PI/180)-px,y2=pj.throw_mm*Math.cos(pj.deg*Math.PI/180)-py;
-      if((y1>0)!==(y2>0)){const t=y1/(y1-y2);if(x1+t*(x2-x1)>0)crosses++;}
-    }
-    return(crosses%2===1);
-  }
-  const sdegs=ST.points.map(p=>p.deg).sort((a,b)=>a-b);
-  let mg=0,gi=0;
-  for(let i=0;i<sdegs.length;i++){const n=i<sdegs.length-1?sdegs[i+1]:sdegs[0]+360;if(n-sdegs[i]>mg){mg=n-sdegs[i];gi=i;}}
-  let arcStart=sdegs[(gi+1)%sdegs.length],arcEnd=sdegs[gi];
-  let arcSpan=((arcEnd-arcStart+360)%360)||360;
-  const actMax=ST.act_max_throw||10058;
-  const zoneMax=Math.max(...ST.points.map(p=>p.throw_mm));
-  const zoneMin=(ST.act_min_throw&&ST.act_min_throw>50)?ST.act_min_throw:Math.min(...ST.points.map(p=>p.throw_mm));
-  const zoneThrowMin2=Math.min(...ST.points.map(p=>p.throw_mm));
-  // Sprinkler-in-center: all walk points at same throw => gap is not an exclusion
-  const pathSIC=zoneMax>0&&(zoneMax-zoneThrowMin2)/zoneMax<0.05;
-  if(pathSIC){arcStart=0;arcSpan=360;}
-  // Origin-inside-polygon: force 360 deg arc so polygon boundary clips coverage
-  const pathOriginInside=pointInZone(0,1);
-  if(!pathSIC&&pathOriginInside){arcStart=0;arcSpan=360;}
-  // b435: spanned-gap guard (see drawHeatMap) -- a long straight edge can
-  // span the largest vertex-bearing gap; don't window it out of the path.
-  if(arcSpan<360&&mg>0){
-    let spanned=false;
-    for(let k=1;k<=3;k++){
-      const gb=(sdegs[gi]+mg*k/4)%360;
-      const gbs=Math.sin(gb*Math.PI/180),gbc=Math.cos(gb*Math.PI/180);
-      let best=0;
-      for(let i=0;i<ST.points.length;i++){
-        const j=(i+1)%ST.points.length,pi=ST.points[i],pj=ST.points[j];
-        const x1=pi.throw_mm*Math.sin(pi.deg*Math.PI/180),y1=pi.throw_mm*Math.cos(pi.deg*Math.PI/180);
-        const x2=pj.throw_mm*Math.sin(pj.deg*Math.PI/180),y2=pj.throw_mm*Math.cos(pj.deg*Math.PI/180);
-        const dx=x2-x1,dy=y2-y1,det=gbc*dx-gbs*dy;
-        if(Math.abs(det)<1e-6)continue;
-        const s=(dx*y1-dy*x1)/det,u=(gbs*y1-gbc*x1)/det;
-        if(s>0.5&&u>=0&&u<=1&&s>best)best=s;
-      }
-      if(best>=461)spanned=true;
-    }
-    if(spanned){arcStart=0;arcSpan=360;}
-  }
-  const rings=[];let t=zoneMax;
-  while(t>=zoneMin&&rings.length<36){rings.push(t);t-=Math.max(700*(t/actMax),80);}
-  if(!rings.length)return;
-  // Inner rings below zoneMin for sprinkler-inside-polygon zones
-  if(!pathSIC&&pathOriginInside&&zoneMin>461){
-    while(t>461&&rings.length<36){rings.push(t);t-=Math.max(700*(t/actMax),80);}
-  }
-  const STEP=0.5;
-  for(let ri=0;ri<rings.length;ri++){
-    const thr=rings[ri],r=(thr/_edScale())*maxR;
-    const cw=(ri%2===0),al=0.70-0.30*(ri/(rings.length-1||1));
-    const spans=[];let spanStart=null;
-    for(let o=0;o<=arcSpan+STEP;o+=STEP){
-      const bearing=(arcStart+o)%360,inside=pointInZone(bearing,thr);
-      if(inside&&spanStart===null)spanStart=o;
-      if(!inside&&spanStart!==null){spans.push({lo:(arcStart+spanStart+360)%360,span:o-spanStart});spanStart=null;}
-    }
-    if(spanStart!==null)spans.push({lo:(arcStart+spanStart+360)%360,span:arcSpan-spanStart});
-    for(const {lo,span} of spans){
-      if(span<0.5)continue;
-      const sa=(lo-90)*Math.PI/180;
-      ctx.beginPath();ctx.arc(cx,cy,r,sa,sa+span*Math.PI/180,false);
-      ctx.strokeStyle=cw?'rgba(80,180,255,'+al+')':'rgba(255,160,60,'+al+')';
-      ctx.lineWidth=1.5;ctx.setLineDash([]);ctx.stroke();
-    }
+  if (ST.points.length < 2 || typeof IrrigotoPath === 'undefined') return;
+  const geom = IrrigotoPath.build(ST.points, {
+    mode: pathMode, pass: pathPass,
+    act_max_throw: ST.act_max_throw || 10058,
+    act_min_throw: ST.act_min_throw || 0,
+  });
+  const o = {cx: cx, cy: cy, maxR: maxR, scale_mm: _edScale()};
+  IrrigotoPath.draw(ctx, geom, o);
+  // Scrub marker: where the nozzle is at this point along the path.
+  const at = IrrigotoPath.marker(ctx, IrrigotoPath.flatten(geom), pathT, o);
+  const lbl = document.getElementById('zs-at');
+  if (lbl) {
+    lbl.textContent = !at ? (pathT <= 0 ? 'start' : '')
+      : at.dry ? 'moving \u00b7 dry'
+      : 'ring ' + (at.ring + 1) + ' \u00b7 ' + (at.r_mm / 304.8).toFixed(1) + "'";
   }
 }
 
@@ -822,8 +893,10 @@ function draw(){
   ctx.lineWidth   = 0.7;
   // Range rings + labels — tick list derived from the domain so the grid
   // adapts to any calibrated max throw (and thus any supply pressure).
-  const _maxFt = (ST.act_max_throw||10058)/304.8;
-  const _step  = _maxFt > 40 ? 10 : 5;
+  // Grid ticks span the VISIBLE domain, not the full reach, so a zoomed map
+  // keeps useful labels instead of one ring at the rim.
+  const _maxFt = _edScale()/304.8;
+  const _step  = _maxFt > 40 ? 10 : _maxFt > 18 ? 5 : _maxFt > 9 ? 2 : 1;
   const _ft = [];
   for(let f=_step; f<=_maxFt+0.01; f+=_step) _ft.push(f);
   _ft.forEach(ft => {
@@ -853,11 +926,15 @@ function draw(){
     ctx.strokeStyle='rgba(255,140,0,.55)'; ctx.lineWidth=1.5; ctx.stroke();
   }
 
-  // Current throw ring (dashed)
-  const throwR=(ST.throw_mm/_edScale())*maxR;
-  ctx.beginPath(); ctx.arc(cx,cy,throwR,0,Math.PI*2);
-  ctx.strokeStyle='rgba(0,232,122,.12)'; ctx.lineWidth=1;
-  ctx.setLineDash([3,5]); ctx.stroke(); ctx.setLineDash([]);
+  // Current throw ring (dashed). When zoomed, the spray can reach past the
+  // view -- clip the ring at the rim rather than drawing off-canvas.
+  const throwRraw=(ST.throw_mm/_edScale())*maxR;
+  const throwR=Math.min(throwRraw, maxR);
+  if (throwRraw <= maxR) {
+    ctx.beginPath(); ctx.arc(cx,cy,throwR,0,Math.PI*2);
+    ctx.strokeStyle='rgba(0,232,122,.12)'; ctx.lineWidth=1;
+    ctx.setLineDash([3,5]); ctx.stroke(); ctx.setLineDash([]);
+  }
 
   // Overlays (drawn before nozzle line so line stays on top)
   drawHeatMap(W, H, cx, cy, maxR);
@@ -882,8 +959,13 @@ function draw(){
   ctx.strokeStyle='rgba(0,232,122,.55)'; ctx.lineWidth=1.5;
   ctx.shadowBlur=14; ctx.shadowColor='#00e87a'; ctx.stroke(); ctx.shadowBlur=0;
 
-  // Throw indicator dot — at actual throw when valve open, else slider position
-  const actualThrowR = actualThrowMm > 100 ? (actualThrowMm/_edScale())*maxR : throwR;
+  // Throw indicator dot — at actual throw when valve open, else slider position.
+  // Clipped to the rim when zoomed; the distance is then written beside it so
+  // it's clear the spray goes past the view.
+  const _throwMmShown = actualThrowMm > 100 ? actualThrowMm : ST.throw_mm;
+  const actualThrowRraw = (_throwMmShown/_edScale())*maxR;
+  const actualThrowR = Math.min(actualThrowRraw, maxR);
+  const _throwClipped = actualThrowRraw > maxR;
   const dotIsActual = actualThrowMm > 100;
   const tx=cx+Math.cos(brad)*actualThrowR, ty=cy+Math.sin(brad)*actualThrowR;
   ctx.beginPath(); ctx.arc(tx,ty,5.5,0,Math.PI*2);
@@ -893,6 +975,13 @@ function draw(){
   if (dotIsActual) {
     ctx.beginPath(); ctx.arc(tx,ty,9,0,Math.PI*2);
     ctx.strokeStyle='rgba(0,232,122,.35)'; ctx.lineWidth=1.5; ctx.stroke();
+  }
+  if (_throwClipped) {
+    ctx.fillStyle='#00e87a'; ctx.font='10px "Courier New",monospace';
+    ctx.textAlign = (Math.cos(brad) < 0) ? 'right' : 'left';
+    ctx.textBaseline='middle';
+    ctx.fillText((_throwMmShown/304.8).toFixed(1) + "' \u2192",
+                 tx + (Math.cos(brad) < 0 ? -10 : 10), ty);
   }
 
   // Perimeter points
@@ -943,6 +1032,7 @@ function applyState(s){
     nameEl.value=s.name;
   document.getElementById('v-bearing').textContent=s.bearing.toFixed(1)+'°';
   document.getElementById('v-points').textContent=s.points.length+' / 36';
+  if (typeof s.coverage === 'number' && !_covEdited) paintCoverage(s.coverage);
   document.getElementById('btn-water').classList.toggle('on',s.water);
   document.getElementById('btn-save').disabled=(s.points.length<3);
   document.getElementById('btn-dn').classList.toggle('at-limit', !!s.at_min);
@@ -983,6 +1073,7 @@ async function doAct(cmd){
     setConn(true);
     if(cmd==='save'){
       toast('Zone saved ✓');
+      _covEdited = false;   // b556: saved, so the device is authoritative again
       // Zone geometry changed -- clear cached heatmap data so stale coverage
       // is not shown.  Files were deleted server-side; clear JS state too.
       lastRun=null; waterCSVRows=null; draw();
@@ -1036,6 +1127,29 @@ function holdStop(){
 ['pointerup','pointercancel'].forEach(function(ev){ window.addEventListener(ev, holdStop); });
 window.addEventListener('blur', holdStop);
 document.addEventListener('visibilitychange', function(){ if(document.hidden) holdStop(); });
+
+// ── Zone coverage ───────────────────────────────────────────────
+// b556: ring spacing for this zone. Scales the pitch the firmware generates
+// rings at -- and the footprint width it credits depth over, which have to
+// move together or closer rings double-count their overlap.
+let _covEdited = false;   // don't let the poll clobber a fresh choice
+const COV_NOTE = [
+  'Default spacing. Fewest rings, shortest run.',
+  'Rings 25% closer. More even, and a longer run.',
+  'Rings 50% closer. Most even; longest run, and most legs to plan.'
+];
+async function setCoverage(v){
+  _covEdited = true;
+  paintCoverage(v);
+  await doAct('set_coverage&v='+v);
+  toast('Coverage set \u2014 Save the zone to keep it');
+}
+function paintCoverage(v){
+  document.querySelectorAll('.covb').forEach(function(b){
+    b.classList.toggle('sel', +b.dataset.cov === v);
+  });
+  document.getElementById('cov-note').textContent = COV_NOTE[v] || '';
+}
 
 // ── Connection indicator ────────────────────────────────────────
 function setConn(ok){
@@ -1102,7 +1216,9 @@ CV.addEventListener('pointerdown',e=>{
 CV.addEventListener('pointermove',e=>{
   if(!_editMode||!_dragging||_selPt<0) return;
   const {x,y}=_cxy(e); const dx=x-_cx, dy=y-_cy;
-  let r=Math.hypot(dx,dy)/_maxR*_edScale(); if(r>_edScale()) r=_edScale(); if(r<0) r=0;
+  // Clamp to the full calibrated reach, not the zoomed domain -- zooming in
+  // must not cap how far out a point can be dragged.
+  let r=Math.hypot(dx,dy)/_maxR*_edScale(); if(r>_fullScale()) r=_fullScale(); if(r<0) r=0;
   let deg=Math.atan2(dy,dx)*180/Math.PI+90; deg=((deg%360)+360)%360;
   ST.points[_selPt].throw_mm=r; ST.points[_selPt].deg=deg; draw();
 });
@@ -1144,6 +1260,12 @@ async function poll(){
 // ── Init ────────────────────────────────────────────────────────
 window.addEventListener('resize',resizeCanvas);
 resizeCanvas();
+_paintZoomBtn();   // b535: reflect the zoom restored from localStorage
+if (typeof IrrigotoPath !== 'undefined') {
+  document.getElementById('btn-path-mode').textContent =
+    (IrrigotoPath.MODES[pathMode] || {label:'Path'}).label;
+  document.getElementById('btn-path-pass').textContent = passLabelFor(pathMode, pathPass);
+}
 // Mark name field edited when user types so polling won't overwrite it
 document.getElementById('zone-name').addEventListener('input',function(){
   this.dataset.edited='1';

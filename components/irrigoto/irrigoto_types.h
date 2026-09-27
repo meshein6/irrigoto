@@ -38,9 +38,18 @@ typedef struct {
     uint8_t walk_idx;
 } perimeter_point_t;
 
+// coverage: how tightly the watering rings are spaced on this zone. A property
+// of the zone -- its size, its shape, where the sprinkler stands -- not of any
+// one run. 0 = Standard, and 0 is also what a zone saved before b555 reads as,
+// so existing zones are unchanged.
+#define ZONE_COVERAGE_STANDARD  0
+#define ZONE_COVERAGE_FINE      1
+#define ZONE_COVERAGE_FINEST    2
+
 typedef struct {
     uint8_t           num_points;
     perimeter_point_t points[ZONE_MAX_PERIM_POINTS];
+    uint8_t           coverage;   // b555: ZONE_COVERAGE_* -- keep last, see zone_load_nvs
 } zone_perimeter_t;
 
 typedef struct {
@@ -89,6 +98,12 @@ typedef struct {
     // heatmap card normalize actual-vs-expected to the chosen depth instead of
     // a fixed 1/8". 0 when loading a pre-b388 file (card falls back to config).
     float             target_depth_mm;
+    // b555: the ring footprint width this run assumed, in mm. Coverage scales
+    // ring pitch, and the depth accounting has to use the SAME number or
+    // closer rings double-count their overlap and report depth that was never
+    // applied. Persisted so the heatmap stays right across a reboot; 0 in a
+    // pre-b555 file means the old fixed WATER_RING_SPACING.
+    float             ring_footprint_mm;
     water_ring_data_t rings[WATER_RUN_MAX_RINGS];
 } water_run_t;
 

@@ -627,6 +627,11 @@ select:
         - "Pulse"
         - "Gentle"
         - "Smooth"
+        # b536: Serpentine was published by the component since b431 but was
+        # never listed here, so the publish was rejected. Sections (b536) is
+        # serpentine motion with a lobe-major plan.
+        - "Serpentine"
+        - "Sections"
 
 switch:
   # Auto-sleep enable. Toggling this calls irrigoto_set_auto_sleep_enabled(),

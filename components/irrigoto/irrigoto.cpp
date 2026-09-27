@@ -373,9 +373,9 @@ void IrrigotoComponent::loop() {
         }
     }
     if (mode_select_ != nullptr) {
-        int m = irrigoto_get_mode();  // 0=Pulse, 1=Gentle, 2=Smooth, 3=Serpentine (b431)
-        const char *labels[] = {"Pulse", "Gentle", "Smooth", "Serpentine"};
-        if (m >= 0 && m <= 3)
+        int m = irrigoto_get_mode();  // 0=Pulse, 1=Gentle, 2=Smooth, 3=Serpentine, 4=Sections
+        const char *labels[] = {"Pulse", "Gentle", "Smooth", "Serpentine", "Sections"};
+        if (m >= 0 && m <= 4)   // b536: +Sections
             mode_select_->publish_state(labels[m]);
     }
 }
@@ -595,6 +595,7 @@ void IrrigotoModeSelect::control(const std::string &value) {
     else if (value == "Gentle")  m = 1;
     else if (value == "Smooth")  m = 2;
     else if (value == "Serpentine")   m = 3;   // b431
+    else if (value == "Sections")     m = 4;   // b536
     if (m >= 0) irrigoto_set_mode(m);
     publish_state(value);
 }
