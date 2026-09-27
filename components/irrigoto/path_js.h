@@ -140,6 +140,7 @@ R"PATHJS(
     var zmax = Math.max.apply(null, throws);
     var zmin = (actMin && actMin > 50) ? actMin : Math.min.apply(null, throws);
     var pitch = 700 * coverageScale(coverage);
+    ringThrows.lastPitch = pitch;   /* b573: build() matches rings by radius */
     var rings = [], t = zmax;
     while (t >= zmin && rings.length < RING_MAX) {
       rings.push(t);
@@ -318,6 +319,7 @@ R"PATHJS(
 
     var arc = zoneArc(points);
     var thr = ringThrows(points, actMax, actMin, arc, opts.coverage | 0);
+    var pitch = ringThrows.lastPitch || 700;
     if (!thr.length) return null;
 
     var plan = planOrder(modeKey, thr.length, opts.pass || 0, !!opts.sequential);
@@ -366,8 +368,27 @@ R"PATHJS(
      * With no ringPasses (or a length that does not line up with the ring
      * ladder) this degrades to the single pass it always drew, rather than
      * inventing a run. */
-    var rp = opts.ringPasses;
-    var usePasses = !!(rp && rp.length === rings.length);
+    /* b573: match the firmware's pass counts to our rings BY RADIUS.
+     * Requiring the two ladders to be the same length meant one extra ring
+     * here -- the page had no act_min_throw, so it floored at a different
+     * radius -- silently threw the whole thing away and the preview drew a
+     * single pass. Nearest radius within half a pitch is unambiguous: the
+     * ladders differ at the ends, not in spacing. */
+    var rp = opts.ringPasses, rm = opts.ringMm;
+    var usePasses = !!(rp && rp.length);
+    var passFor = function (idx) {
+      if (!usePasses) return 1;
+      if (rm && rm.length === rp.length) {
+        var want = rings[idx].throw_mm;
+        var best = -1, bd = 1e9;
+        for (var q = 0; q < rm.length; q++) {
+          var d = Math.abs(rm[q] - want);
+          if (d < bd) { bd = d; best = q; }
+        }
+        return (best >= 0 && bd < pitch) ? rp[best] : 1;
+      }
+      return idx < rp.length ? rp[idx] : 1;
+    };
     var nPasses = 1;
     if (usePasses) rp.forEach(function (v) { if (v > nPasses) nPasses = v; });
     if (nPasses > 12) nPasses = 12;        /* a drawing, not an endurance test */
@@ -377,7 +398,7 @@ R"PATHJS(
       /* Rings still owed water on this pass. */
       var live = [];
       for (var q = 0; q < rings.length; q++) {
-        var need = usePasses ? rp[q] : 1;
+        var need = passFor(q);
         if (need > pp) live.push(rings[q]);
       }
       if (!live.length) break;
@@ -630,6 +651,8 @@ R"PATHJS(
     ctx.lineWidth = 1.5; ctx.setLineDash([]); ctx.stroke();
   }
 
+  var _lastThumbScale = 6000;   /* b571: last scale thumb() drew at */
+
   function thumb(canvas, points, opts) {
     if (!canvas || !canvas.getContext) return false;
     var ctx = canvas.getContext('2d');
@@ -650,7 +673,11 @@ R"PATHJS(
     /* Fit the thumbnail to the zone; full reach wastes most of the disc. */
     var zmax = Math.max.apply(null, points.map(function (p) { return p.throw_mm; }));
     var scale = Math.max(zmax * 1.12, 600);
-    ov.lastScale = scale;   /* b570: the overlay's live marker uses this too */
+    /* b571: module-level, NOT ov.lastScale -- ov is null until the overlay
+     * is first opened, and thumb() runs well before that (the Water modal
+     * draws its thumbnail on open). Writing through the null threw inside
+     * openModal, so the modal never appeared and Water Zone did nothing. */
+    _lastThumbScale = scale;
 
     ctx.strokeStyle = 'rgba(120,140,130,.45)';
     ctx.lineWidth = 1;
@@ -709,7 +736,6 @@ R"PATHJS(
       '<div class="ipo-scrub">' +
         '<button class="ipo-btn ipo-play" aria-label="Play">&#9654;</button>' +
         '<input type="range" min="0" max="1000" step="1" value="0" aria-label="Position along the path">' +
-        '<span class="ipo-at">start</span>' +
       '</div>' +
       '<div class="ipo-note"></div>';
     var css = document.createElement('style');
@@ -727,8 +753,6 @@ R"PATHJS(
         'cursor:pointer;font-family:inherit;}' +
       '#irr-path-ov .ipo-btn.sel{border-color:var(--green);background:var(--green-dim);color:var(--green);}' +
       '#irr-path-ov .ipo-scrub input{flex:1;min-width:0;}' +
-      '#irr-path-ov .ipo-at{font-family:"Courier New",monospace;font-size:11px;' +
-        'min-width:96px;text-align:right;}' +
       '#irr-path-ov .ipo-note{width:min(92vw,620px);font-size:11px;' +
         'color:var(--text-mid);text-align:center;min-height:14px;}';
     document.head.appendChild(css);
@@ -741,7 +765,6 @@ R"PATHJS(
       pass: el.querySelector('.ipo-pass'),
       play: el.querySelector('.ipo-play'),
       range: el.querySelector('input'),
-      at: el.querySelector('.ipo-at'),
       note: el.querySelector('.ipo-note'),
       opts: null, mode: '7', passIdx: 0, t: 0, timer: null,
       variants: [], passNoteText: ''
@@ -828,23 +851,23 @@ R"PATHJS(
       coverage: ov.opts.coverage | 0,
       /* b569: the scrubber now walks the WHOLE run, every pass, so there is
        * nothing left for a pass stepper to step through. */
-      ringPasses: ov.opts.ringPasses
+      ringPasses: ov.opts.ringPasses,
+      ringMm: ov.opts.ringMm
     };
     var at = thumb(ov.cv, ov.opts.points, o);
     if (ov.opts.live) {
       var c = ov.cv, W = c.width, H = c.height;
       drawLive(c.getContext('2d'), ov.opts.live,
                { cx: W / 2, cy: H / 2, maxR: Math.min(W, H) / 2 - 2,
-                 scale_mm: ov.lastScale || 6000 });
+                 scale_mm: _lastThumbScale || 6000 });
     }
     var label = (MODES[ov.mode] || {}).label || '';
     ov.title.textContent = (ov.opts.title ? ov.opts.title + ' \u00b7 ' : '') + label;
-    ov.at.textContent = (at && at.r_mm !== undefined)
-      ? (at.dry ? 'moving \u00b7 dry'
-                : at.turn ? 'turning \u00b7 wet'
-                : 'pass ' + ((at.pass | 0) + 1) + ' \u00b7 ring ' + (at.ring + 1)
-                  + ' \u00b7 ' + (at.r_mm / 304.8).toFixed(1) + "'")
-      : (ov.t <= 0 ? 'start' : '');
+    /* b572: no per-frame readout here. It was a monospace span in the same
+     * flex row as the scrubber, and once b569 added the pass number the text
+     * outgrew its min-width and resized the slider as playback moved -- the
+     * bar jittered under the thumb. The marker on the canvas already shows
+     * where the nozzle is. */
   }
 
   function openPreview(opts) {

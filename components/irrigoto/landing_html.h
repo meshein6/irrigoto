@@ -1174,6 +1174,7 @@ function zonePathOpts(pass){
            act_min_throw: (pathZone && pathZone.act_min_throw) || 0,
            coverage: (pathZone && pathZone.coverage) | 0,   // b561
            ringPasses: _lastPlan && _lastPlan.ring_passes,   // b569: full run
+           ringMm:     _lastPlan && _lastPlan.ring_mm,       // b573: match by radius
            live: _live };                                    // b570
 }
 function renderPathThumb(){
@@ -1206,6 +1207,7 @@ function openPathFull(){
     mode: selModeDat, lockMode: true, depth8: selDepth,
     coverage: (pathZone && pathZone.coverage) | 0,   // b564: draw the zone's real ring pitch
     ringPasses: _lastPlan && _lastPlan.ring_passes,  // b569: every pass, not one lap
+    ringMm:     _lastPlan && _lastPlan.ring_mm,      // b573: match by radius
     live: _live,                                     // b570: the real nozzle
     title: pathZone.name || 'Zone',
   });

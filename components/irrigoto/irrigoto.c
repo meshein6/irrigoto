@@ -17648,8 +17648,10 @@ static esp_err_t api_run_plan_handler(httpd_req_t *req)
     // water_serpentine_passes. Order matches the ring ladder the preview
     // builds from the same pitch, outer to inner. 0 = never watered.
     uint8_t ring_passes[WATER_MAX_RINGS_CAL];
+    float   ring_mm[WATER_MAX_RINGS_CAL];
     int     ring_passes_n = 0;
     memset(ring_passes, 0, sizeof(ring_passes));
+    memset(ring_mm, 0, sizeof(ring_mm));
     {
         float t = zmax; int r2 = 0;
         while (t >= act_min && r2 < WATER_MAX_RINGS_CAL) {
@@ -17658,8 +17660,10 @@ static esp_err_t api_run_plan_handler(httpd_req_t *req)
             float in = t - sp; if (in < 0.0f) in = 0.0f;
             float ad = run_plan_active_deg(have_zone ? &z : NULL, t, active);
             if (ad < 1.0f) {
-                if (ring_passes_n < WATER_MAX_RINGS_CAL)
+                if (ring_passes_n < WATER_MAX_RINGS_CAL) {
+                    ring_mm[ring_passes_n]       = t;
                     ring_passes[ring_passes_n++] = 0;
+                }
                 r2++; t -= sp; continue;
             }
             float want = 0.0f;
@@ -17677,8 +17681,10 @@ static esp_err_t api_run_plan_handler(httpd_req_t *req)
             if (rp < 1) rp = 1;
             if (rp > need_passes) need_passes = rp;
             est_s_total += (ad / got) * (float)rp;   // this ring's own time
-            if (ring_passes_n < WATER_MAX_RINGS_CAL)
+            if (ring_passes_n < WATER_MAX_RINGS_CAL) {
+                ring_mm[ring_passes_n]       = t;
                 ring_passes[ring_passes_n++] = (uint8_t)(rp > 255 ? 255 : rp);
+            }
             r2++; t -= sp;
         }
     }
@@ -17721,18 +17727,29 @@ static esp_err_t api_run_plan_handler(httpd_req_t *req)
     char adv_js[200];
     json_escape(adv_js, sizeof(adv_js), advice);
 
-    char rp_js[160];
+    // b573: ring_mm alongside ring_passes. The preview builds its own ring
+    // ladder and the two did not agree -- 31 here against 33 there, because
+    // the page was never told the zone's inner throw limit -- so the
+    // length-equality check silently rejected the data and the preview fell
+    // back to drawing a single pass. Publishing the radii lets the preview
+    // match by position instead of trusting two ladders to come out the same.
+    char rp_js[180], rm_js[240];
     {
         int k = 0;
         rp_js[k++] = '[';
         for (int i = 0; i < ring_passes_n && k < (int)sizeof(rp_js) - 8; i++)
             k += snprintf(rp_js + k, sizeof(rp_js) - k, "%s%u",
                           i ? "," : "", (unsigned)ring_passes[i]);
-        rp_js[k++] = ']';
-        rp_js[k]   = '\0';
+        rp_js[k++] = ']'; rp_js[k] = '\0';
+        k = 0;
+        rm_js[k++] = '[';
+        for (int i = 0; i < ring_passes_n && k < (int)sizeof(rm_js) - 10; i++)
+            k += snprintf(rm_js + k, sizeof(rm_js) - k, "%s%.0f",
+                          i ? "," : "", (double)ring_mm[i]);
+        rm_js[k++] = ']'; rm_js[k] = '\0';
     }
 
-    char buf[860];
+    char buf[1180];   /* b573: + ring_mm */
     int n = snprintf(buf, sizeof(buf),
         "{\"ok\":true,\"zone\":%d,\"depth8\":%d,\"depth_mm\":%.2f,"
         "\"passes\":%d,\"per_pass_mm\":%.3f,\"rings\":%d,"
@@ -17741,13 +17758,13 @@ static esp_err_t api_run_plan_handler(httpd_req_t *req)
         "\"rings_at_max\":%d,\"rings_at_min\":%d,"
         "\"clamp\":\"%s\",\"est_min\":%.1f,\"coverage\":%u,"
         "\"active_deg\":%.0f,\"speed_floor_cal\":%s,\"pass_frac\":%.2f,"
-        "\"ring_passes\":%s,\"advice\":\"%s\"}",
+        "\"ring_passes\":%s,\"ring_mm\":%s,\"advice\":\"%s\"}",
         zone_id, depth8, depth_mm, passes, per_pass_mm, rings,
         (double)lo_dps, (double)hi_dps, (double)min_dps, (double)max_dps,
         n_fast, n_slow, clamp, (double)est_min,
         (unsigned)(have_zone ? z.coverage : 0),
         (double)active, floor_cal ? "true" : "false", (double)worst_frac,
-        rp_js, adv_js);
+        rp_js, rm_js, adv_js);
     if (n >= (int)sizeof(buf)) n = sizeof(buf) - 1;
     httpd_resp_send(req, buf, n);
     return ESP_OK;
