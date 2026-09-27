@@ -9894,55 +9894,12 @@ static float serp_ff_valve(int ring, float ring_throw, bool direct, float corr,
 // SERP_V_APPROACH_OVS below the target and come back up to it from below.
 // Nozzle is stationary at the turn point; ~0.5 s per closing turn; no
 // pressure feedback involved (Rob: no hunting, keep the flow continuous).
-// b574: 3.0 -> 1.0 deg. This is a deliberate undershoot with the stream ON:
-// the valve is driven below the ring's target angle and brought back up, so
-// the ball always lands from the same side and pressure hysteresis is
-// repeatable. At 3 deg it is 0.6-5.4 ft of throw error on this unit's curve
-// (58-552 mm/deg), held for up to SERP_V_APPROACH_MS, at every inward ring
-// change -- the reported "when it changes distance it undershoots for a
-// second". b413 measured the direction-dependent stopping bias at ~2.8 deg
-// MOTOR side, and the AS5600L sits on the valve OUTPUT shaft where lash is
-// far smaller, so 1 deg establishes the same consistent approach for a third
-// of the excursion. Tunable: raise it if throws start landing inconsistently
-// on inward rings.
-#define SERP_V_APPROACH_OVS   1.0f
-#define SERP_V_APPROACH_MS    1500u
-static void serp_valve_settle_from_below(chase_motor_t *vm, float v1, int *v_dir_io)
-{
-    const int      OPEN_DIR  = -1;      // matches VALVE_OPEN_DIR in glide_legs
-    const uint16_t DUTY_HI   = 220, DUTY_LO = 70;
-    const float    TOL       = 0.8f, DECEL = 4.0f;
-    float v_pre = fmaxf(v1 - SERP_V_APPROACH_OVS, VALVE_CAL_START_DEG + 0.5f);
-    if (v_pre >= v1 - 0.3f) return;     // no room below: nothing to gain
-    uint16_t raw = 0; float cur = v1;
-    // Phase A: make sure we are BELOW the target (closing direction).
-    chase_motor_apply(vm, 0, 0); vTaskDelay(pdMS_TO_TICKS(50));
-    TickType_t t0 = xTaskGetTickCount();
-    while ((uint32_t)pdTICKS_TO_MS(xTaskGetTickCount() - t0) < SERP_V_APPROACH_MS) {
-        if (!as5600_read(ADDR_AS5600L, &raw, NULL, NULL)) break;
-        cur = cal_unwrap_deg_near(raw * (360.0f / 4096.0f), VALVE_CLOSED_DEG + 40.0f);  // b517
-        if (cur <= v_pre + TOL) break;
-        float d = cur - v_pre; uint16_t duty = DUTY_HI;
-        if (d < DECEL) duty = (uint16_t)(DUTY_LO + (DUTY_HI - DUTY_LO) * (d / DECEL));
-        chase_motor_apply(vm, -OPEN_DIR, duty);
-        vTaskDelay(pdMS_TO_TICKS(30));
-    }
-    chase_motor_apply(vm, 0, 0); vTaskDelay(pdMS_TO_TICKS(60));
-    // Phase B: approach the target from below (opening direction).
-    t0 = xTaskGetTickCount();
-    while ((uint32_t)pdTICKS_TO_MS(xTaskGetTickCount() - t0) < SERP_V_APPROACH_MS) {
-        if (!as5600_read(ADDR_AS5600L, &raw, NULL, NULL)) break;
-        cur = cal_unwrap_deg_near(raw * (360.0f / 4096.0f), VALVE_CLOSED_DEG + 40.0f);  // b517
-        if (cur >= v1 - TOL) break;
-        float d = v1 - cur; uint16_t duty = DUTY_HI;
-        if (d < DECEL) duty = (uint16_t)(DUTY_LO + (DUTY_HI - DUTY_LO) * (d / DECEL));
-        chase_motor_apply(vm, OPEN_DIR, duty);
-        vTaskDelay(pdMS_TO_TICKS(30));
-    }
-    chase_motor_apply(vm, 0, 0);
-    if (v_dir_io) *v_dir_io = 0;
-    s_valve_last_dir = OPEN_DIR;
-}
+// b576: the from-below re-approach helper is gone. It drove the valve past a
+// ring's target and back up so the ball always landed from the same side --
+// with the stream ON, so every inward ring change sprayed short for up to
+// 1.5 s. The stiction nudge inside the valve chase does the part that
+// mattered (getting a stuck ball moving) without leaving the planned
+// distance.
 
 // b520: runtime dry hop for a sweep whose nozzle is not at the arc entry.
 // Close the valve in place, rotate the shortest way to the entry with the
@@ -10039,6 +9996,27 @@ static bool serpentine_glide_legs(const serpentine_leg_t *legs, int n,
     const uint16_t V_CHASE_DUTY  = 220;
     const uint16_t V_MIN_DUTY    = 70;
     const float    V_TOL_DEG     = 0.8f;
+    // b576: the chase eases duty down to V_MIN_DUTY as it nears the target,
+    // and V_MIN_DUTY is 70 -- the exact duty this codebase records the valve
+    // STALLING at ("Frontyard f9e994 stalls at duty 70", b521). So the last
+    // fraction of a degree was being attempted at stall threshold, which is
+    // why the per-ring feed-forward measured 4-11.5 s on inner rings and why
+    // the stream took a second to settle onto a new distance.
+    //
+    // Instead of creeping, detect that the valve has stopped moving and give
+    // it one short boosted pulse to break static friction, then resume the
+    // normal chase. Bounded: a pulse only fires after V_STUCK_MS of no
+    // encoder movement, lasts V_NUDGE_MS, and at most V_NUDGE_MAX per leg, so
+    // a genuinely jammed valve still falls through to the existing fault
+    // paths rather than being hammered.
+    const uint32_t V_STUCK_MS    = 150;    // no encoder movement for this long
+    const uint32_t V_NUDGE_MS    = 100;    // owner-specified pulse width
+    const uint16_t V_NUDGE_DUTY  = 320;    // enough to break stiction
+    const int      V_NUDGE_MAX   = 6;
+    float      v_seen_pos   = -1.0f;       // encoder angle at last movement
+    TickType_t v_seen_tick  = 0;
+    TickType_t v_nudge_end  = 0;
+    int        v_nudges     = 0;
     const float    V_DECEL_DEG   = 4.0f;
     const float    V_LAG_DEG     = 5.0f;
     const float    V_NOM_DPS     = 8.0f;  // timeout estimates only
@@ -10301,6 +10279,27 @@ static bool serpentine_glide_legs(const serpentine_leg_t *legs, int n,
                 } else {
                     vd = V_CHASE_DUTY;
                 }
+                // b576: stiction nudge. Track real movement; if the encoder
+                // has not budged while we are still outside tolerance, the
+                // eased-down duty is below what this valve needs to start
+                // moving, so pulse it.
+                TickType_t _nw = xTaskGetTickCount();
+                if (v_seen_pos < 0.0f || fabsf(cur_v - v_seen_pos) > 0.05f) {
+                    v_seen_pos  = cur_v;
+                    v_seen_tick = _nw;
+                } else if (v_nudge_end == 0 && v_nudges < V_NUDGE_MAX
+                           && (uint32_t)pdTICKS_TO_MS(_nw - v_seen_tick) > V_STUCK_MS) {
+                    v_nudge_end = _nw + pdMS_TO_TICKS(V_NUDGE_MS);
+                    v_nudges++;
+                    v_seen_tick = _nw;   // don't re-arm until it moves or times out
+                }
+                if (v_nudge_end != 0) {
+                    if ((int32_t)(_nw - v_nudge_end) < 0) {
+                        if (vd < V_NUDGE_DUTY) vd = V_NUDGE_DUTY;
+                    } else {
+                        v_nudge_end = 0;
+                    }
+                }
                 if (v_dir && want != v_dir) {
                     chase_motor_reverse_fast(&vm, vd);
                     v_dir = vm.dir;
@@ -10468,12 +10467,13 @@ static bool serpentine_glide_legs(const serpentine_leg_t *legs, int n,
 
         if (!ok) break;
 
-        // b515: closing leg -> re-approach the ring's valve target from below
-        // so the ball lands where the encoder says (see helper above).
-        if (!dry_leg && (v1 < v0 - 0.5f)) {
-            serp_valve_settle_from_below(&vm, v1, &v_dir);
-            TOUCH_ACTIVITY();
-        }
+        // b576: the from-below re-approach is gone. It drove the valve past
+        // the ring's target and back up so the ball always landed from the
+        // same side -- but it did that with the stream ON, so every inward
+        // ring change sprayed short for up to 1.5 s, which is the reported
+        // "undershoots for a second when it changes distance". Its real job
+        // was getting a stuck ball to move, and the stiction nudge in the
+        // chase above does that without leaving the planned distance.
 
         // b427: PSI settle after a flow-starting valve open (run start, or
         // reopen after a dry hop). The valve chase reaches the ring target
