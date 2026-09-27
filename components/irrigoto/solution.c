@@ -378,6 +378,9 @@ int solution_entry_json(const schedule_entry_t *e, char *buf, size_t len)
         c.speed, c.pulse, c.on_s, c.off_s);
 }
 
+/* b568: what the last completed dose was, kept after s_run is torn down. */
+static struct { uint8_t bottle; float ml; uint32_t pump_s; } s_last;
+
 /* ── Public: run lifecycle ────────────────────────────────────────────────── */
 
 void solution_arm_entry(const schedule_entry_t *e)
@@ -448,6 +451,19 @@ void solution_on_run_end(void)
                  (unsigned long)(s_run.pump_ms / 1000),
                  s_run.entry_id ? "" : " (manual)");
     }
+    /* b568: latch what this run actually dosed BEFORE the state is cleared.
+     * The run-history row is written after this returns, and solution_bottle()
+     * reads s_run which is about to be torn down -- so the history had no way
+     * to know a bottle had been used. Only a run that actually pumped counts;
+     * an armed-but-never-started dose (no flow, aborted) records nothing. */
+    if (s_run.started) {
+        s_last.bottle  = s_run.bottle;
+        s_last.ml      = solution_rate(s_run.bottle, s_run.cfg.speed)
+                         * (float)(s_run.pump_ms / 1000u);
+        s_last.pump_s  = s_run.pump_ms / 1000u;
+    } else {
+        s_last.bottle = 0; s_last.ml = 0.0f; s_last.pump_s = 0;
+    }
     s_run.armed = false;
     s_run.phase = PH_IDLE;
 }
@@ -457,6 +473,12 @@ void solution_on_run_end(void)
 bool     solution_armed(void)        { return s_run.armed; }
 bool     solution_pumping(void)      { return s_run.armed && pump_running(); }
 uint8_t  solution_bottle(void)       { return s_run.armed ? s_run.bottle : 0; }
+/* b568: the LAST finished dose, latched in solution_on_run_end(). 0 = the
+ * last run did not dose. Survives the run teardown so the history row can
+ * record it. */
+uint8_t  solution_last_bottle(void)  { return s_last.bottle; }
+float    solution_last_ml(void)      { return s_last.ml; }
+uint32_t solution_last_pump_s(void)  { return s_last.pump_s; }
 uint32_t solution_pump_seconds(void)
 {
     return (s_run.pump_ms + (pump_running() ? pump_elapsed_ms() : 0)) / 1000;

@@ -3998,7 +3998,8 @@ static void zone_name_resolve(uint16_t id, const char *lfs_name,
 static const char RUNS_CSV_HEADER[] =
     "start_local,end_local,uptime_s,duration_min,zone_id,zone_name,trigger,"
     "mode,depth_in,status,rings,rings_supply_limited,volume_l,avg_depth_mm,"
-    "coverage_pct,score,supply_psi_min,supply_psi_avg,supply_psi_max,fw_build";
+    "coverage_pct,score,supply_psi_min,supply_psi_avg,supply_psi_max,fw_build,"
+    "bottle,solution_ml";   /* b568: 0 / 0.0 when the run did not dose */
 
 static void runs_csv_append(void)
 {
@@ -4041,7 +4042,8 @@ static void runs_csv_append(void)
 
     char row[RUNS_LINE_MAX];
     snprintf(row, sizeof(row),
-        "%s,%s,%lu,%.1f,%u,%s,%s,%s,%d,%s,%u,%u,%.2f,%.2f,%.1f,%.2f,%.2f,%.2f,%.2f,%u",
+        "%s,%s,%lu,%.1f,%u,%s,%s,%s,%d,%s,%u,%u,%.2f,%.2f,%.1f,%.2f,%.2f,%.2f,%.2f,%u,"
+        "%u,%.1f",   /* b568: bottle used and mL dosed */
         t0, t1, (unsigned long)s_run_start_uptime,
         m->duration_s / 60.0f,
         (unsigned)s_last_water_zone_id, zname,
@@ -4051,7 +4053,8 @@ static void runs_csv_append(void)
         (unsigned)m->num_rings, (unsigned)m->rings_supply_limited,
         m->volume_l, m->actual_avg_depth_mm, m->polygon_coverage_pct, m->score,
         m->supply_psi_min, m->supply_psi_avg, m->supply_psi_max,
-        (unsigned)FW_BUILD);
+        (unsigned)FW_BUILD,
+        (unsigned)solution_last_bottle(), (double)solution_last_ml());
     if (storage_runs_append(RUNS_CSV_HEADER, row) == ESP_OK)
         INFO("Run logged to runs.csv");
 }

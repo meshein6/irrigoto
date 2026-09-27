@@ -203,6 +203,10 @@ section{margin-bottom:18px;}
   padding:10px 12px;margin:-8px 0 14px;}
 .mode-help.show{display:block;}
 .mode-help b{color:var(--text);}
+/* b568: a dosed run is marked in the history so "did this one get solution?"
+   is answerable without opening the CSV. */
+.run-sol{color:var(--green);}
+
 /* Run history (b535) */
 .run-row{display:flex;gap:8px;padding:7px 0;border-bottom:1px solid var(--border);
   align-items:baseline;font-size:12px;}
@@ -1104,7 +1108,8 @@ function toggleSupplyHelp(){
 // in step with RUNS_CSV_HEADER in irrigoto.c.
 const RUN_COL = {start:0,end:1,uptime:2,dur:3,zone_id:4,zone:5,trigger:6,mode:7,
                  depth:8,status:9,rings:10,limited:11,vol:12,depth_mm:13,
-                 cov:14,score:15,psi_min:16,psi_avg:17,psi_max:18,fw:19};
+                 cov:14,score:15,psi_min:16,psi_avg:17,psi_max:18,fw:19,
+                 bottle:20,sol_ml:21};   // b568
 function escHtml(t){ const d=document.createElement('div'); d.textContent=t==null?'':t; return d.innerHTML; }
 async function loadRuns(){
   const el = document.getElementById('runs-card');
@@ -1123,11 +1128,20 @@ async function loadRuns(){
       : '+' + Math.round((+c[RUN_COL.uptime]||0)/60) + 'm up';
     const depth = DEPTH_LABELS[+c[RUN_COL.depth]] || '';
     const vol = parseFloat(c[RUN_COL.vol]);
+    // b568: rows written before this column existed simply have no field.
+    const bottle = +c[RUN_COL.bottle] || 0;
+    const solMl  = parseFloat(c[RUN_COL.sol_ml]);
+    const sol = bottle
+      ? ' \u00b7 <span class="run-sol" title="Solution dosed from bottle ' + bottle + '">'
+        + '\u2697 B' + bottle + (isFinite(solMl) && solMl > 0 ? ' ' + solMl.toFixed(0) + 'mL' : '')
+        + '</span>'
+      : '';
     return '<div class="run-row">' +
       '<span class="run-when">' + escHtml(when) + '</span>' +
       '<span class="run-what">' + escHtml(c[RUN_COL.zone] || '') +
         '<small>' + escHtml(c[RUN_COL.mode] || '') + (depth ? ' ' + depth : '') +
         ' \u00b7 ' + (+c[RUN_COL.dur]||0).toFixed(0) + ' min \u00b7 ' + escHtml(c[RUN_COL.trigger]||'') +
+        sol +
         (ok ? '' : ' \u00b7 <span style="color:var(--orange)">' + escHtml(st.replace(/_/g,' ')) + '</span>') +
         '</small></span>' +
       '<span class="run-vol' + (ok ? '' : ' bad') + '">' +

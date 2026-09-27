@@ -94,6 +94,12 @@ bool     solution_armed(void);      /* this run will / is dosing */
 bool     solution_pumping(void);    /* pump currently on for a dose */
 uint8_t  solution_bottle(void);     /* bottle chosen for this run, 0 = none */
 uint32_t solution_pump_seconds(void);   /* accumulated pump-on time this run */
+/* b568: the last COMPLETED dose, latched at run end so the run-history row
+ * can record it after the run state has been torn down. bottle 0 = the last
+ * run did not dose. */
+uint8_t  solution_last_bottle(void);
+float    solution_last_ml(void);
+uint32_t solution_last_pump_s(void);
 /* JSON object: {"enabled":b,"armed":b,"phase":"idle|waiting|delay|dosing|done","bottle":n,
  *               "speed":n,"pulse":b,"pump_s":n,"est_ml":x} */
 int   solution_status_json(char *buf, size_t len);
