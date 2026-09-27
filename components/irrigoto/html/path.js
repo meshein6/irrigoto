@@ -934,6 +934,17 @@
     openPreview: openPreview, closePreview: ovClose,
     MODES: MODES, build: build, draw: draw, thumb: thumb, normPoints: normPoints,
     flatten: flatten, pointAt: pointAt, marker: marker, drawLive: drawLive,
+    /* b582: feed new live data to an open overlay. Returns false when the
+     * overlay is closed, so the caller can stop polling for it. */
+    updateLive: function (live) {
+      if (!ov || !ov.el || !ov.el.classList.contains('open')) return false;
+      ov.opts.live = live;
+      ovDraw();
+      return true;
+    },
+    isOpen: function () {
+      return !!(ov && ov.el && ov.el.classList.contains('open'));
+    },
     zoneArc: zoneArc, ringThrows: ringThrows, ringSpans: ringSpans,
     pointInZone: pointInZone
   };

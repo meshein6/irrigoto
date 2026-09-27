@@ -207,6 +207,12 @@ section{margin-bottom:18px;}
    is answerable without opening the CSV. */
 .run-sol{color:var(--green);}
 
+/* b582: opt-in live view button, sits in the watering bar */
+.live-btn{margin-left:auto;background:var(--green-dim);border:1px solid var(--green);
+  color:var(--green);border-radius:5px;font-size:10px;letter-spacing:.05em;
+  padding:3px 8px;cursor:pointer;font-family:inherit;white-space:nowrap;}
+.live-btn:active{opacity:.75;}
+
 /* Run history (b535) */
 .run-row{display:flex;gap:8px;padding:7px 0;border-bottom:1px solid var(--border);
   align-items:baseline;font-size:12px;}
@@ -628,6 +634,11 @@ function renderZones(zones){
             <div class="watering-bar" id="wbar-${z.id}" style="display:none">
               <div class="pulse-dot"></div>
               <span class="watering-label" id="wlabel-${z.id}">Watering&hellip;</span>
+              <!-- b582: the live view is opt-in. The card stays a plain zone
+                   outline; this opens the big view only when asked. -->
+              <button class="live-btn" id="wlive-${z.id}"
+                      onclick="openLiveView(${z.id})"
+                      title="Watch the run against its planned path">&#9678; Live</button>
             </div>
             <div class="zone-name-wrap">
               <input class="zone-name" type="text" value="${z.name||'Zone #'+z.id}"
@@ -1349,80 +1360,54 @@ function startLivePoll(){
                 throw_act: st.live_throw_act, ring: st.live_ring,
                 pass: st.live_pass, passes_total: st.live_passes_total,
                 rings_total: st.live_rings_total, age_ms: st.live_age_ms };
-      renderPathThumb();   // modal thumbnail, if it happens to be open
-      drawLiveOnCard();    // b581: the one you can actually see
+      // b582: push into the live overlay if it is open. The card radar is
+      // left as the plain zone outline -- the owner only wants the live view
+      // when they ask for it.
+      if (typeof IrrigotoPath !== 'undefined' && IrrigotoPath.isOpen())
+        IrrigotoPath.updateLive(_live);
     } catch(e) { /* a dropped poll is not worth a visible error */ }
-    if (_liveTimer) _liveTimer = setTimeout(tick, 1500);
+    // b582: 0.5 s while the live view is open -- the device samples about
+    // every 140 ms at these sweep speeds, so half a second actually shows
+    // movement. When the overlay is closed only the watering-bar label needs
+    // refreshing, so back off rather than poll at 2 Hz for a line of text.
+    const open = (typeof IrrigotoPath !== 'undefined') && IrrigotoPath.isOpen();
+    if (_liveTimer) _liveTimer = setTimeout(tick, open ? 500 : 2000);
   };
   _liveTimer = setTimeout(tick, 0);
 }
-// b581: the live run, drawn where you can actually see it.
+// b582: the live view is a button, not always-on.
 //
-// b570 put the live marker on the Water modal's path thumbnail -- which is
-// inside #modal-bg, closed during a run, and the Water Zone button is
-// disabled while watering. So the live view existed and was unreachable.
-// It now draws on the watering zone's own card radar on the main page, over
-// the planned path, and the "Watering..." bar carries the numbers.
-function drawLiveOnCard(){
-  if (!_live || activeWaterZoneId < 0) return;
-  const card = document.getElementById('zcard-' + activeWaterZoneId);
-  const cv = card && card.querySelector('.zone-radar');
-  if (!cv || typeof IrrigotoPath === 'undefined') return;
-  const z = _zoneCache && _zoneCache[activeWaterZoneId];
-  if (!z || !z.points || z.points.length < 2) return;
-
-  // Planned path first, then the planned ring, then where it really is.
-  const o = { mode: String(lastWaterMode || 9), pass: 0,
-              act_max_throw: z.act_max_throw || 10058,
-              act_min_throw: z.act_min_throw || 0,
-              coverage: z.coverage | 0,
-              ringPasses: _lastPlan && _lastPlan.ring_passes,
-              ringMm: _lastPlan && _lastPlan.ring_mm,
-              thumb: true };
-  try { IrrigotoPath.thumb(cv, z.points, o); } catch(e) { return; }
-
-  const S = cv.width, cx = S/2, cy = S/2, maxR = cx - 2;
-  const zmax = Math.max.apply(null, z.points.map(p => p.mm || p.throw_mm || 0));
-  const scale = Math.max(zmax * 1.12, 600);
-  const ctx = cv.getContext('2d');
-  // The ring the plan says it should be on -- a short throw then shows as
-  // the dot sitting inside this circle.
-  if (_live.throw_mm > 0) {
-    const r = (_live.throw_mm / scale) * maxR;
-    if (r > 0 && r < maxR * 1.05) {
-      ctx.beginPath(); ctx.arc(cx, cy, r, 0, Math.PI*2);
-      ctx.strokeStyle = 'rgba(120,200,255,.55)';
-      ctx.lineWidth = 1; ctx.setLineDash([3,3]); ctx.stroke(); ctx.setLineDash([]);
-    }
-  }
-  IrrigotoPath.drawLive(ctx,
-    { deg: _live.deg, throw_mm: _live.throw_act > 0 ? _live.throw_act : _live.throw_mm,
-      age_ms: _live.age_ms },
-    { cx: cx, cy: cy, maxR: maxR, scale_mm: scale });
-
-  const lbl = document.getElementById('wlabel-' + activeWaterZoneId);
-  if (lbl) {
-    const plan = _live.throw_mm > 0 ? (_live.throw_mm/304.8).toFixed(1) : '\u2014';
-    const act  = _live.throw_act > 0 ? (_live.throw_act/304.8).toFixed(1) : '\u2014';
-    const pass = (_live.passes_total > 0)
-      ? ('pass ' + ((_live.pass|0) || 1) + '/' + _live.passes_total + ' \u00b7 ') : '';
-    const ring = (_live.ring >= 0)
-      ? ('ring ' + (_live.ring + 1) + (_live.rings_total ? '/' + _live.rings_total : '') + ' \u00b7 ') : '';
-    lbl.textContent = pass + ring + 'plan ' + plan + "' \u00b7 actual " + act + "'";
-  }
+// b570 drew the marker on the Water modal thumbnail, which is closed during a
+// run. b581 moved it onto the zone card radar, which works but paints over
+// the zone outline for the whole run. This opens the big shared overlay on
+// demand instead, and the card stays as it was.
+function openLiveView(id){
+  const z = _zoneCache && _zoneCache[id];
+  if (!z || !z.points || z.points.length < 2 || typeof IrrigotoPath === 'undefined') return;
+  IrrigotoPath.openPreview({
+    points: z.points,
+    act_max_throw: z.act_max_throw, act_min_throw: z.act_min_throw,
+    coverage: z.coverage | 0,
+    mode: String(lastWaterMode || 9), lockMode: true, depth8: selDepth,
+    ringPasses: _lastPlan && _lastPlan.ring_passes,
+    ringMm:     _lastPlan && _lastPlan.ring_mm,
+    live: _live,
+    title: (z.name || ('Zone ' + id)) + ' \u00b7 live'
+  });
+  // Don't make the user wait out the slow tick for the first frame.
+  if (_liveTimer) { clearTimeout(_liveTimer); _liveTimer = null; startLivePoll(); }
 }
+
+// b583: no per-update annotations on the card. They rewrote the watering bar
+// twice a second and made the zone card unreadable. The live numbers belong
+// in the live overlay; the card keeps whatever the countdown puts there, and
+// for Serpentine/Sections that estimate is fixed at run start (b578) so it
+// does not move as the run progresses.
 
 function stopLivePoll(){
   if (_liveTimer) clearTimeout(_liveTimer);
   _liveTimer = null;
-  if (_live) {
-    _live = null;
-    renderPathThumb();
-    // b581: put the card radar back to the plain zone outline.
-    document.querySelectorAll('.zone-radar').forEach(function(cv){
-      if (cv._pts) drawRadar(cv, cv._pts);
-    });
-  }
+  if (_live) { _live = null; renderPathThumb(); }
 }
 
 function updateWateringState(watering, mode, estMin, waterZoneId, cleanupPass) {
@@ -1435,6 +1420,10 @@ function updateWateringState(watering, mode, estMin, waterZoneId, cleanupPass) {
   // update so they react within the 8 s poll without waiting for the
   // 30 s schedule refresh.
   if (typeof paintSchedDots === 'function') paintSchedDots();
+  // b582: the Live button only exists while that zone is running.
+  document.querySelectorAll('[id^="wlive-"]').forEach(function(b){
+    b.style.display = (watering && ('wlive-' + waterZoneId) === b.id) ? '' : 'none';
+  });
 
   document.querySelectorAll('[id^="wbar-"]').forEach(el=>{
     const zid = parseInt(el.id.split('-')[1]);

@@ -10714,6 +10714,20 @@ static void water_serpentine_passes(
                 if (_t < 100.0f || _a < 100.0f) continue;
                 float _ratio = _a / _t;
                 if (_ratio < 0.75f || _ratio > 1.25f) continue;   /* b433 band */
+                // b583: seed on UNDER-throw only.
+                //
+                // Correcting an over-read closes the valve and shortens the
+                // throw, and b433 already established that the
+                // pressure->throw model over-reads at low PSI -- "over-throw
+                // is not re-fired; beyond +25% it's artifact, within it the
+                // water still landed inside the splash band". The previous
+                // run recorded 1.19x on the outermost ring, which is inside
+                // the plausibility band and so was trusted here: corr became
+                // 1/1.19 = 0.84, the run aimed at 0.84 x 10.5 = 8.8 ft, and
+                // the stream landed about two feet short of the grass. That
+                // was this seeding, not the calibration -- the cal round
+                // trips to within 0.00 ft on every walked point.
+                if (_ratio > 0.98f) continue;   /* over-read: leave it alone */
                 corr[i] = fmaxf(0.5f, fminf(1.6f, _t / _a));
                 _seeded++;
             }
