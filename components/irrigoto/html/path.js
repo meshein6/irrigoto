@@ -117,20 +117,35 @@
     return { start: start, span: span, centred: false, originInside: false, gap: mg, gi: gi };
   }
 
-  /* Ring radii, outer to inner. */
-  function ringThrows(pts, actMax, actMin, arc) {
+  /* Per-zone ring coverage, mirroring zone_coverage_scale() in irrigoto.c.
+   * 0 Standard, 1 Fine, 2 Finest -- and anything unrecognised is Standard,
+   * which is also what a zone saved before coverage existed reports. */
+  function coverageScale(c) {
+    return c === 2 ? 0.50 : c === 1 ? 0.75 : 1.00;
+  }
+
+  /* Ring radii, outer to inner.
+   *
+   * b561: the 700 mm base pitch is scaled by the zone's coverage, the same
+   * way phase_water_zone does through s_ring_pitch_mm. Without this the
+   * preview drew Standard spacing whatever the zone was set to, so changing
+   * coverage appeared to do nothing -- the preview was claiming a ring layout
+   * the firmware would not use. The 80 mm floor is WATER_MIN_RING_SPACING and
+   * is NOT scaled, matching the firmware. */
+  function ringThrows(pts, actMax, actMin, arc, coverage) {
     var throws = pts.map(function (p) { return p.throw_mm; });
     var zmax = Math.max.apply(null, throws);
     var zmin = (actMin && actMin > 50) ? actMin : Math.min.apply(null, throws);
+    var pitch = 700 * coverageScale(coverage);
     var rings = [], t = zmax;
     while (t >= zmin && rings.length < RING_MAX) {
       rings.push(t);
-      t -= Math.max(700 * (t / actMax), 80);
+      t -= Math.max(pitch * (t / actMax), 80);
     }
     if (!arc.centred && arc.originInside && zmin > MIN_THROW) {
       while (t > MIN_THROW && rings.length < RING_MAX) {
         rings.push(t);
-        t -= Math.max(700 * (t / actMax), 80);
+        t -= Math.max(pitch * (t / actMax), 80);
       }
     }
     return rings;
@@ -300,7 +315,7 @@
     if (modeKey === 'chase' || modeKey === 'demo') return { modeKey: modeKey, rings: [], noPath: true };
 
     var arc = zoneArc(points);
-    var thr = ringThrows(points, actMax, actMin, arc);
+    var thr = ringThrows(points, actMax, actMin, arc, opts.coverage | 0);
     if (!thr.length) return null;
 
     var plan = planOrder(modeKey, thr.length, opts.pass || 0, !!opts.sequential);
@@ -328,6 +343,7 @@
       arc: arc,
       lobes: sectioned ? (sectioned[sectioned.length - 1].lobe + 1) : 1,
       rings: rings,
+      coverage: opts.coverage | 0,
       scale_mm: opts.scale_mm || (actMax + 914),
       orderVaries: plan.orderVaries,
       noPath: false

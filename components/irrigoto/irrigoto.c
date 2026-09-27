@@ -2060,9 +2060,26 @@ static esp_err_t spd_save_primary(const speed_map_t *m)
 }
 static esp_err_t spd_load_primary(speed_map_t *m)
 {
+    esp_err_t r;
     if (storage_ready() && storage_spd_load(m) == ESP_OK && m->num_points > 0)
-        return ESP_OK;
-    return spd_load_nvs_internal(m);
+        r = ESP_OK;
+    else
+        r = spd_load_nvs_internal(m);
+    // b561: the slow-speed floor is the only thing standing between the
+    // solver and a sweep the nozzle cannot sustain, and this unit's
+    // speed.json stores min_continuous_dps = 0.00 while the slowest MEASURED
+    // point in the same file is 10.25 deg/s. Two writers exist and the wrong
+    // one wrote it. A zero floor means serpentine_ring_dps clamps nothing
+    // below, so the planner commands a sub-stall speed and the motor stalls
+    // instead of crawling -- which is how a run reported "completed" having
+    // delivered 1.53 mm of a 3.175 mm target. Fall back to the slowest speed
+    // actually measured, so every consumer gets a real number without
+    // needing a recalibration first.
+    if (r == ESP_OK && m->num_points > 0 && m->min_continuous_dps <= 0.01f) {
+        m->min_continuous_dps = m->deg_per_sec[0];
+        if (m->min_continuous_dps <= 0.01f) m->min_continuous_dps = 10.9f;
+    }
+    return r;
 }
 static esp_err_t cal_save_nvs_internal(const pressure_map_t *map)
 {
@@ -9328,9 +9345,14 @@ static float serpentine_ring_valve_deg(float ring_throw, bool direct_ring,
 // continuous band; a ceiling-pinned inner ring over-deposits once and is
 // then satisfied by the cumulative tracker (the b382 TopCorner lesson:
 // never skip, always water).
-static float serpentine_ring_dps(float ring_throw, float inner_throw,
+// out_want (nullable) receives the speed the deposit maths actually asked for,
+// before the min/max clamp. b561: run_plan needs it -- comparing the clamped
+// return against itself always says "no clamp", which is why the planner
+// reported every depth reaching 100% of target in one pass.
+static float serpentine_ring_dps_ex(float ring_throw, float inner_throw,
                             float active_deg, float per_pass_depth,
-                            const speed_map_t *spd, bool have_spd)
+                            const speed_map_t *spd, bool have_spd,
+                            float *out_want)
 {
     float r_outer = ring_throw  / 1000.0f;
     float r_inner = inner_throw / 1000.0f;
@@ -9348,12 +9370,21 @@ static float serpentine_ring_dps(float ring_throw, float inner_throw,
         float Q_ref = NOZZLE_FLOW_K * powf(ref_psi, NOZZLE_FLOW_N);
         dps = Q_ref * active_deg / (per_pass_depth * 60000.0f * ring_area);
     }
+    if (out_want) *out_want = dps;
     float min_dps = have_spd ? spd->min_continuous_dps : 10.9f;
     float max_dps = (have_spd && spd->num_points > 0)
                     ? spd->deg_per_sec[spd->num_points - 1] : 118.0f;
     if (dps < min_dps) dps = min_dps;
     if (dps > max_dps) dps = max_dps;
     return dps;
+}
+
+static float serpentine_ring_dps(float ring_throw, float inner_throw,
+                            float active_deg, float per_pass_depth,
+                            const speed_map_t *spd, bool have_spd)
+{
+    return serpentine_ring_dps_ex(ring_throw, inner_throw, active_deg,
+                                  per_pass_depth, spd, have_spd, NULL);
 }
 
 // b423: build the serpentine leg list for ONE pass into s_serpentine_legs[].
@@ -12027,8 +12058,6 @@ static void phase_water_zone(void)
     bool  use_eighths = (depth8 >= 1 && depth8 <= 8) && !demo_mode;
     float depth_mm    = use_eighths ? (float)depth8 * 3.175f :
                         (sel == '2' || sel == '4' || sel == '6') ? 6.35f : 3.175f;
-    bool  use_pulse_mode_sel = !demo_mode && !gentle_mode && !smooth_mode
-                               && !serpentine_mode;
     int   passes      = gentle_mode ? GENTLE_MAX_PASSES :
                         use_eighths  ? depth8 :                 // pulse: N x 1/8"
                         (sel == '3' || sel == '4') ? 2 : 1;
@@ -12036,26 +12065,26 @@ static void phase_water_zone(void)
     if (smooth_mode) { passes = 30; } // adaptive; depth_mm target set above
     if (serpentine_mode)  { passes = 30; } // b429: adaptive, exits when all rings satisfied
 
-    // b557: user-chosen pass count. Depth says how much water; passes says how
-    // it is spread. per_pass_target = depth_mm / passes goes to the speed
-    // solver, so MORE passes means each sweep deposits less and therefore runs
-    // FASTER, and fewer passes means a slower, heavier sweep. Speed is not a
-    // knob -- it is the consequence of these two, and the solver already
-    // existed; all that was missing was the ability to say how many passes.
-    // 0 keeps each mode's own behaviour, so an unspecified run is unchanged.
-    int req_passes = s_web_water_passes;
-    s_web_water_passes = 0;
-    if (req_passes < 1 || req_passes > WATER_MAX_PASSES_REQ) req_passes = 0;
-    if (demo_mode) req_passes = 0;
-    float per_pass_target = (req_passes > 0) ? depth_mm / (float)req_passes : 0.0f;
-    if (req_passes > 0) {
-        // Pulse's pass IS its depth unit, so the request sets its pass count
-        // outright. The adaptive modes keep their cap and simply finish early
-        // once the rings meet target.
-        if (use_pulse_mode_sel) passes = req_passes;
-        INFO("Passes: %d requested -- %.2f mm per pass of a %.2f mm target",
-             req_passes, per_pass_target, depth_mm);
-    }
+    // b561: no pass count to choose. Every pass asks for the WHOLE target
+    // depth, which makes the solver ask for the slowest sweep it can, and the
+    // floor clamp is what stops it asking for one the nozzle cannot hold. The
+    // pass count then falls out: the adaptive multipass tops up whatever a
+    // single slow pass could not reach, per ring, and stops when every ring
+    // is satisfied.
+    //
+    // This is better than letting the user pick a count. Slow is what we
+    // actually want -- every extra pass repeats the ring transitions, and
+    // those are where the travel waste and the stream wander live -- and a
+    // chosen count is a guess at a number the firmware can simply solve for.
+    // b557 shipped the picker; this replaces it.
+    //
+    // Inner rings are unaffected: their area is tiny, so the full-depth
+    // request still pins them at max_dps exactly as before.
+    s_web_water_passes = 0;                 // drain any legacy request
+    float per_pass_target = demo_mode ? 0.0f : depth_mm;
+    if (!demo_mode)
+        INFO("Speed: solving for the slowest sustainable sweep at the full "
+             "%.2f mm target; passes follow from what one pass reaches", depth_mm);
 
     // b283: arm pressure trace recorder for smooth/gentle runs only (pulse
     // mode's per-arc valve PID would make valve_deg snapshots meaningless).
@@ -13001,9 +13030,13 @@ static void phase_water_zone(void)
             //   gentle: GENTLE_PER_PASS_DEPTH_MM (~0.635mm, seed-safe; adaptive multi-pass)
             //   pulse:  depth_mm / passes (1- or 2-pass open-loop hits target exactly)
             float per_pass_depth;
-            if (per_pass_target > 0.0f) per_pass_depth = per_pass_target;  // b557
+            // b561: Gentle keeps its own light pass on purpose -- it exists for
+            // seed and bare soil, where a heavy slow pass is the failure mode,
+            // not the goal. Every other mode asks for the whole target in one
+            // pass so the solver returns the slowest sweep the floor allows.
+            if (gentle_mode)            per_pass_depth = GENTLE_PER_PASS_DEPTH_MM;
+            else if (per_pass_target > 0.0f) per_pass_depth = per_pass_target;
             else if (smooth_mode)       per_pass_depth = depth_mm;
-            else if (gentle_mode)       per_pass_depth = GENTLE_PER_PASS_DEPTH_MM;
             else                        per_pass_depth = depth_mm / (float)(passes > 0 ? passes : 1);
 
             // Flow-model dps: dps = Q[mL/min]*active_deg / (per_pass_depth*60000*ring_area[m2])
@@ -15532,6 +15565,14 @@ static esp_err_t zone_act_handler(httpd_req_t *req)
             int v = atoi(cv);
             if (v >= ZONE_COVERAGE_STANDARD && v <= ZONE_COVERAGE_FINEST) {
                 s_web_zone.coverage = (uint8_t)v;
+                // b561: persist immediately. It is one scalar, and making the
+                // user press Save to apply it meant the preview and the run
+                // disagreed until they did -- Save also drops the cached
+                // heatmap, which is far too heavy for a settings tap. The
+                // heatmap stays valid because each run records the footprint
+                // it actually used (water_run_t.ring_footprint_mm).
+                if (!s_web_zone_is_new && s_web_zone.num_points >= 2)
+                    zone_save_primary(s_web_zone_id, s_web_zone_name, &s_web_zone);
                 INFO("Zone %u coverage -> %s", s_web_zone_id,
                      zone_coverage_name(s_web_zone.coverage));
             }
@@ -16626,9 +16667,10 @@ static esp_err_t api_all_handler(httpd_req_t *req)
             zone_name_resolve(ids[i], _zn, _zdef, zrname, sizeof(zrname));
             n=snprintf(buf,sizeof(buf),
                 "%s{\"id\":%u,\"name\":\"%s\",\"num_points\":%u,"
+                "\"coverage\":%u,"          /* b561: the preview needs the ring pitch */
                 "\"min_ft\":%.1f,\"max_ft\":%.1f,\"arc_deg\":%.1f,\"points\":[",
                 count?",":"",ids[i],zrname,
-                zp.num_points,mn/304.8f,mx/304.8f,ahi-alo);
+                zp.num_points,(unsigned)zp.coverage,mn/304.8f,mx/304.8f,ahi-alo);
             httpd_resp_send_chunk(req, buf, n);
             for(int j=0;j<zp.num_points;j++){
                 n=snprintf(buf,sizeof(buf),"%s{\"deg\":%.1f,\"mm\":%.0f,\"widx\":%d}",
@@ -17467,11 +17509,14 @@ static esp_err_t api_run_plan_handler(httpd_req_t *req)
     }
     if (depth8 < 1) depth8 = 1;
     if (depth8 > 8) depth8 = 8;
-    if (passes < 1) passes = 1;
-    if (passes > WATER_MAX_PASSES_REQ) passes = WATER_MAX_PASSES_REQ;
+    (void)passes;   // b561: no longer an input -- see below
 
+    // b561: the run always asks for the whole depth in one pass, so the
+    // solver returns the slowest sweep the floor allows. What the caller
+    // wants to know is what that produces: how deep one pass actually gets,
+    // and therefore how many passes the run will take.
     float depth_mm    = (float)depth8 * 3.175f;
-    float per_pass_mm = depth_mm / (float)passes;
+    float per_pass_mm = depth_mm;
 
     zone_perimeter_t z = {0};
     bool have_zone = (zone_load_primary((uint16_t)zone_id, &z) == ESP_OK && z.num_points >= 2);
@@ -17524,51 +17569,63 @@ static esp_err_t api_run_plan_handler(httpd_req_t *req)
     float est_s = 0.0f, lo_dps = 1e6f, hi_dps = 0.0f;
     RUN_PLAN_WALK(per_pass_mm, rings, n_fast, n_slow, lo_dps, hi_dps, est_s);
     if (rings == 0) { lo_dps = hi_dps = 0.0f; }
-    float est_min = est_s * (float)passes / 60.0f;
 
-    // The smallest pass count that actually clears the clamp. Suggesting
-    // "double it" was wrong often enough to be useless -- on this zone a 1/8"
-    // target needs 4 passes, not 2 -- and the user should not have to find the
-    // edge by trial when the firmware can just solve for it.
-    int suggest = 0;
-    for (int c = 1; c <= WATER_MAX_PASSES_REQ; c++) {
-        int r2 = 0, f2 = 0, s2 = 0; float l2 = 1e6f, h2 = 0.0f, e2 = 0.0f;
-        RUN_PLAN_WALK(depth_mm / (float)c, r2, f2, s2, l2, h2, e2);
-        if (r2 > 0 && f2 <= r2 / 2 && s2 <= r2 / 2) { suggest = c; break; }
+    // How deep the slowest pass actually gets on the ring that does worst,
+    // and therefore how many passes the adaptive multipass will need. Solve
+    // it the same way the solver does, inverted: at the clamped speed,
+    // deposit = requested_depth x (requested_dps / clamped_dps).
+    float worst_frac = 1.0f;
+    {
+        float t = zmax; int r2 = 0;
+        while (t >= act_min && r2 < WATER_MAX_RINGS_CAL) {
+            float sp = pitch * (t / act_max);
+            if (sp < WATER_MIN_RING_SPACING) sp = WATER_MIN_RING_SPACING;
+            float in = t - sp; if (in < 0.0f) in = 0.0f;
+            float want = 0.0f;
+            float got  = serpentine_ring_dps_ex(t, in, active, per_pass_mm,
+                                                &spd, have_spd, &want);
+            if (got < min_dps) got = min_dps;
+            // Deposit scales inversely with speed, so a ring forced to sweep
+            // faster than asked lays down want/got of what was requested.
+            float frac = (got > 0.01f && want > 0.0f) ? (want / got) : 1.0f;
+            if (frac > 1.0f) frac = 1.0f;       // pinned fast = over-applies, not short
+            if (frac < worst_frac) worst_frac = frac;
+            r2++; t -= sp;
+        }
     }
+    if (worst_frac < 0.02f) worst_frac = 0.02f;
+    int need_passes = (int)ceilf(1.0f / worst_frac);
+    if (need_passes < 1) need_passes = 1;
+    passes = need_passes;
+    float est_min = est_s * (float)need_passes / 60.0f;
 
     const char *clamp = "none";
     char advice[220];
     advice[0] = '\0';
     if (n_fast > rings / 2 && rings > 0) {
+        // Every ring wants to go faster than the nozzle can, so even one pass
+        // over-applies. Depth is the only lever left.
         clamp = "fast";
-        if (suggest > 0)
-            snprintf(advice, sizeof(advice),
-                     "Too many passes for this depth -- the sprinkler cannot sweep "
-                     "fast enough, so each pass applies more than intended and the "
-                     "run overshoots. Try %d pass%s.",
-                     suggest, suggest == 1 ? "" : "es");
-        else
-            snprintf(advice, sizeof(advice),
-                     "No pass count works for this depth on this zone -- every "
-                     "choice sweeps faster than the target needs. Water less "
-                     "deeply, or space the rings finer in Zone Setup.");
-    } else if (n_slow > rings / 2 && rings > 0) {
+        snprintf(advice, sizeof(advice),
+                 "Even the fastest sweep lays down more than this depth asks "
+                 "for, so the run will overshoot. Water less deeply, or space "
+                 "the rings finer in Zone Setup.");
+    } else if (need_passes > WATER_MAX_PASSES_REQ) {
         clamp = "slow";
-        if (suggest > 0)
-            snprintf(advice, sizeof(advice),
-                     "Too few passes for this depth -- the sprinkler cannot sweep "
-                     "slowly enough, so the target is never reached and water "
-                     "pools. Try %d passes.%s", suggest,
-                     floor_cal ? "" : " Slow-speed limit is not calibrated "
-                                      "(assuming 10.9 dps) -- run the speed cal.");
-        else
-            snprintf(advice, sizeof(advice),
-                     "This depth cannot be reached on this zone at any pass count "
-                     "up to %d -- the sweep cannot go slow enough. Water less "
-                     "deeply, or run it twice.%s", WATER_MAX_PASSES_REQ,
-                     floor_cal ? "" : " Slow-speed limit is not calibrated "
-                                      "(assuming 10.9 dps) -- run the speed cal.");
+        snprintf(advice, sizeof(advice),
+                 "This depth needs about %d passes at the slowest sweep the "
+                 "nozzle can hold. That is a very long run -- consider "
+                 "watering less deeply, or twice.%s", need_passes,
+                 floor_cal ? "" : " Slow-speed limit is not calibrated "
+                                  "(assuming 10.9 deg/s) -- run the speed cal.");
+    } else if (need_passes > 1) {
+        clamp = "slow";
+        snprintf(advice, sizeof(advice),
+                 "One slow pass reaches about %.0f%% of this depth, so the run "
+                 "will make %d passes.%s", (double)(worst_frac * 100.0f),
+                 need_passes,
+                 floor_cal ? "" : " Slow-speed limit is not calibrated "
+                                  "(assuming 10.9 deg/s) -- run the speed cal.");
     }
     char adv_js[200];
     json_escape(adv_js, sizeof(adv_js), advice);
@@ -17581,13 +17638,13 @@ static esp_err_t api_run_plan_handler(httpd_req_t *req)
         "\"limit_dps_min\":%.1f,\"limit_dps_max\":%.1f,"
         "\"rings_at_max\":%d,\"rings_at_min\":%d,"
         "\"clamp\":\"%s\",\"est_min\":%.1f,\"coverage\":%u,"
-        "\"active_deg\":%.0f,\"speed_floor_cal\":%s,\"suggest_passes\":%d,"
+        "\"active_deg\":%.0f,\"speed_floor_cal\":%s,\"pass_frac\":%.2f,"
         "\"advice\":\"%s\"}",
         zone_id, depth8, depth_mm, passes, per_pass_mm, rings,
         (double)lo_dps, (double)hi_dps, (double)min_dps, (double)max_dps,
         n_fast, n_slow, clamp, (double)est_min,
         (unsigned)(have_zone ? z.coverage : 0),
-        (double)active, floor_cal ? "true" : "false", suggest, adv_js);
+        (double)active, floor_cal ? "true" : "false", (double)worst_frac, adv_js);
     if (n >= (int)sizeof(buf)) n = sizeof(buf) - 1;
     httpd_resp_send(req, buf, n);
     return ESP_OK;

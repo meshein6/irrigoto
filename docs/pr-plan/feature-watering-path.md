@@ -193,54 +193,93 @@ variables to avoid creating runs that are too fast."*
   `ring_covers()` does not double-count overlap on a Finest run (a pre-change
   run file reads 0 and keeps the old width).
 - Zone Setup: a **Ring coverage** row with a one-line note per option.
-  `/zone/act?cmd=set_coverage&v=` sets it, and the next Save writes it.
-  `/zone/state` reports `coverage`.
+  `/zone/act?cmd=set_coverage&v=` sets it and **persists it immediately** —
+  requiring a Save meant the preview and the run disagreed until the user
+  pressed it, and Save also drops the cached heatmap, far too heavy for a
+  settings tap. The heatmap stays valid regardless because every run records
+  the footprint it used.
+- **The preview draws the real pitch.** `ringThrows()` in `path.js` had the
+  700 mm base hardcoded, so it drew Standard spacing whatever the zone was set
+  to: changing coverage appeared to do nothing, and the preview claimed a ring
+  layout the firmware would not use. It now scales by `coverageScale()`,
+  mirroring `zone_coverage_scale()`, with the 80 mm floor left unscaled to
+  match `WATER_MIN_RING_SPACING`. Coverage rides in `/api/all`'s zone payload
+  and in `/zone/state`, so both the Water modal thumbnail and the Zone Setup
+  canvas follow it, and Zone Setup redraws on the tap.
 
-### Passes
+### Passes: removed, and replaced by "as slow as the nozzle can hold"
 
-- `POST /zone/water … &passes=1..8`, consumed once by `phase_water_zone` like
-  depth. Absent or 0 means each mode's own behaviour, so HA and old clients are
-  unaffected.
-- `per_pass_target = depth_mm / passes` goes to the speed solver in both paths:
-  the shared ring loop and `serpentine_build_pass_plan` (new
-  `water_serpentine_passes` argument). Fewer passes means a slower, heavier
-  sweep. Pulse, whose pass *is* its depth unit, takes the request as its pass
-  count outright.
+b557 shipped a 1..8 pass picker exactly as the design above asked. Owner
+direction after using it, 2026-09-27: *"get rid of pass selection, always
+optimise for slowest possible travel. Make sure we go as slow as possible for
+the angle sweep."*
+
+That is right, and it supersedes the design. A chosen pass count is a guess at
+a number the firmware can solve for, and slow is what we want anyway: every
+extra pass repeats the ring transitions, which is where the travel waste and
+the stream wander live (`feature-depth-by-speed.md` asked for this first).
+
+- Every pass now asks for the **whole** target depth, so the solver returns
+  the slowest sweep it can and the floor clamp is the only thing stopping it
+  asking for one the nozzle cannot hold. The pass count falls out: the
+  adaptive multipass tops up, per ring, whatever one slow pass did not reach.
+- **Gentle is exempt.** It exists for seed and bare soil, where a heavy slow
+  pass is the failure mode rather than the goal, so it keeps
+  `GENTLE_PER_PASS_DEPTH_MM`. A first cut of this override removed that;
+  caught before it shipped.
+- `POST /zone/water&passes=` is accepted and ignored; nothing in the UI asks.
 
 ### The bound, made visible
 
 The clamp fails silently in both directions:
 
-- **pinned at max dps**: the sweep cannot go fast enough, every pass
-  over-applies, and the run overshoots. Too many passes for the depth.
-- **pinned at min dps**: the sweep cannot go slow enough, and the target is
-  never met. Too few passes for the depth.
+- **pinned at max dps**: the sweep cannot go fast enough, so even one pass
+  over-applies and the run overshoots. Depth is the only lever left.
+- **pinned at min dps**: the sweep cannot go slow enough, so one pass falls
+  short and the run needs more of them.
 
-`GET /api/run_plan?zone=&depth=&passes=` walks the same ring ladder at the
-zone's coverage, asks the solver for each ring's speed, and returns the clamp
-state, the dps range, the estimated minutes, and the **smallest pass count
-that clears the clamp** (searched, not guessed). The Water modal shows this
-live under the pickers: speed and minutes when it works, and which way it is
-wrong and what to change when it does not.
+`GET /api/run_plan?zone=&depth=` walks the same ring ladder at the zone's
+coverage and reports what the firmware solved: the dps range, the fraction of
+the target one slow pass reaches (`pass_frac`), the pass count that implies,
+and the estimate. The Water modal shows it live under the depth picker.
 
-This unit's `speed.json` has `min_continuous_dps: 0.00`, so the slow side has
-no real floor. `/api/run_plan` judges against a conservative 10.9 dps, reports
-`speed_floor_cal: false` and says so in the advice.
+Two things had to be fixed to make that honest:
 
-Measured plan output (zone 0, 237° arc, 20 rings, Standard):
+- `spd_load_primary()` falls back to the slowest **measured** speed when the
+  stored `min_continuous_dps` is <= 0. This unit stored 0.00 while the same
+  file lists 10.25 deg/s, so `serpentine_ring_dps` clamped nothing below and
+  Serpentine/Sections were commanding sub-stall speeds — a stall, reported as
+  a completed run.
+- `serpentine_ring_dps_ex()` exposes the **pre-clamp** requested speed.
+  Without it `run_plan` compared the clamped return against itself and
+  reported every depth reaching 100 % of target in one pass — confidently
+  wrong.
+
+### What the honest numbers say
 
 ```
-depth  passes  per_pass   dps range      clamp  suggest  est_min
-1/8    1       3.17 mm    10.9-10.9      slow   3        7.2
-1/8    2       1.59 mm    10.9-11.4      slow   3       14.4
-1/8    4       0.79 mm    10.9-22.8      none   3       20.8
-2/8    8       0.79 mm    10.9-22.8      none   6       41.6
-8/8    8       3.17 mm    10.9-10.9      slow   0       57.9
+coverage  rings   1/8" sweep        one pass reaches   passes
+Standard   20     10.2 deg/s              26%            4
+Fine       25     10.2 deg/s              30%            4
+Finest     31     10.2-11.4 deg/s         30%            4
+
+depth   one pass   passes
+1/8       26%         4
+2/8       13%         8
+4/8        7%        16
+8/8        3%        31
 ```
 
-The 7.2 min estimate for 1/8″ × 1 compares with a measured 5.9 min. The last
-real 1/8″ run delivered `actual_avg_depth_mm 1.53` against 3.175, which is the
-"too few passes" failure the endpoint now reports.
+**At the slowest sweep the nozzle can hold, one pass delivers about a quarter
+of a 1/8″ target.** The mechanism is roughly 4× too fast at its floor for this
+zone. No pass count fixes that well — 1/2″ would want 16 passes — and it is
+corroborated by the last real run: `actual_avg_depth_mm 1.53` against a 3.175
+target, 48 %, reported at the time as simply "completed".
+
+Note that finer coverage helps only slightly (26 % -> 30 %), and only through
+the smaller per-ring annulus. The large effect — closer rings overlapping so
+their depths add — is precisely what a pitch-tied footprint cannot represent.
+See "Open work".
 
 ## 6. Smaller path fixes
 
@@ -306,7 +345,8 @@ Still to do:
   schedule schema bump with an NVS migration, plus the HA package.
 - **Slow-sweep floor.** When the target needs a slower sweep than the motor can
   hold, Gentle / Smooth under-deliver and Serpentine / Sections command
-  sub-stall speeds (`min_continuous_dps` is 0 here). Pulse already escapes by
+  sub-stall speeds (`min_continuous_dps` was 0 here; b561 falls back to the
+  slowest measured speed, so this part is done). Pulse already escapes by
   dwelling. In order:
   1. Fall back to `deg_per_sec[0]` when the stored floor is ≤ 0.
   2. Run `phase_jog_pulse_cal()` so the pulse step is ~0.2° instead of ~3.9°.
