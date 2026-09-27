@@ -285,11 +285,10 @@ section{margin-bottom:18px;}
     <div id="depth-block">
       <div class="pick-lbl">Depth</div>
       <div class="pick-grid depth" id="depth-pick"></div>
-      <!-- b559: passes is a RUN property, like depth. Coverage (how close the
-           rings sit) belongs to the zone and lives in Zone Setup. Speed is
-           neither -- it is solved from depth, passes and the zone. -->
-      <div class="pick-lbl" style="margin-top:10px">Passes</div>
-      <div class="pick-grid depth" id="passes-pick"></div>
+      <!-- b561: no pass picker. The run always sweeps as slowly as the nozzle
+           can hold, which is what puts the most water down per pass, and the
+           pass count falls out of that rather than being guessed at. This
+           note says what the firmware solved. -->
       <div id="plan-note"></div>
     </div>
     <div id="path-row">
@@ -490,7 +489,6 @@ const MODE_HELP = {
   'd': '<b>Demo.</b> Max-speed sweep. Not tracked as watering.',
 };
 let selDepth = 1;
-let selPasses = 1;
 function buildDepthPicker(){
   const g = document.getElementById('depth-pick');
   if (!g || g.children.length) return;
@@ -506,34 +504,19 @@ function selDepthBtn(btn){
   refreshRunPlan();
 }
 
-// b559: how many passes to spread the depth over. More passes means each one
-// deposits less and so sweeps faster; fewer means a slower, heavier sweep.
-function buildPassesPicker(){
-  const g = document.getElementById('passes-pick');
-  if (!g || g.children.length) return;
-  g.innerHTML = [1,2,3,4,5,6,7,8].map(v =>
-    '<button class="pick' + (v === selPasses ? ' sel' : '') + '" data-passes="' + v + '" ' +
-    'onclick="selPassesBtn(this)">' + v + '</button>').join('');
-}
-function selPassesBtn(btn){
-  selPasses = +btn.dataset.passes;
-  document.querySelectorAll('#passes-pick .pick').forEach(b => b.classList.toggle('sel', b === btn));
-  saveModePrefs();
-  refreshRunPlan();
-}
-
-// Ask the firmware whether this depth/passes combination is actually
-// achievable. The clamp fails in both directions and used to fail silently --
-// a run would simply miss its target -- so the answer is shown as the pickers
-// move. The arithmetic stays on the device, where the pressure cal and speed
-// map live.
+// What the firmware will actually do with this depth on this zone: the sweep
+// speed it solved for, how many passes that needs, and how long. The clamp
+// used to fail silently in both directions -- a run would simply miss target
+// -- so the answer is shown as the depth moves, the same live-feedback
+// pattern the solution mL estimate uses. The arithmetic stays on the device,
+// where the pressure cal and speed map live.
 let _planSeq = 0;
 function refreshRunPlan(){
   const el = document.getElementById('plan-note');
   if (!el) return;
   if (selModeDat === 'c' || selModeDat === 'd') { el.textContent = ''; el.className = ''; return; }
   const seq = ++_planSeq;
-  fetch('/api/run_plan?zone=' + selZoneId + '&depth=' + selDepth + '&passes=' + selPasses,
+  fetch('/api/run_plan?zone=' + selZoneId + '&depth=' + selDepth,
         {cache:'no-store'})
     .then(r => r.json())
     .then(p => {
@@ -542,12 +525,11 @@ function refreshRunPlan(){
       const mins = p.est_min >= 1 ? Math.round(p.est_min) + ' min' : '< 1 min';
       if (p.clamp === 'none') {
         el.className = 'plan-ok';
-        el.textContent = 'About ' + mins + ' \u00b7 ' + p.per_pass_mm.toFixed(2) +
-                         ' mm per pass \u00b7 sweep ' + p.dps_min.toFixed(0) + '\u2013' +
-                         p.dps_max.toFixed(0) + '\u00b0/s';
+        el.textContent = 'One pass \u00b7 about ' + mins + ' \u00b7 sweep ' +
+                         p.dps_min.toFixed(0) + '\u2013' + p.dps_max.toFixed(0) + '\u00b0/s';
       } else {
         el.className = 'plan-warn';
-        el.textContent = p.advice;
+        el.textContent = p.advice + ' About ' + mins + ' total.';
       }
     })
     .catch(() => { el.textContent = ''; el.className = ''; });
@@ -570,18 +552,16 @@ function toggleModeHelp(){
   if (btn) btn.setAttribute('aria-expanded', on ? 'true' : 'false');
 }
 function saveModePrefs(){
-  try { localStorage.setItem('irrigoto_mode', JSON.stringify({mode:selModeDat, depth:selDepth, passes:selPasses})); } catch(_){}
+  try { localStorage.setItem('irrigoto_mode', JSON.stringify({mode:selModeDat, depth:selDepth})); } catch(_){}
 }
 function restoreModePrefs(){
   let p = {};
   try { p = JSON.parse(localStorage.getItem('irrigoto_mode') || '{}'); } catch(_){}
   if (MODE_HELP[p.mode]) selModeDat = p.mode;
   if (p.depth >= 1 && p.depth <= 8) selDepth = p.depth;
-  if (p.passes >= 1 && p.passes <= 8) selPasses = p.passes;
-  buildDepthPicker(); buildPassesPicker(); refreshRunPlan();
+  buildDepthPicker(); refreshRunPlan();
   document.querySelectorAll('#mode-pick .pick').forEach(b => b.classList.toggle('sel', b.dataset.mode === selModeDat));
   document.querySelectorAll('#depth-pick .pick').forEach(b => b.classList.toggle('sel', +b.dataset.depth === selDepth));
-  document.querySelectorAll('#passes-pick .pick').forEach(b => b.classList.toggle('sel', +b.dataset.passes === selPasses));
   applyModeVisibility();
 }
 
@@ -595,7 +575,6 @@ async function startWater(){
     body += '&duration=' + d;
   } else if (selModeDat !== 'd') {
     body += '&depth=' + selDepth;   // b535: eighths; Demo/Chase send none
-    body += '&passes=' + selPasses; // b559
   }
   try{
     const r=await fetch('/zone/water',{method:'POST',
@@ -637,7 +616,8 @@ let _zoneCache = {};
 function zonePathOpts(pass){
   return { mode: selModeDat, pass: pass|0,
            act_max_throw: (pathZone && pathZone.act_max_throw) || 10058,
-           act_min_throw: (pathZone && pathZone.act_min_throw) || 0 };
+           act_min_throw: (pathZone && pathZone.act_min_throw) || 0,
+           coverage: (pathZone && pathZone.coverage) | 0 };   // b561
 }
 function renderPathThumb(){
   const row = document.getElementById('path-row');
@@ -667,6 +647,7 @@ function openPathFull(){
     points: pathZone.points,
     act_max_throw: pathZone.act_max_throw, act_min_throw: pathZone.act_min_throw,
     mode: selModeDat, lockMode: true, depth8: selDepth,
+    coverage: (pathZone && pathZone.coverage) | 0,   // b564: draw the zone's real ring pitch
     title: pathZone.name || 'Zone',
   });
 }

@@ -19,6 +19,7 @@ had no .html source at all until they were re-extracted from the headers.
 """
 import re
 import shutil
+import os
 import subprocess
 import sys
 import tempfile
@@ -27,6 +28,36 @@ from pathlib import Path
 HERE = Path(__file__).parent          # html/ — .html sources
 OUT = HERE.parent                     # component root — *_html.h payloads
 WRAP = re.compile(r'R"([A-Z]+)\(\r?\n(.*)\)\1"', re.S)
+
+
+# b564: this check was silently skipped whenever node was absent, which on a
+# Mac without a JS toolchain is always -- so the guard the docstring below
+# describes had not actually run in a long time. macOS ships JavaScriptCore,
+# which parses the same language, so fall back to it rather than skipping.
+# Skipping quietly is how the b525 bug reached three units in the first place.
+_JSC = ("/System/Library/Frameworks/JavaScriptCore.framework"
+        "/Versions/A/Helpers/jsc")
+
+
+def js_checker():
+    """Return fn(path) -> error string or "", or None if nothing can check."""
+    if shutil.which("node"):
+        def _node(f):
+            r = subprocess.run(["node", "--check", str(f)],
+                               capture_output=True, text=True)
+            return "" if r.returncode == 0 else \
+                chr(10).join(r.stderr.strip().splitlines()[:4])
+        return _node
+    if os.path.exists(_JSC):
+        def _jsc(f):
+            # new Function() parses without executing -- we want syntax only.
+            probe = ("try { new Function(readFile(%r)); }"
+                     "catch (e) { print('ERR ' + e); }" % str(f))
+            r = subprocess.run([_JSC, "-e", probe], capture_output=True, text=True)
+            out = (r.stdout or "").strip()
+            return out[4:].strip() if out.startswith("ERR ") else ""
+        return _jsc
+    return None
 
 
 def js_syntax_check(html_path) -> list:
@@ -41,10 +72,10 @@ def js_syntax_check(html_path) -> list:
     escape in a confirm() string had become a REAL newline, which a JS string
     cannot span. Cheap to check, invisible until someone opens the page.
 
-    Returns a list of error strings; empty means clean. Skipped silently if
-    node isn't installed.
+    Returns a list of error strings; empty means clean.
     """
-    if shutil.which("node") is None:
+    chk = js_checker()
+    if chk is None:
         return []
     src = html_path.read_text(encoding="utf-8")
     errors = []
@@ -52,11 +83,9 @@ def js_syntax_check(html_path) -> list:
         for i, block in enumerate(re.findall(r"<script>(.*?)</script>", src, re.S)):
             f = Path(td) / f"{html_path.stem}_{i}.js"
             f.write_text(block, encoding="utf-8")
-            r = subprocess.run(["node", "--check", str(f)],
-                               capture_output=True, text=True)
-            if r.returncode != 0:
-                detail = chr(10).join(r.stderr.strip().splitlines()[:4])
-                errors.append(f"{html_path.name} <script> #{i}:{chr(10)}{detail}")
+            err = chk(f)
+            if err:
+                errors.append(f"{html_path.name} <script> #{i}:{chr(10)}{err}")
     return errors
 
 
@@ -67,14 +96,16 @@ def main() -> int:
         for err in js_syntax_check(html):
             print(f"JS SYNTAX ERROR -- {err}")
             fail = True
-    # b535: standalone .js files get the same check (node --check directly).
-    if shutil.which("node"):
+    # b535: standalone .js files get the same check.
+    chk = js_checker()
+    if chk is None:
+        print("WARNING: no JavaScript parser found (no node, no jsc) -- "
+              "the pages were NOT syntax-checked.")
+    else:
         for js in sorted(HERE.glob("*.js")):
-            r = subprocess.run(["node", "--check", str(js)],
-                               capture_output=True, text=True)
-            if r.returncode != 0:
-                print(f"JS SYNTAX ERROR -- {js.name}:{chr(10)}"
-                      + chr(10).join(r.stderr.strip().splitlines()[:4]))
+            err = chk(js)
+            if err:
+                print(f"JS SYNTAX ERROR -- {js.name}:{chr(10)}{err}")
                 fail = True
     if fail:
         print("Refusing to regenerate: fix the JavaScript first.")

@@ -510,6 +510,7 @@ function openPathPreview(){
     points: ST.points,
     act_max_throw: ST.act_max_throw, act_min_throw: ST.act_min_throw,
     mode: pathMode, lockMode: false, depth8: 1,
+    coverage: ST.coverage | 0,   // b564: draw the zone's real ring pitch
     title: document.getElementById('zone-name').value || 'Zone',
   });
 }
@@ -847,6 +848,7 @@ function drawPath(W, H, cx, cy, maxR) {
     mode: pathMode, pass: pathPass,
     act_max_throw: ST.act_max_throw || 10058,
     act_min_throw: ST.act_min_throw || 0,
+    coverage: ST.coverage | 0,     // b561: ring pitch follows the zone setting
   });
   const o = {cx: cx, cy: cy, maxR: maxR, scale_mm: _edScale()};
   IrrigotoPath.draw(ctx, geom, o);
@@ -1140,9 +1142,11 @@ const COV_NOTE = [
 ];
 async function setCoverage(v){
   _covEdited = true;
+  ST.coverage = v;      // b561: redraw the path at the new ring pitch at once
   paintCoverage(v);
+  draw();
   await doAct('set_coverage&v='+v);
-  toast('Coverage set \u2014 Save the zone to keep it');
+  toast('Coverage saved');
 }
 function paintCoverage(v){
   document.querySelectorAll('.covb').forEach(function(b){

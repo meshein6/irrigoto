@@ -287,6 +287,7 @@ function entryPathOpts(e){
   return { mode: String(SCHED_MODE_DIGIT[e.mode] || '1'), pass: 0,
            act_max_throw: z.act_max_throw || 10058,
            act_min_throw: z.act_min_throw || 0,
+           coverage: z.coverage | 0,   // b564: the zone's real ring pitch
            thumb: true };
 }
 // Schedule numbering (0 Pulse, 1 Gentle, 2 Smooth, 3 Serpentine) -> web digit.
@@ -301,6 +302,7 @@ function openEntryPreview(idx){
   IrrigotoPath.openPreview({
     points: z.points, act_max_throw: z.act_max_throw, act_min_throw: z.act_min_throw,
     mode: String(SCHED_MODE_DIGIT[e.mode] || '1'), lockMode: true, depth8: e.depth,
+    coverage: (z && z.coverage) | 0,   // b564: draw the zone's real ring pitch
     title: z.name || ('Zone ' + e.zone),
   });
 }
