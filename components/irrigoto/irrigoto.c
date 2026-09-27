@@ -10004,7 +10004,15 @@ static bool serpentine_glide_legs(const serpentine_leg_t *legs, int n,
     const float    MIN_SWEEP_DEG = 1.0f;  // below this a leg is radial
     const uint16_t V_CHASE_DUTY  = 220;
     const uint16_t V_MIN_DUTY    = 70;
-    const float    V_TOL_DEG     = 0.8f;
+    // b585: 0.8 -> 0.20 deg. The ring ladder commands valve moves of
+    // 0.43-0.97 deg between consecutive rings on this zone, so a 0.8 deg
+    // tolerance swallowed 13 of 19 of them -- the chase said "already within
+    // tolerance", the valve never moved, and consecutive rings swept at the
+    // SAME physical distance. That is the reported "goes back and forth at
+    // the same distance" and "distances aren't adjusting granularly". The
+    // encoder resolves 360/4096 = 0.088 deg, so 0.20 is about 2.3 counts:
+    // tight, but comfortably inside the smallest step we need to make.
+    const float    V_TOL_DEG     = 0.20f;
     // b576: the chase eases duty down to V_MIN_DUTY as it nears the target,
     // and V_MIN_DUTY is 70 -- the exact duty this codebase records the valve
     // STALLING at ("Frontyard f9e994 stalls at duty 70", b521). So the last
@@ -10018,15 +10026,27 @@ static bool serpentine_glide_legs(const serpentine_leg_t *legs, int n,
     // encoder movement, lasts V_NUDGE_MS, and at most V_NUDGE_MAX per leg, so
     // a genuinely jammed valve still falls through to the existing fault
     // paths rather than being hammered.
-    const uint32_t V_STUCK_MS    = 150;    // no encoder movement for this long
+    // b585: harder and sooner. Sub-degree ring steps are exactly where
+    // static friction dominates -- there is no run-up to build momentum -- so
+    // a gentle nudge just dwells at stall. Still bounded, so a genuinely
+    // jammed valve reaches the existing fault paths instead of being hammered.
+    const uint32_t V_STUCK_MS    = 90;     // 150 -> 90: react before it settles
     const uint32_t V_NUDGE_MS    = 100;    // owner-specified pulse width
-    const uint16_t V_NUDGE_DUTY  = 320;    // enough to break stiction
-    const int      V_NUDGE_MAX   = 6;
+    const uint16_t V_NUDGE_DUTY  = 420;    // 320 -> 420
+    const int      V_NUDGE_MAX   = 10;     // 6 -> 10: more small steps per leg
     float      v_seen_pos   = -1.0f;       // encoder angle at last movement
     TickType_t v_seen_tick  = 0;
     TickType_t v_nudge_end  = 0;
     int        v_nudges     = 0;
-    const float    V_DECEL_DEG   = 4.0f;
+    // b585: 4.0 -> 1.0 deg. Deceleration starting 4 deg out meant a
+    // sub-degree ring step spent its ENTIRE travel inside the easing ramp,
+    // which works out to duty ~76 -- the duty b521 records this valve
+    // stalling at. So even the steps that cleared the old tolerance were
+    // attempted too gently to move.
+    const float    V_DECEL_DEG   = 1.0f;
+    // And the ramp floor is raised off the stall threshold. V_MIN_DUTY (70)
+    // is kept for other uses; the chase never eases below this.
+    const uint16_t V_EASE_FLOOR  = 140;
     const float    V_LAG_DEG     = 5.0f;
     const float    V_NOM_DPS     = 8.0f;  // timeout estimates only
     const uint32_t TICK_MS       = 30;
@@ -10283,8 +10303,8 @@ static bool serpentine_glide_legs(const serpentine_leg_t *legs, int n,
                 if (v_abs < V_DECEL_DEG) {
                     float t    = v_abs / V_DECEL_DEG;
                     float ease = 0.5f * (1.0f - cosf((float)M_PI * t));
-                    vd = (uint16_t)((float)V_MIN_DUTY
-                            + ease * (float)(V_CHASE_DUTY - V_MIN_DUTY));
+                    vd = (uint16_t)((float)V_EASE_FLOOR
+                            + ease * (float)(V_CHASE_DUTY - V_EASE_FLOOR));
                 } else {
                     vd = V_CHASE_DUTY;
                 }
