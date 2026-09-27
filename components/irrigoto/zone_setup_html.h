@@ -1004,12 +1004,15 @@ function applyState(s){
   document.getElementById('btn-dn').classList.toggle('at-limit', !!s.at_min);
   document.getElementById('btn-up').classList.toggle('at-limit', !!s.at_max);
   const limHint = s.at_min ? ' MIN' : s.at_max ? ' MAX' : '';
-  // b553: while an arrow is held, show the COMMANDED distance. The hold-repeat
-  // path skips the pressure settle on purpose, so every reading that comes back
-  // mid-hold is a transient sample and the number jumped around under the
-  // thumb. Releasing triggers the settle fetch, which shows what is actually
-  // being delivered.
-  const shownFt = (_hActive && typeof s.cmd_throw_ft === 'number')
+  // b554: the readout is the COMMANDED distance, always -- this is a setpoint
+  // control, and the setpoint does not move on its own. It used to show the
+  // measured throw whenever the water was on, re-derived from a fresh pressure
+  // sample on every 900 ms poll, so the number wobbled continuously with sensor
+  // noise and supply ripple even when nothing had been touched. Since b553 the
+  // firmware corrects once onto the dialed distance at water-on, so commanded
+  // and measured agree; the measured value still drives the radar dot and the
+  // spray trail, and still backs the turn-on correction.
+  const shownFt = (typeof s.cmd_throw_ft === 'number' && s.cmd_throw_ft > 0)
                   ? s.cmd_throw_ft : s.throw_ft;
   document.getElementById('v-throw').textContent = shownFt.toFixed(1)+'ft'+limHint;
   document.getElementById('btn-trim').classList.toggle('water-off', !s.water);
