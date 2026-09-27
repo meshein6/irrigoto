@@ -9511,10 +9511,54 @@ static int serpentine_build_pass_plan(
                 }
             }
         }
-        if (n_lobes > 1)
-            INFO("Serpentine: section-by-section, %d lobe(s)", n_lobes);
-        else
+        // b575: order the lobes by how far OUT they reach, not by bearing.
+        //
+        // serpentine_arc_bounds returns arcs sorted by CW distance from
+        // zone_arc_start, so the lobe list was in bearing order and the run
+        // started with whichever lobe happened to come first round the
+        // circle. On the measured zone that is the 260-340 deg lobe, which
+        // only reaches out to ring 19, so the run began mid-distance, worked
+        // inward to ring 31, then jumped to the 80-100 deg lobe and started
+        // again from ring 1 -- the outermost ring in the zone. Each lobe was
+        // correctly outer->inner; the lobes were in the wrong order, and from
+        // the yard it reads as starting in the middle and jumping about.
+        //
+        // Sort by the extreme ring in the direction this pass travels, so an
+        // out->in pass starts at the globally outermost ring and an in->out
+        // pass starts at the innermost.
+        if (n_lobes > 1) {
+            int lobe_edge[WATER_MAX_ARCS_PER_RING];
+            for (int L = 0; L < n_lobes; L++)
+                lobe_edge[L] = out_to_in ? WATER_RUN_MAX_RINGS : -1;
+            for (int ring = 0; ring < num_rings && ring < WATER_RUN_MAX_RINGS; ring++) {
+                if (skip[ring]) continue;
+                int na0 = serpentine_arc_bounds(zone, have_zone, ring_throws[ring],
+                              sector_throw, act_max_throw, zone_arc_start,
+                              zone_arc_end, zone_arc_deg, tl, th);
+                for (int a = 0; a < na0; a++)
+                    for (int L = 0; L < n_lobes; L++)
+                        if (serp_arc_overlaps(tl[a], th[a], lobe_lo[L], lobe_hi[L])) {
+                            if (out_to_in) { if (ring < lobe_edge[L]) lobe_edge[L] = ring; }
+                            else           { if (ring > lobe_edge[L]) lobe_edge[L] = ring; }
+                            break;   // lowest-index lobe wins, as in the sweep loop
+                        }
+            }
+            for (int a = 0; a < n_lobes - 1; a++)
+                for (int b = a + 1; b < n_lobes; b++) {
+                    bool swap = out_to_in ? (lobe_edge[b] < lobe_edge[a])
+                                          : (lobe_edge[b] > lobe_edge[a]);
+                    if (swap) {
+                        int ei = lobe_edge[a]; lobe_edge[a] = lobe_edge[b]; lobe_edge[b] = ei;
+                        float f = lobe_lo[a]; lobe_lo[a] = lobe_lo[b]; lobe_lo[b] = f;
+                        f = lobe_hi[a];       lobe_hi[a] = lobe_hi[b]; lobe_hi[b] = f;
+                    }
+                }
+            INFO("Serpentine: section-by-section, %d lobe(s); order by reach: "
+                 "%s ring %d first", n_lobes,
+                 out_to_in ? "outermost" : "innermost", lobe_edge[0] + 1);
+        } else {
             sections = false;   // single lobe: ring-major already never crosses
+        }
     }
 
     int  prev_sec = -1;   // b541: which section the last emitted arc belonged to
@@ -10616,20 +10660,91 @@ static void water_serpentine_passes(
     memset(s_serp_prev_cum, 0, sizeof(s_serp_prev_cum));
     serp_ff_reset();   // b513: cache the cal table, forget stale supply samples
 
+    // b575: THE PASS SCHEDULE IS DECIDED HERE, BEFORE ANY WATER FLOWS.
+    //
+    // It used to be decided pass by pass from measured depth
+    // (depth_ok = cumulative_depth[i] >= depth_mm), which meant the run was
+    // unknowable in advance: which rings appeared in pass 2, how many passes
+    // there would be, and how long it would take were all consequences of
+    // what earlier passes measured. Nothing could be previewed past pass 1
+    // and nothing could be estimated except from history.
+    //
+    // Now each ring's pass count comes from the same arithmetic the planner
+    // and the preview use: what one sweep deposits at the speed the solver
+    // will command, and how many of those it takes to reach target.
+    //
+    //   dps  = serpentine_ring_dps(...)          the speed that will be used
+    //   d1   = nozzle_precip_depth_mm(..., dps)  what one sweep deposits
+    //   n    = ceil(target / d1)                 passes that ring needs
+    //
+    // Both functions are the ones the executor itself uses, so the schedule
+    // cannot disagree with what happens. Measurement continues and is still
+    // logged and reported -- it just no longer changes the plan.
+    uint8_t plan_passes[WATER_RUN_MAX_RINGS];
+    int     plan_max_passes = 1;
+    {
+        float _tl[WATER_MAX_ARCS_PER_RING], _th[WATER_MAX_ARCS_PER_RING];
+        for (int i = 0; i < WATER_RUN_MAX_RINGS; i++) plan_passes[i] = 0;
+        for (int i = 0; i < num_rings && i < WATER_RUN_MAX_RINGS; i++) {
+            if (ring_unwaterable[i]) continue;
+            float ro = ring_throws[i];
+            float ri = (i == num_rings - 1) ? ro * 0.92f : ring_throws[i + 1];
+            int na = serpentine_arc_bounds(zone, have_zone, ro, sector_throw,
+                         act_max_throw, zone_arc_start, zone_arc_end,
+                         zone_arc_deg, _tl, _th);
+            if (na == 0) continue;
+            float active = 0.0f;
+            for (int a = 0; a < na; a++)
+                active += fmodf(_th[a] - _tl[a] + 360.0f, 360.0f);
+            if (active < 0.5f) continue;
+            float dps = (serpentine_dps > 0.0f) ? serpentine_dps
+                      : serpentine_ring_dps(ro, ri, active, depth_mm, spd, have_spd);
+            float psi = cal_throw_to_psi(ro) * pressure_scale;
+            float d1  = nozzle_precip_depth_mm(ro, ri, dps, psi);
+            int   n1  = (d1 > 0.0005f) ? (int)ceilf(depth_mm / d1) : 1;
+            if (n1 < 1) n1 = 1;
+            if (n1 > passes) n1 = passes;   // the caller's cap is the backstop
+            plan_passes[i] = (uint8_t)n1;
+            if (n1 > plan_max_passes) plan_max_passes = n1;
+        }
+        INFO("Serpentine plan: %d pass(es) scheduled up front for %.2f mm "
+             "target (deterministic -- measurement no longer re-plans)",
+             plan_max_passes, depth_mm);
+        for (int i0 = 0; i0 < num_rings && i0 < WATER_RUN_MAX_RINGS; i0 += 12) {
+            char _b[200]; int _o = 0;
+            for (int i = i0; i < i0 + 12 && i < num_rings
+                             && i < WATER_RUN_MAX_RINGS; i++) {
+                int _n = snprintf(_b + _o, sizeof(_b) - _o, " r%d=%u",
+                                  i + 1, (unsigned)plan_passes[i]);
+                if (_n < 0 || _n >= (int)(sizeof(_b) - _o)) break;
+                _o += _n;
+            }
+            INFO("Serpentine plan passes/ring [%d-%d]:%s", i0 + 1, i0 + 12, _b);
+        }
+    }
+    if (plan_max_passes < passes) passes = plan_max_passes;   // run as many as needed
+
     for (int pass = 0; pass < passes; pass++) {
         bool skip[WATER_RUN_MAX_RINGS];
         int  todo = 0;
         for (int i = 0; i < num_rings && i < WATER_RUN_MAX_RINGS; i++) {
-            bool depth_ok = (pass > 0 && cumulative_depth[i] >= depth_mm);
+            // b575: from the schedule, not from measured depth.
+            bool depth_ok = (plan_passes[i] > 0) ? (pass >= plan_passes[i])
+                                                 : true;
             if (depth_ok && !ring_unwaterable[i]) {
                 water_ring_data_t *r = &s_last_water_run.rings[i];
                 if (r->throw_mm > 100.0f && r->actual_throw_mm > 100.0f) {
                     float ratio = r->actual_throw_mm / r->throw_mm;
+                    // b575: report, do not re-plan. Re-firing a ring because
+                    // its MEASURED throw came up short is the same
+                    // measurement-driven re-planning that made the run
+                    // unknowable. The deviation still matters -- it says the
+                    // throw cal is off for that ring -- so it is logged only.
                     if (ratio >= 0.75f && ratio < 0.90f && throw_retries[i] < 3) {
                         throw_retries[i]++;
-                        depth_ok = false;   // re-fire for throw convergence
-                        INFO("Serpentine ring %d: depth ok but throw %.2fx -- "
-                             "re-fire %u/3", i + 1, ratio, throw_retries[i]);
+                        INFO("Serpentine ring %d: throw %.2fx of target "
+                             "(plan unchanged -- recalibrate if persistent)",
+                             i + 1, ratio);
                     }
                 }
             }
@@ -10686,27 +10801,29 @@ static void water_serpentine_passes(
                     continue;
                 bool _under = r->actual_throw_mm < r->throw_mm;
                 if (_under && r->avg_psi < psi_min) continue;   // cold-start
+                // b575: corr shifted each ring's VALVE ANGLE between passes
+                // from its measured throw, so pass 2 swept a different radius
+                // than pass 1 -- the planned path was not the path that ran.
+                // The plan is authoritative now: corr stays 1.0 and the
+                // correction it would have made is logged, so a ring whose
+                // throw is consistently off gets fixed in calibration instead
+                // of silently mid-run.
                 float new_corr = fmaxf(0.5f, fminf(1.6f,
                                        r->throw_mm / r->actual_throw_mm));
-                float old_corr = corr[i];
-                corr[i] = old_corr * 0.6f + new_corr * 0.4f;
-                if (fabsf(corr[i] - 1.0f) > 0.05f)
-                    INFO("  Serpentine ring %d corr %.3f->%.3f (%.0f->%.0fmm, psi %.2f)",
-                         i + 1, old_corr, corr[i],
-                         r->throw_mm, r->actual_throw_mm, r->avg_psi);
+                // Report against new_corr, not corr[i] -- corr[i] is held at
+                // 1.0 now, so testing it would silence the very deviation
+                // this line exists to surface.
+                if (fabsf(new_corr - 1.0f) > 0.05f)
+                    INFO("  Serpentine ring %d throw %.0f->%.0fmm (psi %.2f) "
+                         "-- would have corrected x%.3f, plan held",
+                         i + 1, r->throw_mm, r->actual_throw_mm,
+                         r->avg_psi, new_corr);
             }
-            // Pass 0: un-credit rings whose water landed in the wrong ring
-            // (smooth's seed gate -- |corr-1| > 0.20 means the deposit
-            // geometry was off by more than a ring's worth).
-            if (pass == 0) {
-                for (int i = 0; i < num_rings && i < WATER_RUN_MAX_RINGS; i++) {
-                    if (fabsf(corr[i] - 1.0f) > 0.20f && cumulative_depth[i] > 0.0f) {
-                        INFO("  Serpentine ring %d: pass 0 depth not credited (corr %.3f)",
-                             i + 1, corr[i]);
-                        cumulative_depth[i] = 0.0f;
-                    }
-                }
-            }
+            // b575: the pass-0 un-credit is gone with corr. It discarded
+            // depth whose deposit geometry looked off by more than a ring's
+            // worth -- another measurement changing the run. The schedule no
+            // longer depends on credited depth, so there is nothing to
+            // un-credit.
         }
 
         // Per-ring cumulative depth dump (catch-cup aid, smooth's format;
