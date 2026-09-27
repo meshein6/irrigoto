@@ -152,6 +152,62 @@
     return spans.filter(function (s) { return s.span >= 0.5; });
   }
 
+  /* Max ray-polygon intersection distance at a bearing -- the zone's extent
+   * there. Mirrors water_perimeter_throw() in irrigoto.c. */
+  function perimExtent(pts, bearing) {
+    var bs = Math.sin(bearing * Math.PI / 180), bc = Math.cos(bearing * Math.PI / 180), best = 0;
+    for (var i = 0; i < pts.length; i++) {
+      var j = (i + 1) % pts.length, pi = pts[i], pj = pts[j];
+      var x1 = pi.throw_mm * Math.sin(pi.deg * Math.PI / 180),
+          y1 = pi.throw_mm * Math.cos(pi.deg * Math.PI / 180),
+          x2 = pj.throw_mm * Math.sin(pj.deg * Math.PI / 180),
+          y2 = pj.throw_mm * Math.cos(pj.deg * Math.PI / 180);
+      var dx = x2 - x1, dy = y2 - y1, det = bc * dx - bs * dy;
+      if (Math.abs(det) < 1e-6) continue;
+      var sD = (dx * y1 - dy * x1) / det, u = (bs * y1 - bc * x1) / det;
+      if (sD > 0.5 && u >= 0 && u <= 1 && sD > best) best = sD;
+    }
+    return best;
+  }
+
+  /* The turn between two arcs, for Serpentine and Sections.
+   *
+   * b550: the preview used to draw nothing here, or a grey dotted radial
+   * line, and that is why Serpentine looked like "a different path approach
+   * entirely" next to the real thing. The firmware never shuts the stream
+   * off at a turn (serpentine_build_pass_plan, b426): when the direct glide
+   * would leave the polygon, the path rides just inside the boundary
+   * instead, watering the whole way. Those boundary-hug waypoints are the
+   * majority of the legs in a real plan, so leaving them out of the picture
+   * left out most of the path.
+   *
+   * Mirrors the firmware exactly: ~4 deg waypoints, radius clamped to
+   * min(linear glide, perimeter extent - 200 mm), each one point-in-polygon
+   * verified. A single failure means a true exclusion, and the whole turn
+   * falls back to the firmware's dry hop.
+   */
+  var TURN_STEP_DEG = 4.0, TURN_MARGIN_MM = 200.0, TURN_MAX_WPS = 64;
+
+  function buildTurn(pts, fromB, fromR, toB, toR, turnFloor) {
+    var d = toB - fromB;
+    while (d >  180) d -= 360;
+    while (d < -180) d += 360;
+    var nw = Math.floor(Math.abs(d) / TURN_STEP_DEG) + 1;
+    if (nw > TURN_MAX_WPS) nw = TURN_MAX_WPS;
+    var wps = [];
+    for (var wi = 1; wi <= nw; wi++) {
+      var f = wi / nw;
+      var b = ((fromB + d * f) % 360 + 360) % 360;
+      var r = fromR + (toR - fromR) * f;
+      var ext = perimExtent(pts, b) - TURN_MARGIN_MM;
+      if (ext < r) r = ext;
+      if (!pointInZone(pts, b, r)) r -= TURN_MARGIN_MM;   /* one nudge inward */
+      if (r < turnFloor || !pointInZone(pts, b, r)) return { wet: false };
+      wps.push({ deg: b, r: (wi === nw) ? toR : r });
+    }
+    return { wet: true, wps: wps };
+  }
+
   /* Visit order and sweep direction per mode.
    *
    * This corrects a mismatch in the old drawPath, which alternated direction

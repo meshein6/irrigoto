@@ -5414,8 +5414,10 @@ static bool valve_goto_direct(float target_deg, float tolerance_deg,
 #endif
 #define VALVE_JOG_MAX_PULSES 60     // safety cap
 
-static bool valve_goto_jog(float target_deg, float tolerance_deg,
-                            uint32_t timeout_ms)
+// b550: allow_overshoot=false keeps the pulsed, encoder-checked precision but
+// skips the snap-through excursion. See valve_goto_interactive() below.
+static bool valve_goto_jog_ex(float target_deg, float tolerance_deg,
+                               uint32_t timeout_ms, bool allow_overshoot)
 {
     const float DEG_PER_COUNT = 360.0f / 4096.0f;
 
@@ -5434,7 +5436,7 @@ static bool valve_goto_jog(float target_deg, float tolerance_deg,
     // If below target: overshoot to VALVE_FRICTION_HI + 2 deg to complete
     // the hydraulic snap-through, then jog closing to target.
     // If already above target: jog closing directly -- no overshoot needed.
-    bool need_overshoot = (pos < target_deg - 0.5f);
+    bool need_overshoot = allow_overshoot && (pos < target_deg - 0.5f);
     if (need_overshoot) {
         float overshoot = VALVE_FRICTION_HI + 2.0f;  // past snap-through point
         valve_goto_direct(overshoot, 2.0f, timeout_ms / 2, false);
@@ -5521,6 +5523,37 @@ static bool valve_goto_jog(float target_deg, float tolerance_deg,
 // Is a given valve target angle in the hydrodynamic resistance zone?
 static inline bool valve_in_friction_zone(float deg) {
     return (deg >= VALVE_FRICTION_LO && deg <= VALVE_FRICTION_HI);
+}
+
+static bool valve_goto_jog(float target_deg, float tolerance_deg,
+                            uint32_t timeout_ms)
+{
+    return valve_goto_jog_ex(target_deg, tolerance_deg, timeout_ms, true);
+}
+
+// b550: valve positioning for the zone-setup d-pad.
+//
+// Same pulsed, encoder-checked stepping the watering run uses inside the
+// hydrodynamic zone -- so the motor still doesn't stall-kick its way through
+// it, which matters more on a high-pressure supply, not less -- but without
+// the approach-from-above excursion. That excursion drives the valve to
+// VALVE_FRICTION_HI + 2 (~13 ft of throw on this unit) and waits 300 ms
+// before closing onto the target, and it fired on every upward press of the
+// d-pad: the reported burst high and back.
+//
+// It is NOT conditional on supply_regulated. The resistance it compensates
+// for is water pressure on the partially-open ball face, which grows with
+// supply pressure, so a regulated municipal line needs it at least as much
+// as a well does. What makes it wrong here is that this is an interactive
+// control: the user is watching the stream and correcting by eye, so a few
+// tenths of a foot of position error costs nothing and a 13 ft excursion
+// across the yard costs everything. Watering runs keep the excursion.
+static bool valve_goto_interactive(float target_deg, float tolerance_deg,
+                                    uint32_t timeout_ms)
+{
+    if (valve_in_friction_zone(target_deg))
+        return valve_goto_jog_ex(target_deg, tolerance_deg, timeout_ms, false);
+    return valve_goto_direct(target_deg, tolerance_deg, timeout_ms, false);
 }
 
 static bool valve_goto_ex(float target_deg, float tolerance_deg,
@@ -7233,6 +7266,38 @@ static float cal_get_min_throw_mm(void)
     return WATER_MIN_THROW_MM;  // fallback
 }
 
+// b550: the lowest valve angle the throw calibration actually covers.
+// Below it cal_valve_deg_to_throw_mm() just clamps to the table's first
+// throw, so stepping further only walks the valve into an uncalibrated dead
+// zone -- and once past VALVE_CAL_START_DEG the readout snapped to 0, which
+// is not a distance. The d-pad now stops here instead, at the real minimum.
+static float cal_get_min_valve_deg(void)
+{
+    pressure_map_t c = {0};
+    if (cal_load_primary(&c) == ESP_OK && c.num_points > 0) {
+        float mn = 9999.0f;
+        for (int i = 0; i < c.num_points; i++)
+            if (c.throw_mm[i] > 100.0f && c.valve_deg[i] < mn)
+                mn = c.valve_deg[i];
+        if (mn < 9000.0f) return mn;
+    }
+    return VALVE_CAL_START_DEG;   // no cal: fall back to the pressure threshold
+}
+
+// b550: the angle below which the zone readout should say 0 ft.
+//
+// This was VALVE_CAL_START_DEG -- "pressure begins rising here" -- but on
+// this unit that lands at 334.97 while the throw calibration's lowest
+// MEASURED point is valve 333.28 = 494 mm = 1.62 ft. Anything the user
+// dialled into that 1.7 deg sliver read as 0 ft, which is not a distance and
+// is not what the calibration says. The floor is whichever is lower: a
+// distance the cal actually measured is a real distance, so show it.
+static float zone_display_floor_deg(void)
+{
+    float cal_lo = cal_get_min_valve_deg();
+    return (cal_lo < VALVE_CAL_START_DEG) ? cal_lo : VALVE_CAL_START_DEG;
+}
+
 static float water_perimeter_throw(const zone_perimeter_t *z,
                                    float bearing_deg,
                                    float psi_min, float psi_max)
@@ -7705,12 +7770,34 @@ static bool nozzle_sweep_pulse(
         as5600_read(ADDR_AS5600, &n_raw_b, NULL, NULL);
         float pos_before = n_raw_b * (360.0f / 4096.0f);
 
+        // b550: shorten the final pulse so the sweep lands ON the arc bound
+        // instead of sailing past it. The loop condition only asks whether
+        // 0.3 deg remains, but a pulse is a fixed shove: with the default
+        // cal (jog_pulse_duty/ms unset -> duty 200 for 80 ms, ~49 dps) that
+        // shove is ~3.9 deg, so every arc used to finish up to ~3.6 deg
+        // outside the polygon with the valve still open -- about 200 mm past
+        // the boundary at a 3.2 m throw, on every arc end, in both
+        // directions. Visible as the stream stepping over the zone edge.
+        uint32_t this_ms = pulse_ms;
+        if (deg_per_pulse > 0.1f) {
+            float frac = (arc_deg - progress) / deg_per_pulse;
+            if (frac < 1.0f) {
+                // Below roughly a third of a pulse the motor won't break
+                // static friction, so a scaled pulse would just stall three
+                // times and log a false stall. Stop instead: a sub-degree
+                // shortfall is invisible, an overshoot waters the path.
+                if (frac < 0.35f) break;
+                this_ms = (uint32_t)(pulse_ms * frac);
+                if (this_ms < 15) this_ms = 15;
+            }
+        }
+
         // Fire pulse
         mcpwm_comparator_set_compare_value(n_cmpr, pulse_duty);
-        vTaskDelay(pdMS_TO_TICKS(pulse_ms));
+        vTaskDelay(pdMS_TO_TICKS(this_ms));
         mcpwm_comparator_set_compare_value(n_cmpr, 0);
         vTaskDelay(pdMS_TO_TICKS(SETTLE_MS));
-        elapsed += pulse_ms + SETTLE_MS;
+        elapsed += this_ms + SETTLE_MS;
 
         uint16_t n_raw_a = 0;
         as5600_read(ADDR_AS5600, &n_raw_a, NULL, NULL);
@@ -7728,14 +7815,18 @@ static bool nozzle_sweep_pulse(
             continue;
         }
         stall_count = 0;
-        deg_per_pulse = (deg_per_pulse < 0.1f)
-            ? delta : (0.8f*deg_per_pulse + 0.2f*delta);
+        // Only learn the pulse size from full-length pulses -- a deliberately
+        // shortened final pulse would drag the estimate down and make the
+        // next arc's last pulse overshoot again.
+        if (this_ms == pulse_ms)
+            deg_per_pulse = (deg_per_pulse < 0.1f)
+                ? delta : (0.8f*deg_per_pulse + 0.2f*delta);
         progress += delta;
 
         // Dwell so total time per step = delta / target_dps
         float   step_ms_ideal = delta / target_dps * 1000.0f;
         int32_t dwell_ms      = (int32_t)step_ms_ideal
-                              - (int32_t)(pulse_ms + SETTLE_MS);
+                              - (int32_t)(this_ms + SETTLE_MS);
 
         // Pressure P-control: nudge valve to maintain target_psi.
         // Valve uses GPIO (not MCPWM) so no conflict with nozzle timer.
@@ -14869,8 +14960,8 @@ static int zone_build_json(char *buf, int maxlen)
         throw_mm = s_web_meas_throw_mm;         // fallback: cached if PSI read failed
     } else if (s_web_valve_deg < 0.0f) {
         throw_mm = cal_get_max_throw_mm();      // initial preview: water_toggle opens to max
-    } else if (s_web_valve_deg < VALVE_CAL_START_DEG) {
-        throw_mm = 0.0f;                        // valve at closed position -- water is off
+    } else if (s_web_valve_deg < zone_display_floor_deg()) {
+        throw_mm = 0.0f;                        // genuinely shut -- below any measured point
     } else {
         throw_mm = cal_valve_deg_to_throw_mm(s_web_valve_deg);  // manual valve position
     }
@@ -14884,8 +14975,14 @@ static int zone_build_json(char *buf, int maxlen)
     //   - water-off used to park the setpoint at VALVE_CLOSED_DEG, so the down
     //     arrow was orange the entire time the water was off.
     bool at_min = (s_web_valve_deg >= 0.0f &&
-                   s_web_valve_deg <= VALVE_CLOSED_DEG + ZONE_WEB_VALVE_STEP_DEG);
-    bool at_max = (s_web_valve_deg >= VALVE_OPEN_DEG - ZONE_WEB_VALVE_STEP_DEG);
+                   s_web_valve_deg <= cal_get_min_valve_deg() + ZONE_WEB_VALVE_STEP_DEG);
+    // b550: symmetric with at_min -- the top stop is the calibrated maximum
+    // throw, not VALVE_OPEN_DEG. On this unit the valve frame says fully open
+    // is 381.6 deg while the throw cal ends at 369.6, so the up arrow never
+    // lit even sitting at the real maximum the d-pad can reach.
+    float cal_hi_deg = cal_throw_to_valve_deg(cal_get_max_throw_mm());
+    if (cal_hi_deg <= 0.0f || cal_hi_deg > VALVE_OPEN_DEG) cal_hi_deg = VALVE_OPEN_DEG;
+    bool at_max = (s_web_valve_deg >= cal_hi_deg - ZONE_WEB_VALVE_STEP_DEG);
 
     // b406: up to ZONE_MAX_PERIM_POINTS(36) points * ~56 bytes + brackets.
     // The old 1536 truncated Patio's 32 points mid-object (invalid JSON).
@@ -15018,6 +15115,21 @@ static esp_err_t zone_act_handler(httpd_req_t *req)
           if (d >= 0.25f && d <= 2.0f) step_deg = d;
       } }
 
+    // b550: &ft= steps by DISTANCE instead, which is what the d-pad now
+    // sends. Stepping the valve by a fixed angle was the cause of "really
+    // pulsy when increasing fast, goes full strength out of nowhere": the
+    // throw curve on this unit runs 58 mm/deg at the bottom and 552 mm/deg
+    // around 13 ft, so one angular step moved the stream 0.2 ft down low and
+    // 1.8 ft in the middle, and the whole usable range is only 36 deg. In
+    // feet the control is uniform end to end, and the valve automatically
+    // creeps through the steep part of the curve.
+    float step_ft = 0.0f;
+    { char ft_str[12] = "";
+      if (httpd_query_key_value(query, "ft", ft_str, sizeof(ft_str)) == ESP_OK) {
+          float f = strtof(ft_str, NULL);
+          if (f >= 0.05f && f <= 3.0f) step_ft = f;
+      } }
+
     if (s_ota_in_progress) {
         httpd_resp_set_type(req, "application/json");
         httpd_resp_sendstr(req, "{\"error\":\"ota_in_progress\"}");
@@ -15038,6 +15150,35 @@ static esp_err_t zone_act_handler(httpd_req_t *req)
     motor_rail_on();
     adc_setup();
 
+    // b550: the d-pad's lower stop. Was VALVE_CLOSED_DEG, which let the
+    // setpoint walk ~40 deg below the throw calibration -- the readout
+    // clamped at the table's first throw for a while and then snapped to 0.
+    const float zone_floor_deg = cal_get_min_valve_deg();
+
+    // One step of the d-pad, in whichever unit the client asked for.
+    // up = +1 / down = -1. Returns the new valve angle, already clamped to
+    // the calibrated span.
+    float (*const _unused)(void) = NULL; (void)_unused;
+    #define ZONE_STEP_VALVE(_dir) do {                                        \
+        if (s_web_valve_deg < zone_floor_deg) s_web_valve_deg = zone_floor_deg;\
+        if (step_ft > 0.0f) {                                                 \
+            float _cur = cal_valve_deg_to_throw_mm(s_web_valve_deg);          \
+            float _tgt = _cur + (_dir) * step_ft * 304.8f;                    \
+            float _lo  = cal_get_min_throw_mm(), _hi = cal_get_max_throw_mm();\
+            if (_tgt < _lo) _tgt = _lo;                                       \
+            if (_tgt > _hi) _tgt = _hi;                                       \
+            float _vd = cal_throw_to_valve_deg(_tgt);                         \
+            /* No usable cal: fall back to the angular step rather than
+               freezing the control. */                                       \
+            s_web_valve_deg = (_vd > 0.0f) ? _vd                              \
+                                           : s_web_valve_deg + (_dir) * step_deg; \
+        } else {                                                              \
+            s_web_valve_deg += (_dir) * step_deg;                             \
+        }                                                                     \
+        if (s_web_valve_deg < zone_floor_deg) s_web_valve_deg = zone_floor_deg;\
+        if (s_web_valve_deg > VALVE_OPEN_DEG) s_web_valve_deg = VALVE_OPEN_DEG;\
+    } while (0)
+
     if (strcmp(cmd, "nozzle_cw") == 0) {
         uint16_t r = 0;
         as5600_read(ADDR_AS5600, &r, NULL, NULL);
@@ -15056,12 +15197,21 @@ static esp_err_t zone_act_handler(httpd_req_t *req)
 
     } else if (strcmp(cmd, "pres_up") == 0) {
         // Open-loop: step valve angle up, then read PSI to derive throw
-        if (s_web_valve_deg < VALVE_CLOSED_DEG)
-            s_web_valve_deg = VALVE_CAL_START_DEG;   // first press: start at pressure threshold
-        s_web_valve_deg += step_deg;
-        if (s_web_valve_deg > VALVE_OPEN_DEG) s_web_valve_deg = VALVE_OPEN_DEG;
+        ZONE_STEP_VALVE(+1);
         if (s_web_water) {
-            valve_goto_ex(s_web_valve_deg, 2.0f, 8000, false, 1);
+        // b550: DIRECT, not valve_goto_ex. Any target in the friction zone
+        // (~1.6 to 10.5 ft on this unit) routes valve_goto_ex to
+        // valve_goto_jog, which on an opening move first drives the valve to
+        // VALVE_FRICTION_HI + 2 (~13.1 ft of throw), waits 300 ms, and only
+        // then jogs closed onto the target. That snap-through exists so a
+        // WATERING RUN lands on a repeatable valve position, and it is worth
+        // it there. On the d-pad it fired on every upward press, which is the
+        // reported "increasing fast at low amount and it bursts really high
+        // for a moment and comes back" -- a 13 ft excursion across the yard
+        // per press. Here the human is watching the stream and correcting by
+        // eye, so a few tenths of a foot of positional error costs nothing
+        // and the excursion costs everything. Runs are untouched.
+            valve_goto_interactive(s_web_valve_deg, 1.0f, 4000);
             s_valve_last_dir = 1;
             vTaskDelay(pdMS_TO_TICKS(ZONE_WEB_SETTLE_MS));
             float psi = 0.0f;
@@ -15079,12 +15229,9 @@ static esp_err_t zone_act_handler(httpd_req_t *req)
 
     } else if (strcmp(cmd, "pres_dn") == 0) {
         // Open-loop: step valve angle down, then read PSI to derive throw
-        if (s_web_valve_deg < VALVE_CLOSED_DEG)
-            s_web_valve_deg = VALVE_CAL_START_DEG;
-        s_web_valve_deg -= step_deg;
-        if (s_web_valve_deg < VALVE_CLOSED_DEG) s_web_valve_deg = VALVE_CLOSED_DEG;
+        ZONE_STEP_VALVE(-1);
         if (s_web_water) {
-            valve_goto_ex(s_web_valve_deg, 2.0f, 8000, false, -1);
+            valve_goto_interactive(s_web_valve_deg, 1.0f, 4000);   // b550: see pres_up
             s_valve_last_dir = -1;
             vTaskDelay(pdMS_TO_TICKS(ZONE_WEB_SETTLE_MS));
             float psi = 0.0f;
@@ -15106,18 +15253,14 @@ static esp_err_t zone_act_handler(httpd_req_t *req)
     } else if (strcmp(cmd, "pres_up_move") == 0) {
         // Hold-repeat fast variant: move valve only, no PSI settle or read.
         // Used by JS for steps 2+ during hold so response is ~motor-time only.
-        if (s_web_valve_deg < VALVE_CLOSED_DEG) s_web_valve_deg = VALVE_CAL_START_DEG;
-        s_web_valve_deg += step_deg;
-        if (s_web_valve_deg > VALVE_OPEN_DEG) s_web_valve_deg = VALVE_OPEN_DEG;
-        if (s_web_water) { valve_goto_ex(s_web_valve_deg, 2.0f, 8000, false,  1); s_valve_last_dir =  1; }
+        ZONE_STEP_VALVE(+1);
+        if (s_web_water) { valve_goto_interactive(s_web_valve_deg, 1.0f, 4000); s_valve_last_dir =  1; }  // b550
         else { s_web_meas_throw_mm = cal_valve_deg_to_throw_mm(s_web_valve_deg); }
 
     } else if (strcmp(cmd, "pres_dn_move") == 0) {
         // Hold-repeat fast variant: move valve only, no PSI settle or read.
-        if (s_web_valve_deg < VALVE_CLOSED_DEG) s_web_valve_deg = VALVE_CAL_START_DEG;
-        s_web_valve_deg -= step_deg;
-        if (s_web_valve_deg < VALVE_CLOSED_DEG) s_web_valve_deg = VALVE_CLOSED_DEG;
-        if (s_web_water) { valve_goto_ex(s_web_valve_deg, 2.0f, 8000, false, -1); s_valve_last_dir = -1; }
+        ZONE_STEP_VALVE(-1);
+        if (s_web_water) { valve_goto_interactive(s_web_valve_deg, 1.0f, 4000); s_valve_last_dir = -1; }  // b550
         else { s_web_meas_throw_mm = cal_valve_deg_to_throw_mm(s_web_valve_deg); }
 
     } else if (strcmp(cmd, "water_toggle") == 0) {
@@ -15213,7 +15356,7 @@ static esp_err_t zone_act_handler(httpd_req_t *req)
             } else {
                 // Water OFF: derive throw from commanded valve position, same as
                 // zone_build_json (s_web_valve_deg < 0 = initial/preview state).
-                if (s_web_valve_deg < 0.0f || s_web_valve_deg < VALVE_CAL_START_DEG)
+                if (s_web_valve_deg < 0.0f || s_web_valve_deg < zone_display_floor_deg())
                     throw_mm = cal_get_max_throw_mm();
                 else
                     throw_mm = cal_valve_deg_to_throw_mm(s_web_valve_deg);
@@ -19828,7 +19971,7 @@ float irrigoto_get_throw_mm(void)
 {
     if (s_web_water && s_web_meas_throw_mm > 10.0f)
         return s_web_meas_throw_mm;
-    if (s_web_valve_deg >= VALVE_CAL_START_DEG)
+    if (s_web_valve_deg >= zone_display_floor_deg())
         return cal_valve_deg_to_throw_mm(s_web_valve_deg);
     return 0.0f;
 }

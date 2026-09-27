@@ -219,6 +219,9 @@ header{
 #btn-trim.busy{opacity:.6;pointer-events:none;}
 
 #btn-water{border-color:#1a5035 !important;color:#3a8060;}
+/* b550: ON is bright and glowing, OFF is plainly dim -- the two states have
+   to be distinguishable at a glance in daylight. */
+#btn-water:not(.on){color:var(--text-dim);border-color:var(--border) !important;}
 #btn-water.on{
   background:var(--green-dim) !important;
   color:var(--green) !important;
@@ -335,7 +338,7 @@ header{
 </div>
 
 <div id="secondary">
-  <button class="sbtn" id="btn-water" onclick="doAct('water_toggle')">💧 Water</button>
+  <button class="sbtn" id="btn-water" onclick="doAct('water_toggle')">💧 Water OFF</button>
   <button class="sbtn" onclick="doAct('undo')">⌫ Undo</button>
   <button class="sbtn" onclick="doAct('clear')">✕ Clear</button>
   <button class="sbtn" id="btn-edit" onclick="toggleEdit()">✎ Edit</button>
@@ -1005,7 +1008,12 @@ function applyState(s){
     nameEl.value=s.name;
   document.getElementById('v-bearing').textContent=s.bearing.toFixed(1)+'°';
   document.getElementById('v-points').textContent=s.points.length+' / 36';
-  document.getElementById('btn-water').classList.toggle('on',s.water);
+  // b550: say which state it is in, not just glow. The green-on-dark glow
+  // alone is hard to read outdoors, and it is the one control where guessing
+  // wrong means water on the ground.
+  const wb=document.getElementById('btn-water');
+  wb.classList.toggle('on',s.water);
+  wb.textContent = s.water ? '💧 Water ON' : '💧 Water OFF';
   document.getElementById('btn-save').disabled=(s.points.length<3);
   document.getElementById('btn-dn').classList.toggle('at-limit', !!s.at_min);
   document.getElementById('btn-up').classList.toggle('at-limit', !!s.at_max);
@@ -1032,7 +1040,26 @@ async function doTrim(){
   btn.textContent = "⊙ trim";
 }
 
+// b550: every source of state -- the 900 ms poll, each d-pad step, and the
+// post-release settle fetch -- called applyState directly, so whichever
+// response happened to land last won. During a hold those overlap constantly
+// and an older /zone/state reply routinely overwrote a newer /zone/act one,
+// rewinding the throw readout. That is the "jumpy, doesn't respond right
+// away" behaviour. Requests are issued in order, so stamping each one and
+// dropping any reply older than what is already on screen fixes it.
+let _reqSeq=0, _appliedSeq=0;
+function applyFresh(seq, j){
+  if(seq < _appliedSeq) return;      // a reply from before what we already drew
+  _appliedSeq = seq;
+  applyState(j);
+}
+function fetchState(){
+  const seq=++_reqSeq;
+  return fetch('/zone/state').then(r=>r.json()).then(j=>applyFresh(seq,j)).catch(()=>{});
+}
+
 async function doAct(cmd){
+  const seq=++_reqSeq;
   try{
     let url='/zone/act?cmd='+cmd;
     if(cmd==='save'){
@@ -1046,7 +1073,7 @@ async function doAct(cmd){
     // b548: the device refuses a step it can't serialise rather than driving
     // the valve twice at once. Skip it -- the next repeat or the poll catches up.
     if(j.busy) return;
-    applyState(j);
+    applyFresh(seq, j);
     if(cmd==='save'){
       toast('Zone saved ✓');
       // Zone geometry changed -- clear cached heatmap data so stale coverage
@@ -1065,10 +1092,15 @@ async function doAct(cmd){
 //   After release : poll() fires after settle delay to refresh the throw display.
 // Nozzle buttons: sequential, same command every repeat.
 let _hTimer=null, _hBtn=null, _hActive=false, _hStep=0, _hIsValve=false, _hGen=0;
-// Acceleration: 0.5 deg taps at first for fine work, opening out to the 2.0
-// the firmware will accept, so crossing the full ~77 deg valve range doesn't
-// take 150 presses.
-function _holdDeg(n){ return n<=4?0.5:n<=8?1.0:n<=16?1.5:2.0; }
+// b550: steps are in FEET OF THROW, not valve degrees. The throw curve on
+// this unit runs 58 mm/deg at the bottom and 552 mm/deg around 13 ft, so a
+// fixed angular step moved the stream 0.2 ft down low and 1.8 ft in the
+// middle -- the same button doing wildly different things depending on where
+// you were. Feet are what the readout shows and what the user is aiming, so
+// the firmware converts through the cal table instead.
+// A tap is 0.25 ft; a hold opens out to 1 ft so the full ~26 ft range is
+// reachable without 100 presses.
+function _holdFt(n){ return n<=4?0.25:n<=10?0.5:1.0; }
 function holdStart(cmd,el){
   holdStop();
   var gen=++_hGen;          // b548: stamps this loop; holdStop invalidates it
@@ -1081,8 +1113,11 @@ function holdStart(cmd,el){
     if(_hStep>180){ holdStop(); toast('hold auto-stopped'); return; }  // ~11s hard cap vs a stuck button
     var act;
     if(_hIsValve){
-      if(_hStep===1) act=cmd+'&deg=0.5';           // full settle -- immediate throw feedback
-      else           act=cmd+'_move&deg='+_holdDeg(_hStep); // motor-only -- fast repeat
+      // Step 1 is the full command (PSI settle -> accurate throw straight
+      // away); repeats use the motor-only variant and the post-release
+      // settle fetch corrects the reading.
+      if(_hStep===1) act=cmd+'&ft=0.25';
+      else           act=cmd+'_move&ft='+_holdFt(_hStep);
     } else {
       act=cmd;
     }
@@ -1102,7 +1137,7 @@ function holdStop(){
   if(_hBtn){_hBtn.classList.remove('held');_hBtn=null;}
   // After releasing a valve button: wait for the valve to settle then poll for
   // updated PSI/throw.  The move-only hold commands skip settle, so we need this.
-  if(wasValve) setTimeout(function(){ fetch('/zone/state').then(r=>r.json()).then(applyState).catch(()=>{}); }, 350);
+  if(wasValve) setTimeout(fetchState, 350);
 }
 // Safety net: a missed pointerup/leave on mobile (pointercancel fires for
 // gestures/long-press) must never leave a button stuck hammering the device
@@ -1148,7 +1183,7 @@ function toggleEdit(){
 function exitEdit(){ _editMode=false; _selPt=-1; _dragging=false; _setEditUI(false); }
 function cancelEdit(){  // discard local edits, reload authoritative device state
   exitEdit();
-  fetch('/zone/state').then(r=>r.json()).then(applyState).catch(()=>{});
+  fetchState();
 }
 function deleteSelPoint(){
   if(_selPt<0 || _selPt>=ST.points.length){ toast('Tap a point first'); return; }
@@ -1200,7 +1235,7 @@ async function saveEdits(){
     const r=await fetch('/zone/import?id='+encodeURIComponent(zid)+'&recompute=1',
                         {method:'POST',body}).then(x=>x.json());
     if(r&&r.ok){ toast('Saved zone '+r.id+' ('+r.num_points+' pts)'); exitEdit();
-      fetch('/zone/state').then(x=>x.json()).then(applyState).catch(()=>{}); }
+      fetchState(); }
     else toast('Save failed: '+((r&&r.error)||'?'));
   }catch(e){ toast('Save error'); }
   finally{ if(btn) btn.disabled=false; }
@@ -1209,10 +1244,15 @@ async function saveEdits(){
 var _pollTimer=null;
 async function poll(){
   if(_editMode){ _pollTimer=setTimeout(poll,900); return; }  // b400: don't clobber edits
+  // b550: don't poll into a hold. The d-pad is already streaming fresh state
+  // back from every step, and a concurrent read only adds contention on the
+  // zone mutex -- which the device now answers with {"busy":true}.
+  if(_hActive){ _pollTimer=setTimeout(poll,250); return; }
+  const seq=++_reqSeq;
   try{
     const r=await fetch('/zone/state');
     if(!r.ok) throw new Error();
-    applyState(await r.json());
+    applyFresh(seq, await r.json());
     setConn(true);
   }catch(e){ setConn(false); }
   _pollTimer=setTimeout(poll,900);
