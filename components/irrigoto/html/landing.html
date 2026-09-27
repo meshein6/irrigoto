@@ -908,6 +908,9 @@ function selDepthBtn(btn){
 // where the pressure cal and speed map live.
 let _planSeq = 0;
 let _lastPlan = null;   // b569: ring_passes for the full-run preview
+// b570: last live nozzle position from /api/status, drawn over the planned
+// path while a run is on. Null when nothing is running.
+let _live = null;
 function refreshRunPlan(){
   const el = document.getElementById('plan-note');
   if (!el) return;
@@ -1167,7 +1170,8 @@ function zonePathOpts(pass){
            act_max_throw: (pathZone && pathZone.act_max_throw) || 10058,
            act_min_throw: (pathZone && pathZone.act_min_throw) || 0,
            coverage: (pathZone && pathZone.coverage) | 0,   // b561
-           ringPasses: _lastPlan && _lastPlan.ring_passes };  // b569: full run
+           ringPasses: _lastPlan && _lastPlan.ring_passes,   // b569: full run
+           live: _live };                                    // b570
 }
 function renderPathThumb(){
   const row = document.getElementById('path-row');
@@ -1199,6 +1203,7 @@ function openPathFull(){
     mode: selModeDat, lockMode: true, depth8: selDepth,
     coverage: (pathZone && pathZone.coverage) | 0,   // b564: draw the zone's real ring pitch
     ringPasses: _lastPlan && _lastPlan.ring_passes,  // b569: every pass, not one lap
+    live: _live,                                     // b570: the real nozzle
     title: pathZone.name || 'Zone',
   });
 }
@@ -1324,7 +1329,33 @@ function renderWinter(winter, leftS){
 let activeWaterZoneId = -1;
 let lastWaterMode = 0;
 
+// b570: while a run is on, track the nozzle at a pace you can actually watch.
+// The main /api/all poll is every 8 s -- fine for state, useless for a moving
+// dot -- so this pulls the much smaller /api/status instead, and only while
+// something is running. It stops itself the moment the run ends.
+let _liveTimer = null;
+function startLivePoll(){
+  if (_liveTimer) return;
+  const tick = async () => {
+    try {
+      const st = await fetch('/api/status', {cache:'no-store'}).then(r => r.json());
+      if (!st.watering) { stopLivePoll(); return; }
+      _live = { deg: st.live_deg, throw_mm: st.live_throw_mm,
+                ring: st.live_ring, pass: st.live_pass, age_ms: st.live_age_ms };
+      renderPathThumb();
+    } catch(e) { /* a dropped poll is not worth a visible error */ }
+    if (_liveTimer) _liveTimer = setTimeout(tick, 1500);
+  };
+  _liveTimer = setTimeout(tick, 0);
+}
+function stopLivePoll(){
+  if (_liveTimer) clearTimeout(_liveTimer);
+  _liveTimer = null;
+  if (_live) { _live = null; renderPathThumb(); }
+}
+
 function updateWateringState(watering, mode, estMin, waterZoneId, cleanupPass) {
+  if (watering) startLivePoll(); else stopLivePoll();
   lastWateringState = !!watering;
   lastCleanupPass   = cleanupPass || 0;
   lastWaterMode     = watering ? (mode || 0) : 0;

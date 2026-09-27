@@ -601,6 +601,32 @@
 
   /* Draw a whole thumbnail: background disc, zone outline, then the path.
    * Used by the Water modal and the schedule entry cards. */
+  /* b570: where the nozzle actually is, from /api/status, drawn on top of the
+   * planned path. This is the point of closing the loop between preview and
+   * run: the same picture, with the real thing moving over it. A stale
+   * reading (the nozzle transiting between arcs, where no sample is taken)
+   * is drawn hollow rather than frozen solid, so a stopped dot never reads
+   * as a live one. */
+  function drawLive(ctx, live, o) {
+    if (!live || !(live.throw_mm > 0)) return;
+    var r = (live.throw_mm / o.scale_mm) * o.maxR;
+    if (!(r > 0) || r > o.maxR * 1.05) return;
+    var a = rad(live.deg);
+    var x = o.cx + Math.cos(a) * r, y = o.cy + Math.sin(a) * r;
+    var fresh = (live.age_ms || 0) < 2500;
+    ctx.beginPath();
+    ctx.arc(x, y, fresh ? 5 : 4, 0, Math.PI * 2);
+    if (fresh) {
+      ctx.fillStyle = 'rgba(120,255,180,.95)';
+      ctx.fill();
+      ctx.beginPath(); ctx.arc(x, y, 9, 0, Math.PI * 2);
+      ctx.strokeStyle = 'rgba(120,255,180,.45)';
+    } else {
+      ctx.strokeStyle = 'rgba(120,255,180,.5)';
+    }
+    ctx.lineWidth = 1.5; ctx.setLineDash([]); ctx.stroke();
+  }
+
   function thumb(canvas, points, opts) {
     if (!canvas || !canvas.getContext) return false;
     var ctx = canvas.getContext('2d');
@@ -621,6 +647,7 @@
     /* Fit the thumbnail to the zone; full reach wastes most of the disc. */
     var zmax = Math.max.apply(null, points.map(function (p) { return p.throw_mm; }));
     var scale = Math.max(zmax * 1.12, 600);
+    ov.lastScale = scale;   /* b570: the overlay's live marker uses this too */
 
     ctx.strokeStyle = 'rgba(120,140,130,.45)';
     ctx.lineWidth = 1;
@@ -647,6 +674,9 @@
     /* Sprinkler at the centre. */
     ctx.fillStyle = 'rgba(0,232,122,.9)';
     ctx.beginPath(); ctx.arc(cx, cy, 2, 0, Math.PI * 2); ctx.fill();
+
+    if (opts.live) drawLive(ctx, opts.live,
+                            { cx: cx, cy: cy, maxR: maxR, scale_mm: scale });
     return at || true;
   }
 
@@ -798,6 +828,12 @@
       ringPasses: ov.opts.ringPasses
     };
     var at = thumb(ov.cv, ov.opts.points, o);
+    if (ov.opts.live) {
+      var c = ov.cv, W = c.width, H = c.height;
+      drawLive(c.getContext('2d'), ov.opts.live,
+               { cx: W / 2, cy: H / 2, maxR: Math.min(W, H) / 2 - 2,
+                 scale_mm: ov.lastScale || 6000 });
+    }
     var label = (MODES[ov.mode] || {}).label || '';
     ov.title.textContent = (ov.opts.title ? ov.opts.title + ' \u00b7 ' : '') + label;
     ov.at.textContent = (at && at.r_mm !== undefined)
@@ -852,7 +888,7 @@
   root.IrrigotoPath = {
     openPreview: openPreview, closePreview: ovClose,
     MODES: MODES, build: build, draw: draw, thumb: thumb, normPoints: normPoints,
-    flatten: flatten, pointAt: pointAt, marker: marker,
+    flatten: flatten, pointAt: pointAt, marker: marker, drawLive: drawLive,
     zoneArc: zoneArc, ringThrows: ringThrows, ringSpans: ringSpans,
     pointInZone: pointInZone
   };

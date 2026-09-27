@@ -412,6 +412,17 @@ static water_sector_accum_t s_smooth_accum[WATER_RUN_MAX_RINGS][36];
 static bool                 s_smooth_accum_mode = false;
 
 // Write one binary row to the open water log file.
+// b570: live nozzle position during a run, for the page to draw a marker on
+// the same path preview it already shows. Written only by
+// water_csv_write_row() below; read by /api/status. Stale after a couple of
+// seconds means the nozzle is between sweeps (a transit or a valve move),
+// which the page shows as "moving" rather than freezing the dot.
+static volatile int16_t    s_live_ring     = -1;
+static volatile int8_t     s_live_pass     = 0;
+static volatile float      s_live_bearing  = 0.0f;
+static volatile float      s_live_throw_mm = 0.0f;
+static volatile TickType_t s_live_tick     = 0;
+
 static void water_csv_write_row(FILE *f, float t_s, int ring_, int arc_,
     int sector_, float nozzle_target, float nozzle_actual,
     float valve_target, float valve_actual,
@@ -419,6 +430,17 @@ static void water_csv_write_row(FILE *f, float t_s, int ring_, int arc_,
     float psi_target, float psi_actual,
     float bearing_rad, uint8_t pass_type)
 {
+    // b570: latch where the nozzle is, for the live run view. Every sweep
+    // function calls this on its own sampling cadence, so one hook here
+    // covers pulse, gentle/smooth and the serpentine glide without touching
+    // any of them -- and without the HTTP handler reaching for the AS5600
+    // while the run task is driving it.
+    s_live_ring     = (int16_t)ring_;
+    s_live_pass     = (int8_t)pass_type;
+    s_live_bearing  = nozzle_actual;
+    s_live_throw_mm = (throw_actual > 100.0f) ? throw_actual : throw_target;
+    s_live_tick     = xTaskGetTickCount();
+
     // Smooth aggregate mode: accumulate into per-(ring,sector) bucket, don't write.
     if (s_smooth_accum_mode) {
         if ((unsigned)ring_ < WATER_RUN_MAX_RINGS && (unsigned)sector_ < 36) {
@@ -17753,17 +17775,28 @@ static esp_err_t api_status_handler(httpd_req_t *req)
 {
     size_t used=0, total=0;
     if (storage_ready()) storage_usage(&used, &total);
-    char buf[256];
+    char buf[420];   /* b570: grew for the live-position fields */
     HTTP_CONN_CLOSE(req);
     int n = snprintf(buf, sizeof(buf),
         "{\"fw_build\":%u,\"wifi_rssi\":%d,"
         "\"storage_used_kb\":%u,\"storage_total_kb\":%u,"
         "\"watering\":%s,\"water_mode\":%d,\"water_est_min\":%d,\"cleanup_pass\":%d,"
+        // b570: where the nozzle is right now, so the page can put a marker
+        // on the path it is already drawing. live_age_ms says how fresh it
+        // is -- a sweep samples every couple of degrees, so anything much
+        // older than that means the nozzle is transiting between arcs.
+        "\"live_ring\":%d,\"live_pass\":%d,\"live_deg\":%.1f,"
+        "\"live_throw_mm\":%.0f,\"live_age_ms\":%lu,"
         "\"led_expander\":\"%s\"}",   // which 0x20 part led_expander_detect() picked
         FW_BUILD, wifi_get_rssi(),
         (unsigned)(used/1024), (unsigned)(total/1024),
         s_web_water_mode?"true":"false", s_web_water_mode, s_water_est_min,
         s_water_cleanup_pass,
+        s_web_water_mode ? (int)s_live_ring : -1,
+        s_web_water_mode ? (int)s_live_pass : 0,
+        (double)s_live_bearing, (double)s_live_throw_mm,
+        (unsigned long)(s_live_tick
+            ? (xTaskGetTickCount() - s_live_tick) * portTICK_PERIOD_MS : 999999u),
         s_led_expander==LED_EXP_SX1502 ? "SX1502" :
         s_led_expander==LED_EXP_TCA6408A ? "TCA6408A" : "unknown");
     httpd_resp_set_type(req, "application/json");
