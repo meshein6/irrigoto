@@ -907,6 +907,7 @@ function selDepthBtn(btn){
 // pattern the solution mL estimate uses. The arithmetic stays on the device,
 // where the pressure cal and speed map live.
 let _planSeq = 0;
+let _lastPlan = null;   // b569: ring_passes for the full-run preview
 function refreshRunPlan(){
   const el = document.getElementById('plan-note');
   if (!el) return;
@@ -918,6 +919,8 @@ function refreshRunPlan(){
     .then(p => {
       if (seq !== _planSeq) return;           // a newer pick already answered
       if (!p || !p.ok) { el.textContent = ''; el.className = ''; return; }
+      _lastPlan = p;
+      renderPathThumb();   // the thumbnail is the whole run, so it moves too
       const mins = p.est_min >= 1 ? Math.round(p.est_min) + ' min' : '< 1 min';
       if (p.clamp === 'none') {
         el.className = 'plan-ok';
@@ -1163,7 +1166,8 @@ function zonePathOpts(pass){
   return { mode: selModeDat, pass: pass|0,
            act_max_throw: (pathZone && pathZone.act_max_throw) || 10058,
            act_min_throw: (pathZone && pathZone.act_min_throw) || 0,
-           coverage: (pathZone && pathZone.coverage) | 0 };   // b561
+           coverage: (pathZone && pathZone.coverage) | 0,   // b561
+           ringPasses: _lastPlan && _lastPlan.ring_passes };  // b569: full run
 }
 function renderPathThumb(){
   const row = document.getElementById('path-row');
@@ -1194,6 +1198,7 @@ function openPathFull(){
     act_max_throw: pathZone.act_max_throw, act_min_throw: pathZone.act_min_throw,
     mode: selModeDat, lockMode: true, depth8: selDepth,
     coverage: (pathZone && pathZone.coverage) | 0,   // b564: draw the zone's real ring pitch
+    ringPasses: _lastPlan && _lastPlan.ring_passes,  // b569: every pass, not one lap
     title: pathZone.name || 'Zone',
   });
 }

@@ -304,17 +304,14 @@ header{
   <!-- b535: view controls live over the map, not in the action row below. -->
   <div id="view-ctl">
     <button class="vbtn" id="btn-zoom" onclick="toggleZoom()" title="Fit the map to this zone, or show the full reach">&#9974; Zoom</button>
-    <button class="vbtn" id="btn-path" onclick="togglePath()" title="Show the watering path; tap the mode chip to change mode">&#9678; Path</button>
+    <button class="vbtn" id="btn-path" onclick="togglePath()" title="Show the rings this zone will be watered in">&#9678; Rings</button>
     <button class="vbtn" id="btn-heatmap" onclick="toggleHeatmap()">&#127777; Depth</button>
   </div>
-  <div id="path-ctl">
-    <button class="vbtn" id="btn-path-mode" onclick="cyclePathMode()" title="Which mode's path to draw">Smooth</button>
-    <button class="vbtn" id="btn-path-pass" onclick="cyclePathPass()" title="Which direction this pass sweeps">Outer &#8594; in</button>
-    <button class="vbtn" onclick="openPathPreview()" title="Bigger view">&#9974;</button>
-    <input type="range" id="zs-scrub" min="0" max="1000" step="1" value="0"
-           oninput="zsScrub(+this.value/1000)" aria-label="Position along the path">
-    <span id="zs-at">start</span>
-  </div>
+  <!-- b569: no mode, pass, scrub or expand here. Zone Setup is the zone and
+       the rings it will water -- WHERE. How the nozzle travels those rings,
+       and how many times, is a property of a run, so it lives in the run
+       preview where the mode and depth are actually chosen. -->
+  <div id="path-ctl"><span id="zs-at"></span></div>
   <div id="heat-legend">
     <div style="display:flex;gap:5px;align-items:stretch">
       <div class="hl-bar" style="height:90px"></div>
@@ -432,9 +429,6 @@ const TRAIL_MAX = 120;
 let waterTrail = [];
 let lastWaterBearing = null;
 let showPath = false;
-let pathMode = '7';  // b535: which mode the Path view draws (web digit)
-let pathPass = 0;    // b535: which pass (serpentine/gentle alternate by pass)
-let pathT = 0;       // b535: scrub position, 0..1 along the path
 let heatPasses = 0;
 let lastRun = null;
 let waterCSVRows = null;
@@ -475,48 +469,10 @@ function togglePath(){
   draw();
 }
 // b535: which mode's path to draw, and which pass.
-function cyclePathMode(){
-  const order = ['1','5','7','8','9'];
-  pathMode = order[(order.indexOf(pathMode) + 1) % order.length];
-  document.getElementById('btn-path-mode').textContent =
-    (IrrigotoPath.MODES[pathMode] || {label:'Path'}).label;
-  const pb = document.getElementById('btn-path-pass');
-  const k = (IrrigotoPath.MODES[pathMode] || {}).key;
-  const same = (k === 'pulse' || k === 'chase' || k === 'demo');
-  pb.style.display = same ? 'none' : '';
-  if (!same) pb.textContent = passLabelFor(pathMode, pathPass);
-  draw();
-}
 // b548: this chip still said "Pass 1..4" -- the same nonsense b544 removed
 // from the shared overlay, left behind because the concept lives in two
 // controls and only one was fixed. Only two pictures exist: the direction
 // flips every pass, so pass 3 is pass 1 again.
-function cyclePathPass(){
-  pathPass = (pathPass + 1) % 2;
-  document.getElementById('btn-path-pass').textContent = passLabelFor(pathMode, pathPass);
-  draw();
-}
-function passLabelFor(mode, idx){
-  const k = (typeof IrrigotoPath !== 'undefined' && IrrigotoPath.MODES[mode])
-            ? IrrigotoPath.MODES[mode].key : 'smooth';
-  if (k === 'pulse' || k === 'chase' || k === 'demo') return '\u2014';
-  return (k === 'serpentine' || k === 'sections')
-    ? (idx ? 'Inner \u2192 out' : 'Outer \u2192 in')
-    : (idx ? 'Sweep back' : 'Sweep one way');
-}
-function zsScrub(t){ pathT = t; draw(); }
-// b536: the shared overlay, UNLOCKED here -- Zone Setup is where you compare
-// a zone across modes, so the mode chips stay live.
-function openPathPreview(){
-  if (typeof IrrigotoPath === 'undefined' || ST.points.length < 2) return;
-  IrrigotoPath.openPreview({
-    points: ST.points,
-    act_max_throw: ST.act_max_throw, act_min_throw: ST.act_min_throw,
-    mode: pathMode, lockMode: false, depth8: 1,
-    coverage: ST.coverage | 0,   // b564: draw the zone's real ring pitch
-    title: document.getElementById('zone-name').value || 'Zone',
-  });
-}
 // b536: Sections joins the mode cycle.
 
 
@@ -847,23 +803,21 @@ function drawHeatMap(W, H, cx, cy, maxR) {
 // for Serpentine -- IrrigotoPath.planOrder gets it right per mode.
 function drawPath(W, H, cx, cy, maxR) {
   if (ST.points.length < 2 || typeof IrrigotoPath === 'undefined') return;
+  // b569: mode '7' only because build() needs one; ringsOnly discards the
+  // ordering it implies and draws just the ring geometry.
   const geom = IrrigotoPath.build(ST.points, {
-    mode: pathMode, pass: pathPass,
+    mode: '7', pass: 0,
     act_max_throw: ST.act_max_throw || 10058,
     act_min_throw: ST.act_min_throw || 0,
     coverage: ST.coverage | 0,     // b561: ring pitch follows the zone setting
   });
-  const o = {cx: cx, cy: cy, maxR: maxR, scale_mm: _edScale()};
-  IrrigotoPath.draw(ctx, geom, o);
-  // Scrub marker: where the nozzle is at this point along the path.
-  const at = IrrigotoPath.marker(ctx, IrrigotoPath.flatten(geom), pathT, o);
+  IrrigotoPath.draw(ctx, geom,
+                    {cx: cx, cy: cy, maxR: maxR, scale_mm: _edScale(), ringsOnly: true});
   const lbl = document.getElementById('zs-at');
-  if (lbl) {
-    lbl.textContent = !at ? (pathT <= 0 ? 'start' : '')
-      : at.dry ? 'moving \u00b7 dry'
-      : 'ring ' + (at.ring + 1) + ' \u00b7 ' + (at.r_mm / 304.8).toFixed(1) + "'";
-  }
+  if (lbl) lbl.textContent = geom && geom.rings
+    ? geom.rings.length + ' rings \u00b7 ' + COV_NAME[ST.coverage | 0] : '';
 }
+const COV_NAME = ['Standard', 'Fine', 'Finest'];
 
 function resizeCanvas(){
   const wrap = document.getElementById('map-wrap');
@@ -1328,11 +1282,6 @@ async function poll(){
 window.addEventListener('resize',resizeCanvas);
 resizeCanvas();
 _paintZoomBtn();   // b535: reflect the zoom restored from localStorage
-if (typeof IrrigotoPath !== 'undefined') {
-  document.getElementById('btn-path-mode').textContent =
-    (IrrigotoPath.MODES[pathMode] || {label:'Path'}).label;
-  document.getElementById('btn-path-pass').textContent = passLabelFor(pathMode, pathPass);
-}
 // Mark name field edited when user types so polling won't overwrite it
 document.getElementById('zone-name').addEventListener('input',function(){
   this.dataset.edited='1';

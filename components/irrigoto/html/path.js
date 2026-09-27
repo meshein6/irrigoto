@@ -348,27 +348,62 @@
      * connectors stay dry. */
     var serpish = (modeKey === 'serpentine' || modeKey === 'sections');
     var turnFloor = Math.max(actMin || 0, 500);
+
+    /* b569: the WHOLE run, not one representative lap.
+     *
+     * ringPasses[i] is how many passes ring i needs, from /api/run_plan --
+     * the firmware solves it from the deposit each slow pass achieves. Pass 1
+     * sweeps every ring; pass k sweeps only the rings still short, which is
+     * exactly what skip[] does in water_serpentine_passes, so a four-pass run
+     * is one full lap plus three progressively smaller ones rather than four
+     * laps. Serpentine and Sections alternate direction per pass
+     * (out_to_in = pass % 2), so later passes are drawn running the other way
+     * round, as they will.
+     *
+     * With no ringPasses (or a length that does not line up with the ring
+     * ladder) this degrades to the single pass it always drew, rather than
+     * inventing a run. */
+    var rp = opts.ringPasses;
+    var usePasses = !!(rp && rp.length === rings.length);
+    var nPasses = 1;
+    if (usePasses) rp.forEach(function (v) { if (v > nPasses) nPasses = v; });
+    if (nPasses > 12) nPasses = 12;        /* a drawing, not an endurance test */
+
     var moves = [], prev = null;
-    for (var mi = 0; mi < rings.length; mi++) {
-      var MR = rings[mi];
-      var ord = MR.spans.slice().sort(function (a, b) {
-        return MR.cw ? (a.lo - b.lo) : (b.lo - a.lo);
-      });
-      for (var mj = 0; mj < ord.length; mj++) {
-        var msp = ord[mj];
-        var mfrom = MR.cw ? msp.lo : (msp.lo + msp.span);
-        var mto   = MR.cw ? (msp.lo + msp.span) : msp.lo;
-        if (prev) {
-          var turn = serpish
-            ? buildTurn(points, prev.deg, prev.r, mfrom, MR.throw_mm, turnFloor)
-            : { wet: false };
-          if (turn.wet) moves.push({ type: 'turn', from: prev, wps: turn.wps });
-          else moves.push({ type: 'hop', from: prev,
-                            to: { deg: mfrom, r: MR.throw_mm } });
+    for (var pp = 0; pp < nPasses; pp++) {
+      /* Rings still owed water on this pass. */
+      var live = [];
+      for (var q = 0; q < rings.length; q++) {
+        var need = usePasses ? rp[q] : 1;
+        if (need > pp) live.push(rings[q]);
+      }
+      if (!live.length) break;
+      /* Later passes of serpentine/sections run the other way round. */
+      if (pp % 2 === 1 && serpish) live = live.slice().reverse();
+
+      for (var mi = 0; mi < live.length; mi++) {
+        var MR = live[mi];
+        /* Direction flips per pass for the serpentine family. */
+        var cwp = (pp % 2 === 1 && serpish) ? !MR.cw : MR.cw;
+        var ord = MR.spans.slice().sort(function (a, b) {
+          return cwp ? (a.lo - b.lo) : (b.lo - a.lo);
+        });
+        for (var mj = 0; mj < ord.length; mj++) {
+          var msp = ord[mj];
+          var mfrom = cwp ? msp.lo : (msp.lo + msp.span);
+          var mto   = cwp ? (msp.lo + msp.span) : msp.lo;
+          if (prev) {
+            var turn = serpish
+              ? buildTurn(points, prev.deg, prev.r, mfrom, MR.throw_mm, turnFloor)
+              : { wet: false };
+            if (turn.wet) moves.push({ type: 'turn', from: prev, wps: turn.wps });
+            else moves.push({ type: 'hop', from: prev,
+                              to: { deg: mfrom, r: MR.throw_mm } });
+          }
+          moves.push({ type: 'sweep', ring: MR.ring, visit: mi, pass: pp,
+                       r: MR.throw_mm, from: mfrom, to: mto, cw: cwp });
+          prev = { r: MR.throw_mm, deg: mto };
         }
-        moves.push({ type: 'sweep', ring: MR.ring, visit: mi, r: MR.throw_mm,
-                     from: mfrom, to: mto, cw: MR.cw });
-        prev = { r: MR.throw_mm, deg: mto };
       }
     }
 
@@ -379,6 +414,7 @@
       arc: arc,
       lobes: sectioned ? (sectioned[sectioned.length - 1].lobe + 1) : 1,
       rings: rings,
+      passes: nPasses,
       coverage: opts.coverage | 0,
       scale_mm: opts.scale_mm || (actMax + 914),
       orderVaries: plan.orderVaries,
@@ -396,13 +432,19 @@
     var n = geom.rings.length;
     var thin = !!o.thumb;
 
+    /* b569: ringsOnly draws WHERE the water lands and nothing about HOW the
+     * nozzle gets there -- no direction colouring, no arrows, no connectors,
+     * no marker. Zone Setup uses it: at that point the zone and its ring
+     * spacing are the subject, and the sweep order belongs to the run. */
+    var ringsOnly = !!o.ringsOnly;
     for (var i = 0; i < n; i++) {
       var R = geom.rings[i];
       var r = (R.throw_mm / scale) * maxR;
       if (!(r > 0) || r > maxR * 1.02) continue;
       /* Fade with visit order so the sequence reads without a legend. */
       var al = 0.75 - 0.45 * (i / (n - 1 || 1));
-      var col = R.cw ? 'rgba(80,180,255,' + al + ')' : 'rgba(255,160,60,' + al + ')';
+      var col = ringsOnly ? 'rgba(80,180,255,.55)'
+              : R.cw ? 'rgba(80,180,255,' + al + ')' : 'rgba(255,160,60,' + al + ')';
       for (var s = 0; s < R.spans.length; s++) {
         var sp = R.spans[s], sa = rad(sp.lo);
         ctx.beginPath();
@@ -411,7 +453,7 @@
         ctx.lineWidth = thin ? 1.2 : 1.8;
         ctx.setLineDash([]);
         ctx.stroke();
-        if (!thin && sp.span > 8) arrow(ctx, cx, cy, r, sp, R.cw);
+        if (!thin && !ringsOnly && sp.span > 8) arrow(ctx, cx, cy, r, sp, R.cw);
       }
     }
 
@@ -422,7 +464,7 @@
      * return from a dryReturn flag on the ring and drew a straight radial
      * line, which was wrong for both: it never drew the boundary-hug turns at
      * all, and it drew a straight chord where the nozzle rides an arc. */
-    if (!geom.moves) return;
+    if (ringsOnly || !geom.moves) return;
     geom.moves.forEach(function (mv) {
       if (mv.type === 'turn') {
         ctx.beginPath();
@@ -462,8 +504,9 @@
     geom.moves.forEach(function (mv) {
       if (mv.type === 'sweep') {
         var len = mv.r * (Math.abs(angDelta(mv.from, mv.to)) * Math.PI / 180);
-        segs.push({ dry: false, ring: mv.ring, visit: mv.visit, r: mv.r,
-                    from: mv.from, to: mv.to, cw: mv.cw, len: Math.max(len, 1) });
+        segs.push({ dry: false, ring: mv.ring, visit: mv.visit, pass: mv.pass || 0,
+                    r: mv.r, from: mv.from, to: mv.to, cw: mv.cw,
+                    len: Math.max(len, 1) });
       } else if (mv.type === 'turn') {
         /* Wet, and followed waypoint by waypoint so the scrubber traces the
          * boundary the way the glide engine does. */
@@ -507,7 +550,8 @@
                    dry: !!sg.dry, turn: !!sg.turn, ring: -1 };
         }
         return { r_mm: sg.r, bearing: sg.from + (sg.to - sg.from) * f,
-                 dry: false, ring: sg.ring, visit: sg.visit, cw: sg.cw };
+                 dry: false, ring: sg.ring, visit: sg.visit,
+                 pass: sg.pass || 0, cw: sg.cw };
       }
       acc += sg.len;
     }
@@ -748,7 +792,10 @@
        * the zone was set to -- the Sections preview in particular looked
        * unaffected by coverage because the lobe ordering runs on top of a
        * ring list that was built at the wrong pitch. */
-      coverage: ov.opts.coverage | 0
+      coverage: ov.opts.coverage | 0,
+      /* b569: the scrubber now walks the WHOLE run, every pass, so there is
+       * nothing left for a pass stepper to step through. */
+      ringPasses: ov.opts.ringPasses
     };
     var at = thumb(ov.cv, ov.opts.points, o);
     var label = (MODES[ov.mode] || {}).label || '';
@@ -756,7 +803,8 @@
     ov.at.textContent = (at && at.r_mm !== undefined)
       ? (at.dry ? 'moving \u00b7 dry'
                 : at.turn ? 'turning \u00b7 wet'
-                : 'ring ' + (at.ring + 1) + ' \u00b7 ' + (at.r_mm / 304.8).toFixed(1) + "'")
+                : 'pass ' + ((at.pass | 0) + 1) + ' \u00b7 ring ' + (at.ring + 1)
+                  + ' \u00b7 ' + (at.r_mm / 304.8).toFixed(1) + "'")
       : (ov.t <= 0 ? 'start' : '');
   }
 
@@ -770,11 +818,9 @@
     ov.mode = MODES[opts.mode] ? opts.mode : '7';
     ov.passIdx = 0; ov.t = 0; ov.range.value = 0;
     var mk = (MODES[ov.mode] || MODES['1']).key;
-    ov.variants = passVariants(mk);
-    ov.passNoteText = passNote(mk, opts.depth8);
-    /* Nothing to step through when every pass looks the same. */
-    ov.pass.style.display = ov.variants.length ? '' : 'none';
-    ovPassLabel();
+    ov.variants = [];
+    ov.passNoteText = '';
+    ov.pass.style.display = 'none';   /* b569: the scrub covers every pass */
     /* Locked: the caller already chose the mode, so show it as a static chip
      * rather than letting the preview disagree with the run that will happen. */
     ov.modes.innerHTML = '';
@@ -792,11 +838,6 @@
         b.addEventListener('click', function () {
           ov.mode = m;
           var k = (MODES[m] || MODES['1']).key;
-          ov.variants = passVariants(k);
-          ov.passNoteText = passNote(k, ov.opts.depth8);
-          if (ov.passIdx >= ov.variants.length) ov.passIdx = 0;
-          ov.pass.style.display = ov.variants.length ? '' : 'none';
-          ovPassLabel();
           ov.modes.querySelectorAll('.ipo-btn').forEach(function (x) { x.classList.toggle('sel', x === b); });
           ovDraw();
         });

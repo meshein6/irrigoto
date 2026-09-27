@@ -17620,6 +17620,14 @@ static esp_err_t api_run_plan_handler(httpd_req_t *req)
     float worst_frac = 1.0f;
     int   need_passes = 1, n_short = 0;
     float est_s_total = 0.0f;
+    // b569: per-ring pass count, so the preview can draw the REAL run instead
+    // of one representative lap. Pass 1 covers every ring; pass k covers only
+    // rings whose count is still >= k, which is exactly what skip[] does in
+    // water_serpentine_passes. Order matches the ring ladder the preview
+    // builds from the same pitch, outer to inner. 0 = never watered.
+    uint8_t ring_passes[WATER_MAX_RINGS_CAL];
+    int     ring_passes_n = 0;
+    memset(ring_passes, 0, sizeof(ring_passes));
     {
         float t = zmax; int r2 = 0;
         while (t >= act_min && r2 < WATER_MAX_RINGS_CAL) {
@@ -17627,7 +17635,11 @@ static esp_err_t api_run_plan_handler(httpd_req_t *req)
             if (sp < WATER_MIN_RING_SPACING) sp = WATER_MIN_RING_SPACING;
             float in = t - sp; if (in < 0.0f) in = 0.0f;
             float ad = run_plan_active_deg(have_zone ? &z : NULL, t, active);
-            if (ad < 1.0f) { r2++; t -= sp; continue; }
+            if (ad < 1.0f) {
+                if (ring_passes_n < WATER_MAX_RINGS_CAL)
+                    ring_passes[ring_passes_n++] = 0;
+                r2++; t -= sp; continue;
+            }
             float want = 0.0f;
             float got  = serpentine_ring_dps_ex(t, in, ad, per_pass_mm,
                                                 &spd, have_spd, &want);
@@ -17643,6 +17655,8 @@ static esp_err_t api_run_plan_handler(httpd_req_t *req)
             if (rp < 1) rp = 1;
             if (rp > need_passes) need_passes = rp;
             est_s_total += (ad / got) * (float)rp;   // this ring's own time
+            if (ring_passes_n < WATER_MAX_RINGS_CAL)
+                ring_passes[ring_passes_n++] = (uint8_t)(rp > 255 ? 255 : rp);
             r2++; t -= sp;
         }
     }
@@ -17685,7 +17699,18 @@ static esp_err_t api_run_plan_handler(httpd_req_t *req)
     char adv_js[200];
     json_escape(adv_js, sizeof(adv_js), advice);
 
-    char buf[560];
+    char rp_js[160];
+    {
+        int k = 0;
+        rp_js[k++] = '[';
+        for (int i = 0; i < ring_passes_n && k < (int)sizeof(rp_js) - 8; i++)
+            k += snprintf(rp_js + k, sizeof(rp_js) - k, "%s%u",
+                          i ? "," : "", (unsigned)ring_passes[i]);
+        rp_js[k++] = ']';
+        rp_js[k]   = '\0';
+    }
+
+    char buf[860];
     int n = snprintf(buf, sizeof(buf),
         "{\"ok\":true,\"zone\":%d,\"depth8\":%d,\"depth_mm\":%.2f,"
         "\"passes\":%d,\"per_pass_mm\":%.3f,\"rings\":%d,"
@@ -17694,12 +17719,13 @@ static esp_err_t api_run_plan_handler(httpd_req_t *req)
         "\"rings_at_max\":%d,\"rings_at_min\":%d,"
         "\"clamp\":\"%s\",\"est_min\":%.1f,\"coverage\":%u,"
         "\"active_deg\":%.0f,\"speed_floor_cal\":%s,\"pass_frac\":%.2f,"
-        "\"advice\":\"%s\"}",
+        "\"ring_passes\":%s,\"advice\":\"%s\"}",
         zone_id, depth8, depth_mm, passes, per_pass_mm, rings,
         (double)lo_dps, (double)hi_dps, (double)min_dps, (double)max_dps,
         n_fast, n_slow, clamp, (double)est_min,
         (unsigned)(have_zone ? z.coverage : 0),
-        (double)active, floor_cal ? "true" : "false", (double)worst_frac, adv_js);
+        (double)active, floor_cal ? "true" : "false", (double)worst_frac,
+        rp_js, adv_js);
     if (n >= (int)sizeof(buf)) n = sizeof(buf) - 1;
     httpd_resp_send(req, buf, n);
     return ESP_OK;
