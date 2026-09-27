@@ -225,7 +225,7 @@ void IrrigotoComponent::loop() {
         char   buf[96];
         if (irrigoto_schedule_next_run(now, &next_t, &next_zone)) {
             struct tm lt;
-            localtime_r(&next_t, &lt);
+            irrigoto_localtime_r(&next_t, &lt);
             // b422: name-first ("Combined (#1) at ..."). Schedule entries
             // carry 1-based zone numbers on the wire; the "(#id)" suffix is
             // the 0-based display id matching HA's schedule tab and cards.
@@ -313,7 +313,7 @@ void IrrigotoComponent::loop() {
                     schedule_delay_sensor_->publish_state("off");
                 } else {
                     struct tm lt;
-                    localtime_r(&cur_delay, &lt);
+                    irrigoto_localtime_r(&cur_delay, &lt);
                     char buf[48];
                     snprintf(buf, sizeof(buf),
                              "until %04d-%02d-%02d %02d:%02d",

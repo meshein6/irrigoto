@@ -62,6 +62,8 @@ substitutions:
   #   Europe/Berlin    : "CET-1CEST,M3.5.0,M10.5.0/3"
   #   Australia/Sydney : "AEST-10AEDT,M10.1.0,M4.1.0/3"
   #   UTC              : "UTC0"
+  # This is the default only: a zone picked in the web UI (System settings
+  # on the device page) is saved on the device and applied over it at boot.
   device_posix_tz: "EST5EDT,M3.2.0/2,M11.1.0/2"
 
 esphome:

@@ -533,6 +533,24 @@ void irrigoto_schedule_get_last_status(char *buf, size_t len);
 bool irrigoto_schedule_next_run(time_t now, time_t *out_t, int *out_zone);
 
 /**
+ * Local time, independent of localtime_r.
+ *
+ * This build's localtime_r fills in the wall-clock fields using a
+ * stale numeric zone -- it reported Eastern hours while correctly naming
+ * them PDT, and runtime setenv("TZ")+tzset() did not change its answer.
+ * mktime does follow TZ, so these derive local time through mktime and
+ * gmtime_r instead. Use them anywhere local wall-clock time is needed;
+ * calling localtime_r directly will be wrong whenever the zone saved in
+ * System settings differs from the compiled default.
+ *
+ * irrigoto_localtime_r() has localtime_r's contract exactly.
+ * irrigoto_tz_offset_min_at() gives minutes east of UTC (EDT -240,
+ * PDT -420), or 0 when the clock has never been set.
+ */
+struct tm *irrigoto_localtime_r(const time_t *t, struct tm *out);
+int        irrigoto_tz_offset_min_at(time_t t);
+
+/**
  * Rain / wind delay — suspend all schedule firing until a specific time
  * (or for N hours from now). Used by automations that want to skip the
  * next watering because of weather, manual override, etc., without

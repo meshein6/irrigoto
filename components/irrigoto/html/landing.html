@@ -132,6 +132,11 @@ section{margin-bottom:18px;}
 .sys-chips .btn.sel{border-color:var(--green);background:var(--green-dim);color:var(--green);}
 .sys-status{font-size:12px;color:var(--text-mid);text-align:center;margin-top:8px;min-height:16px;}
 .sys-div{border-top:1px solid var(--border);margin:14px 0;}
+.sys-in select{flex:1;min-width:0;background:transparent;border:0;color:var(--text);font-size:14px;
+  padding:9px 0;font-family:inherit;}
+.sys-in select:focus{outline:none;}
+.sys-in select option{background:var(--bg2);color:var(--text);}
+.sys-link{background:none;border:0;color:var(--green);font-size:12px;cursor:pointer;padding:0;text-decoration:underline;}
 .modal-title{font-size:16px;font-weight:600;margin-bottom:4px;}
 .modal-sub{font-size:12px;color:var(--text-mid);margin-bottom:18px;}
 .mode-grid{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-bottom:18px;}
@@ -255,7 +260,7 @@ section{margin-bottom:18px;}
 <div id="sys-bg" onclick="if(event.target===this)closeSys()">
   <div id="sys">
     <div class="modal-title">System settings</div>
-    <div class="modal-sub">Network the device joins, and how long it stays awake between sleeps.</div>
+    <div class="modal-sub">Network the device joins, how long it stays awake between sleeps, and the timezone schedules run in.</div>
 
     <div class="sys-sec">Network</div>
     <div class="sys-field"><label for="sys-ssid">WiFi name (SSID)</label>
@@ -282,10 +287,22 @@ section{margin-bottom:18px;}
     </div>
     <div class="sys-hint" id="sys-cycle-hint"></div>
     <div class="modal-actions">
-      <button class="btn" onclick="closeSys()">Close</button>
       <button class="btn btn-primary" id="sys-pow-btn" onclick="sysSavePower()">Save wake period</button>
     </div>
     <div class="sys-status" id="sys-pow-status"></div>
+
+    <div class="sys-div"></div>
+    <div class="sys-sec">Timezone</div>
+    <div class="sys-field"><label for="sys-tz">Schedule times are in</label>
+      <div class="sys-in"><select id="sys-tz" onchange="sysTzChanged()"></select></div></div>
+    <div class="sys-field" id="sys-tz-custom-f" style="display:none"><label for="sys-tz-custom">POSIX TZ string</label>
+      <div class="sys-in"><input id="sys-tz-custom" maxlength="63" autocomplete="off" autocapitalize="off" spellcheck="false" placeholder="e.g. EST5EDT,M3.2.0/2,M11.1.0/2"></div></div>
+    <div class="sys-hint" id="sys-tz-hint">&mdash;</div>
+    <div class="modal-actions">
+      <button class="btn" onclick="closeSys()">Close</button>
+      <button class="btn btn-primary" id="sys-tz-btn" onclick="sysSaveTz()">Save timezone</button>
+    </div>
+    <div class="sys-status" id="sys-tz-status"></div>
   </div>
 </div>
 
@@ -515,6 +532,7 @@ async function openSys(){
     sysEl('sys-awake').value=d.awake_s; sysEl('sys-sleep').value=d.sleep_s;
     sysAlwaysOn=!!d.always_on;
     sysMarkPreset();
+    sysTzLoad(d);
   }catch(e){ sysEl('sys-net-hint').textContent='Could not read settings: '+e.message; }
 }
 function closeSys(){ sysEl('sys-bg').classList.remove('open'); }
@@ -577,6 +595,113 @@ async function sysSaveNet(){
     st.textContent='Saved. Rebooting to join “'+ssid+'”. '+
       (ssid===sysSsid0 ? 'This page reconnects in about 30 seconds.' : 'Open the device on that network once it’s up.');
   }catch(e){ st.style.color='#f87171'; st.textContent='Save failed: '+e.message; sysEl('sys-net-btn').disabled=false; }
+}
+// Timezone. The device keeps UTC and applies a POSIX TZ string to it, so each
+// choice here is an IANA name (saved as the label) plus its POSIX rule. The
+// first option clears the saved zone and returns to the one compiled into the
+// firmware (device_posix_tz). Ids after the first are aliases with the same rule.
+const SYS_TZ=[
+  ['America/New_York','Eastern (US & Canada)','EST5EDT,M3.2.0/2,M11.1.0/2',['America/Detroit','America/Toronto','America/Indiana/Indianapolis','America/Kentucky/Louisville']],
+  ['America/Chicago','Central (US & Canada)','CST6CDT,M3.2.0/2,M11.1.0/2',['America/Winnipeg','America/Indiana/Knox','America/Menominee']],
+  ['America/Denver','Mountain (US & Canada)','MST7MDT,M3.2.0/2,M11.1.0/2',['America/Edmonton','America/Boise']],
+  ['America/Phoenix','Arizona (no DST)','MST7',[]],
+  ['America/Los_Angeles','Pacific (US & Canada)','PST8PDT,M3.2.0/2,M11.1.0/2',['America/Vancouver','America/Tijuana']],
+  ['America/Anchorage','Alaska','AKST9AKDT,M3.2.0/2,M11.1.0/2',['America/Juneau']],
+  ['Pacific/Honolulu','Hawaii','HST10',[]],
+  ['America/Halifax','Atlantic (Canada)','AST4ADT,M3.2.0/2,M11.1.0/2',['America/Moncton']],
+  ['America/St_Johns','Newfoundland','NST3:30NDT,M3.2.0/2,M11.1.0/2',[]],
+  ['America/Puerto_Rico','Atlantic (no DST)','AST4',[]],
+  ['America/Mexico_City','Mexico City','CST6',['America/Monterrey']],
+  ['America/Sao_Paulo','Brasília','<-03>3',['America/Argentina/Buenos_Aires','America/Montevideo']],
+  ['Europe/London','UK','GMT0BST,M3.5.0/1,M10.5.0/2',['Europe/Dublin','Europe/Guernsey','Europe/Jersey','Europe/Isle_of_Man']],
+  ['Europe/Lisbon','Western Europe','WET0WEST,M3.5.0/1,M10.5.0',['Atlantic/Canary','Atlantic/Madeira']],
+  ['Europe/Berlin','Central Europe','CET-1CEST,M3.5.0,M10.5.0/3',['Europe/Paris','Europe/Madrid','Europe/Rome','Europe/Amsterdam','Europe/Brussels','Europe/Vienna','Europe/Zurich','Europe/Stockholm','Europe/Oslo','Europe/Copenhagen','Europe/Warsaw','Europe/Prague','Europe/Budapest']],
+  ['Europe/Athens','Eastern Europe','EET-2EEST,M3.5.0/3,M10.5.0/4',['Europe/Helsinki','Europe/Bucharest','Europe/Sofia','Europe/Riga','Europe/Vilnius','Europe/Tallinn','Europe/Kyiv','Europe/Kiev']],
+  ['Europe/Moscow','Moscow','MSK-3',[]],
+  ['Africa/Johannesburg','South Africa','SAST-2',[]],
+  ['Asia/Dubai','Gulf','<+04>-4',['Asia/Muscat']],
+  ['Asia/Kolkata','India','IST-5:30',['Asia/Calcutta']],
+  ['Asia/Singapore','Singapore','<+08>-8',['Asia/Kuala_Lumpur','Asia/Manila']],
+  ['Asia/Shanghai','China','CST-8',['Asia/Hong_Kong','Asia/Taipei']],
+  ['Asia/Tokyo','Japan','JST-9',[]],
+  ['Asia/Seoul','Korea','KST-9',[]],
+  ['Australia/Perth','Western Australia','AWST-8',[]],
+  ['Australia/Adelaide','South Australia','ACST-9:30ACDT,M10.1.0,M4.1.0/3',['Australia/Broken_Hill']],
+  ['Australia/Darwin','Northern Territory','ACST-9:30',[]],
+  ['Australia/Brisbane','Queensland','AEST-10',[]],
+  ['Australia/Sydney','Eastern Australia','AEST-10AEDT,M10.1.0,M4.1.0/3',['Australia/Melbourne','Australia/Canberra','Australia/Hobart']],
+  ['Pacific/Auckland','New Zealand','NZST-12NZDT,M9.5.0,M4.1.0/3',[]],
+  ['UTC','UTC','UTC0',['Etc/UTC','GMT','Etc/GMT']],
+];
+let sysTzDefault='';
+function sysTzFind(id){ return SYS_TZ.findIndex(z=>z[0]===id||z[3].includes(id)); }
+function sysTzOffStr(m){
+  const sg=m<0?'−':'+'; m=Math.abs(m);
+  return 'UTC'+sg+String(Math.floor(m/60)).padStart(2,'0')+':'+String(m%60).padStart(2,'0');
+}
+function sysTzLoad(d){
+  sysTzDefault=d.tz_default||'';
+  const dflt=SYS_TZ.find(z=>z[2]===sysTzDefault);
+  const sel=sysEl('sys-tz');
+  sel.innerHTML='<option value="default">Firmware default ('+(dflt?dflt[1]:sysTzDefault||'UTC')+')</option>'+
+    SYS_TZ.map((z,i)=>'<option value="'+i+'">'+z[1]+' — '+z[0]+'</option>').join('')+
+    '<option value="custom">Custom POSIX string…</option>';
+  let v='default';
+  if(d.tz_saved){
+    const i=sysTzFind(d.tz_name);
+    v = (i>=0 && SYS_TZ[i][2]===d.tz) ? String(i) : 'custom';
+  }
+  sel.value=v;
+  sysEl('sys-tz-custom').value = v==='custom' ? d.tz : '';
+  sysEl('sys-tz-status').textContent='';
+  sysTzShow(d);
+  sysTzChanged();
+}
+// Current device time and zone, plus a one-tap fix when the phone's zone differs.
+function sysTzShow(d){
+  const h=sysEl('sys-tz-hint');
+  const where = d.tz_saved ? (d.tz_name||'custom')+' ('+d.tz+')' : 'firmware default ('+d.tz+')';
+  const t = d.now>1700000000 ? fmtLocalEpoch(d.now, d.tz_offset_min)+' ' : 'Clock not set yet. ';
+  let msg='Device time: '+t+sysTzOffStr(d.tz_offset_min)+', '+where+'.';
+  const phone=(Intl.DateTimeFormat().resolvedOptions().timeZone)||'';
+  const pi=sysTzFind(phone);
+  h.innerHTML='';
+  h.appendChild(document.createTextNode(msg));
+  if(phone && pi>=0 && SYS_TZ[pi][2]!==d.tz){
+    h.appendChild(document.createTextNode(' This phone is on '+phone+'. '));
+    const b=document.createElement('button'); b.className='sys-link'; b.type='button';
+    b.textContent='Use it'; b.onclick=()=>{ sysEl('sys-tz').value=String(pi); sysTzChanged(); };
+    h.appendChild(b);
+  }
+}
+function sysTzChanged(){
+  sysEl('sys-tz-custom-f').style.display = sysEl('sys-tz').value==='custom' ? '' : 'none';
+}
+async function sysSaveTz(){
+  const st=sysEl('sys-tz-status'), btn=sysEl('sys-tz-btn'), v=sysEl('sys-tz').value;
+  let tz='', name='';
+  if(v==='custom'){
+    tz=sysEl('sys-tz-custom').value.trim();
+    if(!tz){ st.style.color='#f87171'; st.textContent='Enter a POSIX TZ string, e.g. EST5EDT,M3.2.0/2,M11.1.0/2.'; return; }
+    const phone=(Intl.DateTimeFormat().resolvedOptions().timeZone)||'';
+    name = sysTzFind(phone)<0 ? phone : '';
+  } else if(v!=='default'){
+    const z=SYS_TZ[+v]; tz=z[2];
+    const phone=(Intl.DateTimeFormat().resolvedOptions().timeZone)||'';
+    name = z[3].includes(phone) ? phone : z[0];
+  }
+  btn.disabled=true; st.style.color=''; st.textContent='Saving…';
+  try{
+    const r=await fetch('/api/system',{method:'POST',
+      headers:{'Content-Type':'application/x-www-form-urlencoded'},
+      body:'tz='+encodeURIComponent(tz)+'&tz_name='+encodeURIComponent(name)});
+    if(!r.ok) throw new Error(await r.text());
+    const d=await r.json();
+    sysTzLoad(d);
+    st.style.color='var(--green)';
+    st.textContent='Saved. Schedules now run on '+(d.tz_saved?(d.tz_name||d.tz):'the firmware default')+' time.';
+  }catch(e){ st.style.color='#f87171'; st.textContent='Save failed: '+e.message; }
+  btn.disabled=false;
 }
 function selMode(btn){
   document.querySelectorAll('.mode-btn').forEach(b=>b.classList.remove('sel'));

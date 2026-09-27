@@ -51,6 +51,60 @@
 
 static const char *TAG = "irrigoto";
 
+// ── Local time ────────────────────────────────────────────────────────────
+//
+// libc's localtime_r cannot be trusted on this build. Measured on a unit
+// with a saved zone and TZ=PST8PDT,M3.2.0/2,M11.1.0/2 in the
+// environment, localtime_r labelled the result correctly -- tm_isdst=1 and
+// strftime("%Z") = "PDT" -- while the hour/minute fields it filled in were
+// Eastern, three hours out. Setting TZ to "UTC0" at runtime did not move its
+// answer at all, so the numeric rule it applies is frozen at whatever the
+// on_boot hook installed and no amount of setenv+tzset dislodges it. Every
+// timestamp the device rendered was therefore wrong by the difference
+// between the compiled default zone and the saved one.
+//
+// mktime, in the same binary, does follow TZ: it resolved a 06:00 schedule
+// entry to the correct Pacific epoch throughout. So local time is derived
+// from mktime and gmtime_r, and localtime_r is used only for the tm_isdst
+// flag, which was always right.
+//
+// Offset in minutes east of UTC at instant t (EDT -240, PDT -420).
+// Solved by fixed point: guess the local fields, ask mktime which instant
+// they name, and correct by the error. Converges in two passes away from a
+// DST transition and in three at one.
+int irrigoto_tz_offset_min_at(time_t t)
+{
+    if (t < 1700000000) return 0;        // clock not set -- no meaningful zone
+    long off = 0;
+    for (int i = 0; i < 4; i++) {
+        time_t shifted = t + (time_t)off;
+        struct tm lt;
+        gmtime_r(&shifted, &lt);         // candidate local wall-clock fields
+        lt.tm_isdst = -1;                // let libc pick DST for that date
+        time_t back = mktime(&lt);
+        if (back == (time_t)-1) return 0;
+        long err = (long)t - (long)back;
+        if (err == 0) break;
+        off += err;
+        if (off < -50400L || off > 50400L) return 0;   // past +-14h: nonsense
+    }
+    return (int)(off / 60);
+}
+
+// Drop-in replacement for localtime_r. Same contract: fills *out with the
+// local wall-clock decomposition of *t and returns out.
+struct tm *irrigoto_localtime_r(const time_t *t, struct tm *out)
+{
+    time_t shifted = *t + (time_t)irrigoto_tz_offset_min_at(*t) * 60;
+    gmtime_r(&shifted, out);
+    // gmtime_r always reports tm_isdst = 0. Take the real flag from libc,
+    // which gets this part right, so callers that hand the struct back to
+    // mktime or format it with %Z still behave.
+    struct tm probe;
+    if (localtime_r(t, &probe)) out->tm_isdst = probe.tm_isdst;
+    return out;
+}
+
 // ── GPIO assignments ──────────────────────────────────────────────────────────
 #define GPIO_3V3SEN     GPIO_NUM_4
 #define GPIO_9V_EN      GPIO_NUM_18
@@ -16243,11 +16297,128 @@ static esp_err_t api_time_handler(httpd_req_t *req)
     return ESP_OK;
 }
 
+// ── Timezone (System settings modal) ───────────────────────────────────────
+// The compiled default is the POSIX string the ESPHome on_boot hook sets from
+// the device_posix_tz substitution (priority 800, before irrigoto_init). A zone
+// picked in the web UI is saved in NVS ("tz_posix" + display label "tz_name")
+// and applied over that default at boot. The system clock stays UTC; only
+// libc's TZ changes, so localtime_r()/mktime() in the schedule executor and the
+// tz_offset_min the pages use follow it. Clearing the override restores the
+// compiled default.
+static char s_tz_default[64];   // TZ as set by the on_boot hook (compiled)
+static char s_tz_posix[64];     // saved override ("" = use the default)
+static char s_tz_name[48];      // label for the override, e.g. America/Chicago
+
+// Cheap sanity check, not a full parser: newlib silently falls back to UTC on
+// a string it can't parse, so reject the obvious junk before it's saved.
+// Accepts e.g. "EST5EDT,M3.2.0/2,M11.1.0/2", "UTC0", "<+0530>-5:30".
+static bool tz_posix_valid(const char *s)
+{
+    size_t n = strlen(s);
+    if (n < 4 || n >= sizeof(s_tz_posix)) return false;
+    if (!(isalpha((unsigned char)s[0]) || s[0] == '<')) return false;
+    bool digit = false;
+    for (const char *c = s; *c; c++) {
+        if (isdigit((unsigned char)*c)) digit = true;
+        else if (!isalpha((unsigned char)*c) && !strchr("<>+-,./:", *c)) return false;
+    }
+    return digit;   // the standard-time offset is mandatory
+}
+
+static void tz_apply(const char *posix)
+{
+    // Bounce through a different string before applying the real one.
+    // newlib's tzset() skips the parse entirely when TZ is byte-identical to
+    // the string it last parsed, so re-applying the saved zone over rules
+    // that were clobbered some other way was a silent no-op. The extra
+    // setenv/tzset pair costs microseconds and only runs at boot or on a
+    // deliberate change.
+    setenv("TZ", "UTC0", 1);
+    tzset();
+    setenv("TZ", posix, 1);
+    tzset();
+}
+
+// Minutes east of UTC right now (EDT = -240, PDT = -420), or 0 with no clock.
+// See irrigoto_tz_offset_min_at() near the top of this file for why this does
+// not difference localtime_r against gmtime_r.
+static int tz_offset_min_now(void)
+{
+    return irrigoto_tz_offset_min_at(time(NULL));
+}
+
+// Called from irrigoto_init(), after the on_boot hook has set the default.
+static void tz_init(void)
+{
+    const char *cur = getenv("TZ");
+    strncpy(s_tz_default, (cur && cur[0]) ? cur : "UTC0", sizeof(s_tz_default) - 1);
+    nvs_handle_t h;
+    if (nvs_open(CAL_NVS_NAMESPACE, NVS_READONLY, &h) == ESP_OK) {
+        size_t sz = sizeof(s_tz_posix);
+        if (nvs_get_str(h, "tz_posix", s_tz_posix, &sz) != ESP_OK || !tz_posix_valid(s_tz_posix))
+            s_tz_posix[0] = '\0';
+        sz = sizeof(s_tz_name);
+        if (nvs_get_str(h, "tz_name", s_tz_name, &sz) != ESP_OK) s_tz_name[0] = '\0';
+        nvs_close(h);
+    }
+    if (s_tz_posix[0]) {
+        tz_apply(s_tz_posix);
+        INFO("Timezone: %s (%s) from saved setting; compiled default %s",
+             s_tz_posix, s_tz_name[0] ? s_tz_name : "custom", s_tz_default);
+    }
+}
+
+// Re-assert the saved zone if anything else rewrote libc's TZ (e.g. an ESPHome
+// time component applying its own compiled zone). Polled from
+// esphome_idle_task: a strcmp per call, and a setenv only on a mismatch.
+static void tz_guard(void)
+{
+    if (!s_tz_posix[0]) return;
+    const char *cur = getenv("TZ");
+    if (!cur || strcmp(cur, s_tz_posix) != 0) {
+        WARN("Timezone: TZ was changed to \"%s\" elsewhere; restoring %s",
+             cur ? cur : "", s_tz_posix);
+        tz_apply(s_tz_posix);
+    }
+}
+
+// posix "" clears the override and returns to the compiled default.
+static bool tz_set(const char *posix, const char *name)
+{
+    if (posix[0] && !tz_posix_valid(posix)) return false;
+    nvs_handle_t h;
+    if (nvs_open(CAL_NVS_NAMESPACE, NVS_READWRITE, &h) == ESP_OK) {
+        if (posix[0]) {
+            nvs_set_str(h, "tz_posix", posix);
+            nvs_set_str(h, "tz_name", name);
+        } else {
+            nvs_erase_key(h, "tz_posix");
+            nvs_erase_key(h, "tz_name");
+        }
+        nvs_commit(h); nvs_close(h);
+    }
+    strncpy(s_tz_posix, posix, sizeof(s_tz_posix) - 1);
+    s_tz_posix[sizeof(s_tz_posix) - 1] = '\0';
+    strncpy(s_tz_name, posix[0] ? name : "", sizeof(s_tz_name) - 1);
+    s_tz_name[sizeof(s_tz_name) - 1] = '\0';
+    tz_apply(posix[0] ? s_tz_posix : s_tz_default);
+    // The armed run is a UTC epoch derived under the old zone; drop it so the
+    // next sleep re-arms from the schedule table in the new one.
+    sched_fire_disarm();
+    INFO("Timezone set to %s (%s)", posix[0] ? s_tz_posix : s_tz_default,
+         posix[0] ? (s_tz_name[0] ? s_tz_name : "custom") : "compiled default");
+    return true;
+}
+
 // System settings modal. GET returns the station credentials the device is
-// using plus the wake cycle; POST changes either part.
+// using, the wake cycle and the timezone; POST changes any one part.
 //   GET  /api/system -> {"ssid","password","connected","rssi",
-//                        "always_on","awake_s","sleep_s"}
+//                        "always_on","awake_s","sleep_s",
+//                        "tz","tz_name","tz_default","tz_saved",
+//                        "now","tz_offset_min"}
 //   POST always_on=0|1&awake_s=30..3600&sleep_s=30..3600   (any subset)
+//   POST tz=<POSIX TZ>&tz_name=<label>   saves a zone (tz= empty -> back to
+//        the compiled default). Applies immediately, no reboot.
 //   POST ssid=..&password=..   saves the network through ESPHome's
 //        save_wifi_sta() (same store the captive portal uses; it overrides the
 //        compiled credentials from then on) and reboots to join it. If the new
@@ -16301,6 +16472,16 @@ static esp_err_t api_system_handler(httpd_req_t *req)
             esp_restart();
             return ESP_OK;   // not reached
         }
+        char tz[192] = {0}, tzn[192] = {0};
+        if (httpd_query_key_value(b, "tz", tz, sizeof(tz)) == ESP_OK) {
+            httpd_query_key_value(b, "tz_name", tzn, sizeof(tzn));
+            url_decode(tz, sizeof(s_tz_posix));
+            url_decode(tzn, sizeof(s_tz_name));
+            if (!tz_set(tz, tzn)) {
+                httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "invalid POSIX TZ string");
+                return ESP_OK;
+            }
+        }
         if (httpd_query_key_value(b, "always_on", v, sizeof(v)) == ESP_OK)
             irrigoto_set_auto_sleep_enabled(atoi(v) == 0);
         if (httpd_query_key_value(b, "awake_s", v, sizeof(v)) == ESP_OK)
@@ -16320,14 +16501,57 @@ static esp_err_t api_system_handler(httpd_req_t *req)
     wifi_ap_record_t ap = {0};
     bool connected = (esp_wifi_sta_get_ap_info(&ap) == ESP_OK);
 
-    char buf[768];
+    time_t now = time(NULL);
+    long off = tz_offset_min_now();
+    // Diagnostics: report what libc ACTUALLY holds, not our copy of what
+    // we asked for. s_tz_posix only says what was saved -- before this fix it read
+    // Pacific while every rendered timestamp was Eastern, and nothing in the
+    // response could tell the two apart. tz_env is getenv("TZ"), tz_off_lt is
+    // the old localtime_r-vs-gmtime_r derivation: if it disagrees with
+    // tz_offset_min, localtime_r is running on stale rules.
+    long off_lt = 0;
+    int  lt_isdst = -1;
+    char abbr_buf[16] = {0};
+    const char *abbr = "";
+    if (now > 1700000000) {
+        struct tm lt, gt;
+        localtime_r(&now, &lt);
+        gmtime_r(&now, &gt);
+        lt_isdst = lt.tm_isdst;
+        int diff_days = lt.tm_yday - gt.tm_yday;
+        if (lt.tm_year != gt.tm_year) diff_days = (lt.tm_year > gt.tm_year) ? 1 : -1;
+        off_lt = ((long)(lt.tm_hour - gt.tm_hour) * 3600 + (lt.tm_min - gt.tm_min) * 60
+                  + (lt.tm_sec - gt.tm_sec) + (long)diff_days * 86400) / 60;
+        // strftime("%Z") rather than tzname[]: newlib only declares tzname
+        // under __MISC_VISIBLE, and this tells us the same thing.
+        if (strftime(abbr_buf, sizeof(abbr_buf), "%Z", &lt) == 0) abbr_buf[0] = '\0';
+        abbr = abbr_buf;
+    }
+    const char *tz_env = getenv("TZ");
+    char tze_js[140], abbr_js[24];
+    json_escape(tze_js, sizeof(tze_js), tz_env ? tz_env : "");
+    json_escape(abbr_js, sizeof(abbr_js), abbr);
+    const char *tz_cur = s_tz_posix[0] ? s_tz_posix : s_tz_default;
+    char tz_js[140], tzn_js[100], tzd_js[140];
+    json_escape(tz_js, sizeof(tz_js), tz_cur);
+    json_escape(tzn_js, sizeof(tzn_js), s_tz_name);
+    json_escape(tzd_js, sizeof(tzd_js), s_tz_default);
+
+    char buf[1024];
     int n = snprintf(buf, sizeof(buf),
         "{\"ssid\":\"%s\",\"password\":\"%s\",\"connected\":%s,\"rssi\":%d,"
-        "\"always_on\":%s,\"awake_s\":%lu,\"sleep_s\":%lu}",
+        "\"always_on\":%s,\"awake_s\":%lu,\"sleep_s\":%lu,"
+        "\"tz\":\"%s\",\"tz_name\":\"%s\",\"tz_default\":\"%s\",\"tz_saved\":%s,"
+        "\"tz_env\":\"%s\",\"tz_abbr\":\"%s\",\"tz_isdst\":%d,"
+        "\"tz_offset_lt_min\":%ld,"
+        "\"now\":%ld,\"tz_offset_min\":%ld}",
         ssid_js, pass_js, connected ? "true" : "false", connected ? ap.rssi : 0,
         irrigoto_get_auto_sleep_enabled() ? "false" : "true",
         (unsigned long)irrigoto_get_inactivity_s(),
-        (unsigned long)irrigoto_get_sleep_duration_s());
+        (unsigned long)irrigoto_get_sleep_duration_s(),
+        tz_js, tzn_js, tzd_js, s_tz_posix[0] ? "true" : "false",
+        tze_js, abbr_js, lt_isdst, off_lt,
+        (long)now, off);
     if (n >= (int)sizeof(buf)) n = sizeof(buf) - 1;
     httpd_resp_send(req, buf, n);
     return ESP_OK;
@@ -18085,31 +18309,29 @@ static esp_err_t api_schedule_handler(httpd_req_t *req)
     // DST rules (selected by localtime_r based on the date), unlike a
     // bare mktime call which has to be told the isdst flag externally.
     // Day-of-year wrap is the only edge case — handle it explicitly.
-    int tz_off_min = 0;
+    // Was derived by differencing localtime_r against gmtime_r, which
+    // reported Eastern while the saved zone was Pacific -- so the
+    // schedule page rendered every timestamp, including next run, three hours
+    // out. tz_offset_min_now() asks mktime instead; see its comment.
+    int tz_off_min = tz_offset_min_now();
     int diag_isdst = -2;
+    int diag_off_lt = 0;
     if (now > 1700000000) {
         struct tm lt, gt;
         localtime_r(&now, &lt);
         gmtime_r(&now, &gt);
         diag_isdst = lt.tm_isdst;
-        int diff_sec = (lt.tm_hour - gt.tm_hour) * 3600
-                     + (lt.tm_min  - gt.tm_min)  * 60
-                     + (lt.tm_sec  - gt.tm_sec);
-        // tm_yday wraps at year boundary; clamp to ±1 day delta which is
-        // the only physically possible difference between local and UTC
-        // decompositions of the same instant.
         int diff_days = lt.tm_yday - gt.tm_yday;
-        if (lt.tm_year != gt.tm_year) {
-            diff_days = (lt.tm_year > gt.tm_year) ? 1 : -1;
-        }
-        diff_sec += diff_days * 86400;
-        tz_off_min = diff_sec / 60;
+        if (lt.tm_year != gt.tm_year) diff_days = (lt.tm_year > gt.tm_year) ? 1 : -1;
+        diag_off_lt = ((lt.tm_hour - gt.tm_hour) * 3600 + (lt.tm_min - gt.tm_min) * 60
+                       + (lt.tm_sec - gt.tm_sec) + diff_days * 86400) / 60;
     }
-    // One-line diagnostic so we can verify libc TZ is honoring the
-    // POSIX DST rules. Logged at INFO so it shows up in standard logs
-    // — only fires on schedule-page loads, so it's not spammy.
-    ESP_LOGI(TAG, "schedule api: now=%ld isdst=%d tz_off_min=%d",
-             (long)now, diag_isdst, tz_off_min);
+    // One-line diagnostic so we can verify libc TZ is honoring the POSIX DST
+    // rules. lt_off is the localtime_r derivation: it should now agree with
+    // tz_off_min, and a standing disagreement means localtime_r is still on
+    // stale rules and every localtime_r caller is wrong by that much.
+    ESP_LOGI(TAG, "schedule api: now=%ld isdst=%d tz_off_min=%d lt_off=%d",
+             (long)now, diag_isdst, tz_off_min, diag_off_lt);
 
     char status[160] = {0};
     irrigoto_schedule_get_last_status(status, sizeof(status));
@@ -18907,6 +19129,7 @@ static void esphome_idle_task(void *arg)
     (void)arg;
     while (true) {
         check_inactivity();
+        tz_guard();
         vTaskDelay(pdMS_TO_TICKS(1000));
     }
 }
@@ -18919,6 +19142,7 @@ void irrigoto_init(void)
     // NOTE: wifi_init() / esp_event_loop_create_default() omitted — ESPHome owns those.
 
     pm_nvs_load();        // restore auto_sleep + thresholds + last reason
+    tz_init();            // saved timezone over the compiled on_boot default
     valve_offset_nvs_load();  // b389: per-unit valve frame, BEFORE boot valve-close
     check_battery_on_boot();   // b525: also the winter-wake battery gate --
                                // forever-sleeps below BATT_MIN_VOLTAGE_V
@@ -19918,7 +20142,7 @@ void irrigoto_schedule_set_delay_until(time_t t)
     schedule_delay_stamp_local();
     schedule_delay_save_nvs();
     // Log + status using local time so the user sees what they set.
-    struct tm lt; localtime_r(&t, &lt);
+    struct tm lt; irrigoto_localtime_r(&t, &lt);
     INFO("Schedule delay set: suspended until %04d-%02d-%02d %02d:%02d",
          lt.tm_year+1900, lt.tm_mon+1, lt.tm_mday, lt.tm_hour, lt.tm_min);
     snprintf(s_sched_last_status, sizeof(s_sched_last_status),
@@ -19994,7 +20218,7 @@ bool irrigoto_schedule_sync_delay(time_t until, time_t lm)
         snprintf(s_sched_last_status, sizeof(s_sched_last_status),
                  "delay cleared (HA)");
     } else {
-        struct tm lt; localtime_r(&until, &lt);
+        struct tm lt; irrigoto_localtime_r(&until, &lt);
         INFO("Schedule delay set (sync from HA): suspended until %04d-%02d-%02d %02d:%02d",
              lt.tm_year+1900, lt.tm_mon+1, lt.tm_mday, lt.tm_hour, lt.tm_min);
         snprintf(s_sched_last_status, sizeof(s_sched_last_status),
@@ -20735,12 +20959,12 @@ bool irrigoto_schedule_next_run(time_t now, time_t *out_t, int *out_zone)
         for (int d = 0; d < 15; d++) {
             time_t t = earliest + d * 86400;
             struct tm lt;
-            localtime_r(&t, &lt);
+            irrigoto_localtime_r(&t, &lt);
             lt.tm_hour = e->hour; lt.tm_min = e->minute; lt.tm_sec = 0;
             time_t fire_t = mktime(&lt);
             if (fire_t <= earliest) continue;  // already past or in delay
             // Re-check day-of-week of fire_t (DST shifts can reorder)
-            struct tm flt; localtime_r(&fire_t, &flt);
+            struct tm flt; irrigoto_localtime_r(&fire_t, &flt);
             if (!(e->days_mask & (1u << flt.tm_wday))) continue;
             if (best_t == 0 || fire_t < best_t) {
                 best_t = fire_t;
@@ -20772,11 +20996,11 @@ static bool schedule_next_run_full(time_t now, time_t *out_t,
         if (!e->enabled || e->days_mask == 0) continue;
         for (int d = 0; d < 15; d++) {
             time_t t = earliest + d * 86400;
-            struct tm lt; localtime_r(&t, &lt);
+            struct tm lt; irrigoto_localtime_r(&t, &lt);
             lt.tm_hour = e->hour; lt.tm_min = e->minute; lt.tm_sec = 0;
             time_t fire_t = mktime(&lt);
             if (fire_t <= earliest) continue;
-            struct tm flt; localtime_r(&fire_t, &flt);
+            struct tm flt; irrigoto_localtime_r(&fire_t, &flt);
             if (!(e->days_mask & (1u << flt.tm_wday))) continue;
             if (best_t == 0 || fire_t < best_t) { best_t = fire_t; best = e; }
             break;
@@ -20886,10 +21110,10 @@ static void schedule_task(void *arg)
             // that straddles midnight still finds a late-night slot.
             for (int doff = 0; doff >= -1; doff--) {
                 time_t base = now + doff * 86400;
-                struct tm lt; localtime_r(&base, &lt);
+                struct tm lt; irrigoto_localtime_r(&base, &lt);
                 lt.tm_hour = e->hour; lt.tm_min = e->minute; lt.tm_sec = 0;
                 time_t fire_t = mktime(&lt);
-                struct tm flt; localtime_r(&fire_t, &flt);
+                struct tm flt; irrigoto_localtime_r(&fire_t, &flt);
                 if (!(e->days_mask & (1u << flt.tm_wday))) continue;
                 if (now < fire_t) continue;                       // not yet due
                 if (now - fire_t >= (time_t)SCHED_CATCHUP_S) {
