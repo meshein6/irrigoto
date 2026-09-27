@@ -11653,6 +11653,18 @@ abort:
 #define WATER_LOG_BUFFER_SIZE  24576   // 24 KB, ~500-700 log lines typical
 #define WATER_LAST_LOG_PATH    "/lfs/water/last_log.txt"   // b520: persisted copy
 
+// b586: a pinned head, so the run-start block always survives.
+//
+// The ring buffer drops the OLDEST bytes on wrap, and the oldest bytes are
+// the plan: coverage, the pass schedule per ring, the estimate, the supply
+// settle. Those are exactly what is needed to check the plan against what
+// executed, and on a completed run they were always gone. DRAM is at 93.5%
+// so the buffer cannot simply grow; 1.5 KB of pinned head is affordable and
+// captures the whole preamble. Once it is full, capture continues into the
+// ring as before, so the end of the run is still kept too.
+#define WATER_LOG_HEAD_SIZE  1536
+static char     s_watering_log_head[WATER_LOG_HEAD_SIZE];
+static volatile uint16_t s_watering_log_head_len = 0;
 static char     s_watering_log_buf[WATER_LOG_BUFFER_SIZE];
 static volatile uint16_t s_watering_log_pos = 0;
 static volatile bool     s_watering_log_wrapped = false;
@@ -11680,6 +11692,18 @@ static int water_log_vprintf(const char *fmt, va_list args)
     if (!s_watering_log_active || len <= 0) return n;
     if (len > (int)sizeof(line) - 1) len = sizeof(line) - 1;
 
+    // b586: fill the pinned head first; it is never overwritten.
+    if (s_watering_log_head_len < WATER_LOG_HEAD_SIZE) {
+        int room = WATER_LOG_HEAD_SIZE - s_watering_log_head_len;
+        int take = (len < room) ? len : room;
+        memcpy(&s_watering_log_head[s_watering_log_head_len], line, take);
+        s_watering_log_head_len = (uint16_t)(s_watering_log_head_len + take);
+        if (take == len) return n;      // wholly captured in the head
+        line[0] = '\0';                 // remainder falls through to the ring
+        memmove(line, line + take, len - take);
+        len -= take;
+    }
+
     // Append to ring buffer
     for (int i = 0; i < len; i++) {
         s_watering_log_buf[s_watering_log_pos] = line[i];
@@ -11697,6 +11721,7 @@ static void watering_log_capture_start(void)
 {
     s_watering_log_pos = 0;
     s_watering_log_wrapped = false;
+    s_watering_log_head_len = 0;   // b586
     s_watering_log_active = true;
     s_prev_vprintf = esp_log_set_vprintf(water_log_vprintf);
     INFO("Watering RAM log buffer armed (%u bytes)", WATER_LOG_BUFFER_SIZE);
@@ -11721,6 +11746,14 @@ static void watering_log_capture_stop(void)
     // in the same settle window as the run's .wbin -- no mid-run file I/O.
     FILE *f = fopen(WATER_LAST_LOG_PATH, "w");
     if (f) {
+        // b586: pinned run-start block first, so the persisted copy carries
+        // the plan and schedule too -- that copy is what survives a sleep,
+        // and it had the same hole as the RAM one.
+        if (s_watering_log_head_len > 0) {
+            fwrite(s_watering_log_head, 1, s_watering_log_head_len, f);
+            if (s_watering_log_wrapped)
+                fputs("\n# --- run start above is pinned; ring buffer below wrapped ---\n", f);
+        }
         if (s_watering_log_wrapped) {
             uint16_t pos = s_watering_log_pos;
             if (pos < WATER_LOG_BUFFER_SIZE)
@@ -20237,7 +20270,8 @@ static esp_err_t zone_water_trace_handler(httpd_req_t *req)
 // reboots. Cleared format: plain text, chronological order.
 static esp_err_t zone_last_log_handler(httpd_req_t *req)
 {
-    if (s_watering_log_pos == 0 && !s_watering_log_wrapped) {
+    if (s_watering_log_pos == 0 && !s_watering_log_wrapped
+            && s_watering_log_head_len == 0) {
         // b520: nothing in RAM (fresh boot after deep sleep) -- serve the
         // copy persisted at the last run's closeout, if there is one.
         FILE *f = fopen(WATER_LAST_LOG_PATH, "r");
@@ -20262,6 +20296,15 @@ static esp_err_t zone_last_log_handler(httpd_req_t *req)
     httpd_resp_set_type(req, "text/plain");
     httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
     HTTP_CONN_CLOSE(req);
+
+    // b586: the pinned run-start block first -- the plan, the schedule and
+    // the estimate, which the ring buffer used to drop on every completed run.
+    if (s_watering_log_head_len > 0) {
+        httpd_resp_send_chunk(req, s_watering_log_head, s_watering_log_head_len);
+        if (s_watering_log_wrapped)
+            httpd_resp_sendstr_chunk(req,
+                "\n# --- run start above is pinned; the ring buffer below wrapped ---\n");
+    }
 
     if (s_watering_log_wrapped) {
         // Buffer wrapped: send tail (older portion) first, then head.
