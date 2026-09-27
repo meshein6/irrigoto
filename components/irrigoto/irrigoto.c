@@ -15199,10 +15199,10 @@ static esp_err_t zone_act_handler(httpd_req_t *req)
         // Open-loop: step valve angle up, then read PSI to derive throw
         ZONE_STEP_VALVE(+1);
         if (s_web_water) {
-        // b550: DIRECT, not valve_goto_ex. Any target in the friction zone
-        // (~1.6 to 10.5 ft on this unit) routes valve_goto_ex to
+        // b550: interactive, not valve_goto_ex. Any target in the friction
+        // zone (~5.9 to 23.3 ft on this unit) routes valve_goto_ex to
         // valve_goto_jog, which on an opening move first drives the valve to
-        // VALVE_FRICTION_HI + 2 (~13.1 ft of throw), waits 300 ms, and only
+        // VALVE_FRICTION_HI + 2 (~24.6 ft of throw), waits 300 ms, and only
         // then jogs closed onto the target. That snap-through exists so a
         // WATERING RUN lands on a repeatable valve position, and it is worth
         // it there. On the d-pad it fired on every upward press, which is the
@@ -15281,9 +15281,16 @@ static esp_err_t zone_act_handler(httpd_req_t *req)
                 s_web_pres_pct  = ZONE_WEB_PRES_MAX;
                 s_web_valve_deg = VALVE_OPEN_DEG;
             }
+            // b552: valve_goto() routes a friction-zone target to
+            // valve_goto_jog, which opens past it to VALVE_FRICTION_HI + 2
+            // and dwells 300 ms before closing back down -- about 24.6 ft of
+            // throw on this unit. Turning the water on at any dialed amount
+            // between ~5.9 and ~23.3 ft therefore threw a hard burst across
+            // the yard first. Same interactive path as the d-pad: keep the
+            // pulsed approach, drop the excursion.
             // Tight tolerance (1.0 deg) only at the hard stop, where
             // predictive braking otherwise parks 1-2 deg short of it.
-            valve_goto(s_web_valve_deg, wide ? 1.0f : 2.0f, 10000, false);
+            valve_goto_interactive(s_web_valve_deg, wide ? 1.0f : 2.0f, 10000);
             s_valve_last_dir = 1;
             // Read initial PSI so throw display is live from the start
             vTaskDelay(pdMS_TO_TICKS(ZONE_WEB_SETTLE_MS));
