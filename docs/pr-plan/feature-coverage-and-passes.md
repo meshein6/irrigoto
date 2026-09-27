@@ -1,7 +1,9 @@
 # Coverage on the zone, depth + passes on the run, speed solved from both
 
 **Branch:** `feature/coverage-and-passes` · **Type:** feature · **Status:**
-planned. Owner design, 2026-09-26: *"I should get coverage settings in the
+BUILT in b556-b560, dry-verified on hardware; wet test outstanding, and
+per-schedule-entry passes still to do (see "What is not done" at the end).
+Owner design, 2026-09-26: *"I should get coverage settings in the
 zone config and then for an actual run I should be able to control the depth
 and number of passes which calculates a speed for you. Make sure to bound
 these two variables to avoid creating runs that are too fast."*
@@ -133,3 +135,95 @@ of duplicating the flow model in JavaScript.
   warn at exactly the point the firmware would clamp.
 - A deliberately impossible combination in each direction, confirming the
   message names the right fix.
+
+
+---
+
+# Build notes (b556-b560)
+
+## What landed
+
+**Coverage, on the zone.** `zone_perimeter_t` carries a `coverage` byte
+(0/1/2 = Standard/Fine/Finest); 0 is what every pre-existing zone reads as, so
+nothing already saved changes. It persists in the zone JSON and through
+`storage_zone_parse_json`, so an imported zone keeps it. `zone_load_nvs` now
+zeroes before reading, which is what makes a shorter pre-b556 NVS blob leave
+the new tail byte at Standard instead of stack garbage.
+
+The scale reaches ring generation and the depth accounting through
+`s_ring_pitch_mm` / `s_ring_footprint_mm`, threaded to **all four**
+ring-generation sites and **all three** footprint-tolerance sites, so the two
+cannot drift apart. `water_run_t.ring_footprint_mm` records what the run used
+and `ring_covers()` reads it back, so a Finest run does not double-count its
+ring overlap and report depth it never applied — and the heatmap stays correct
+across a reboot, since it is persisted in the run JSON.
+
+Picker sits in Zone Setup under the readout, with a one-line note per option.
+Saved with the zone, which also drops the cached heatmap — correct here, since
+changing ring pitch invalidates the old ring layout.
+
+**Passes, on the run.** `s_web_water_passes`, consumed once by
+`phase_water_zone` like the depth beside it, 0 = each mode's existing
+behaviour. `per_pass_target = depth_mm / passes` feeds the speed solver in both
+paths — the shared ring loop (which already computed `depth_mm / passes`, it
+just had no way to be told) and `serpentine_build_pass_plan` for
+Serpentine/Sections. Pulse, whose pass *is* its depth unit, takes the request as
+its pass count outright.
+
+**The bound, made visible.** `GET /api/run_plan?zone=&depth=&passes=` walks the
+same ring ladder at the zone's coverage, asks the solver for each ring's speed,
+and reports the clamp. The Water modal shows it live as the pickers move:
+sweep speed and estimated minutes when the combination works, and when it does
+not, which way it is wrong and what to change.
+
+The advice **solves for** the smallest pass count that clears the clamp rather
+than suggesting "double it" — on the measured zone a 1/8" target needs 3
+passes, and doubling from 1 to 2 would still have been clamped.
+
+## Two findings from building it
+
+**This unit has no slow-speed floor.** `/lfs/cal/speed.json` has
+`min_continuous_dps: 0.00`, so `serpentine_ring_dps` clamps *nothing* on the
+slow side and the solver will command a sweep slower than the nozzle can
+sustain — it stalls instead of crawling. `/api/run_plan` judges against a
+conservative 10.9 dps, reports `speed_floor_cal: false`, and says so in the
+advice rather than quietly implying the limit is measured.
+
+**The zone is already under-delivering, and the model predicts it.** At 1/8"
+in one pass every ring wants a sweep below the floor. The last real run's own
+record agrees: `target_depth_mm 3.175`, `actual_avg_depth_mm 1.53` — 48% of
+target. That is exactly the "too few passes" failure, and until now nothing
+anywhere said so; the run just reported completion.
+
+Measured plan output (zone 0, 237 deg arc, 20 rings, Standard coverage):
+
+```
+depth  passes  per_pass   dps range      clamp  suggest  est_min
+1/8    1       3.17 mm    10.9-10.9      slow   3        7.2
+1/8    2       1.59 mm    10.9-11.4      slow   3       14.4
+1/8    4       0.79 mm    10.9-22.8      none   3       20.8
+2/8    8       0.79 mm    10.9-22.8      none   6       41.6
+8/8    8       3.17 mm    10.9-10.9      slow   0       57.9
+```
+
+The 7.2 min estimate for 1/8" x1 sits against a measured 5.9 min for the last
+real run, so the flow model is in the right place.
+
+Note that run time does not fall as passes rise: the same water is being
+applied either way. Passes change *how* it is applied — many light fast passes
+against one slow heavy one — not how long it takes. Where the clamp bites,
+more passes cost more time, because every pass then runs pinned at the floor.
+
+## What is not done
+
+- **Passes on schedule entries.** Only manual runs carry the parameter. The
+  schedule blob needs a schema bump with an NVS migration, plus the HA package,
+  and scheduled runs keep each mode's existing behaviour until then.
+- **No wet test.** Everything above is dry: endpoint arithmetic, ring counts
+  and persistence. Whether Fine/Finest actually improve uniformity, and whether
+  the suggested pass count reaches target, needs a run and a heatmap.
+- **The serpentine leg cap** (build order step 4) is untouched. b547 already
+  warns loudly on truncation; finer coverage will make it fire sooner, and the
+  measured log hit the cap at 20 rings on Standard.
+- **Speed calibration should be re-run** on this unit before trusting the
+  slow-side bound, since the floor it is being judged against is assumed.

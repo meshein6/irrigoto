@@ -180,6 +180,12 @@ section{margin-bottom:18px;}
 .est b.unset{color:var(--orange);font-weight:400;font-size:11px;}
 .hint{font-size:11px;color:var(--text-mid);margin-top:4px;line-height:1.4;}
 /* Mode + Depth pickers (b535) -- any mode at any depth, like the schedule. */
+/* b559: run-plan feedback under the pickers. Green when the combination is
+   achievable, amber when the firmware would clamp and quietly miss target. */
+#plan-note{font-size:11px;line-height:1.45;margin-top:8px;min-height:14px;}
+#plan-note.plan-ok{color:var(--text-dim);}
+#plan-note.plan-warn{color:#ff8c00;}
+
 .pick-lbl{display:flex;align-items:center;gap:6px;font-size:10px;letter-spacing:.12em;
   text-transform:uppercase;color:var(--text-mid);margin:0 0 6px;}
 .pick-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:6px;margin-bottom:14px;}
@@ -442,6 +448,12 @@ section{margin-bottom:18px;}
     <div id="depth-block">
       <div class="pick-lbl">Depth</div>
       <div class="pick-grid depth" id="depth-pick"></div>
+      <!-- b559: passes is a RUN property, like depth. Coverage (how close the
+           rings sit) belongs to the zone and lives in Zone Setup. Speed is
+           neither -- it is solved from depth, passes and the zone. -->
+      <div class="pick-lbl" style="margin-top:10px">Passes</div>
+      <div class="pick-grid depth" id="passes-pick"></div>
+      <div id="plan-note"></div>
     </div>
     <div id="path-row">
       <canvas id="path-thumb" width="128" height="128" onclick="openPathFull()"
@@ -872,6 +884,7 @@ const MODE_HELP = {
   'd': '<b>Demo.</b> Max-speed sweep. Not tracked as watering.',
 };
 let selDepth = 1;
+let selPasses = 1;
 function buildDepthPicker(){
   const g = document.getElementById('depth-pick');
   if (!g || g.children.length) return;
@@ -885,6 +898,54 @@ function selDepthBtn(btn){
   saveModePrefs();
   solModeChanged();   // depth changes the run length, so the mL estimate moves
   renderPathThumb();
+  refreshRunPlan();
+}
+
+// b559: how many passes to spread the depth over. More passes means each one
+// deposits less and so sweeps faster; fewer means a slower, heavier sweep.
+function buildPassesPicker(){
+  const g = document.getElementById('passes-pick');
+  if (!g || g.children.length) return;
+  g.innerHTML = [1,2,3,4,5,6,7,8].map(v =>
+    '<button class="pick' + (v === selPasses ? ' sel' : '') + '" data-passes="' + v + '" ' +
+    'onclick="selPassesBtn(this)">' + v + '</button>').join('');
+}
+function selPassesBtn(btn){
+  selPasses = +btn.dataset.passes;
+  document.querySelectorAll('#passes-pick .pick').forEach(b => b.classList.toggle('sel', b === btn));
+  saveModePrefs();
+  refreshRunPlan();
+}
+
+// Ask the firmware whether this depth/passes combination is actually
+// achievable. The clamp fails in both directions and used to fail silently --
+// a run would simply miss its target -- so the answer is shown as the pickers
+// move, the same live-feedback pattern the solution mL estimate uses. The
+// arithmetic stays on the device, where the pressure cal and speed map live.
+let _planSeq = 0;
+function refreshRunPlan(){
+  const el = document.getElementById('plan-note');
+  if (!el) return;
+  if (selModeDat === 'c' || selModeDat === 'd') { el.textContent = ''; el.className = ''; return; }
+  const seq = ++_planSeq;
+  fetch('/api/run_plan?zone=' + selZoneId + '&depth=' + selDepth + '&passes=' + selPasses,
+        {cache:'no-store'})
+    .then(r => r.json())
+    .then(p => {
+      if (seq !== _planSeq) return;           // a newer pick already answered
+      if (!p || !p.ok) { el.textContent = ''; el.className = ''; return; }
+      const mins = p.est_min >= 1 ? Math.round(p.est_min) + ' min' : '< 1 min';
+      if (p.clamp === 'none') {
+        el.className = 'plan-ok';
+        el.textContent = 'About ' + mins + ' \u00b7 ' + p.per_pass_mm.toFixed(2) +
+                         ' mm per pass \u00b7 sweep ' + p.dps_min.toFixed(0) + '\u2013' +
+                         p.dps_max.toFixed(0) + '\u00b0/s';
+      } else {
+        el.className = 'plan-warn';
+        el.textContent = p.advice;
+      }
+    })
+    .catch(() => { el.textContent = ''; el.className = ''; });
 }
 // Chase shows its duration slider; Chase and Demo have no depth.
 function applyModeVisibility(){
@@ -904,16 +965,18 @@ function toggleModeHelp(){
   if (btn) btn.setAttribute('aria-expanded', on ? 'true' : 'false');
 }
 function saveModePrefs(){
-  try { localStorage.setItem('irrigoto_mode', JSON.stringify({mode:selModeDat, depth:selDepth})); } catch(_){}
+  try { localStorage.setItem('irrigoto_mode', JSON.stringify({mode:selModeDat, depth:selDepth, passes:selPasses})); } catch(_){}
 }
 function restoreModePrefs(){
   let p = {};
   try { p = JSON.parse(localStorage.getItem('irrigoto_mode') || '{}'); } catch(_){}
   if (MODE_HELP[p.mode]) selModeDat = p.mode;
   if (p.depth >= 1 && p.depth <= 8) selDepth = p.depth;
-  buildDepthPicker();
+  if (p.passes >= 1 && p.passes <= 8) selPasses = p.passes;
+  buildDepthPicker(); buildPassesPicker(); refreshRunPlan();
   document.querySelectorAll('#mode-pick .pick').forEach(b => b.classList.toggle('sel', b.dataset.mode === selModeDat));
   document.querySelectorAll('#depth-pick .pick').forEach(b => b.classList.toggle('sel', +b.dataset.depth === selDepth));
+  document.querySelectorAll('#passes-pick .pick').forEach(b => b.classList.toggle('sel', +b.dataset.passes === selPasses));
   applyModeVisibility();
 }
 
@@ -1008,6 +1071,7 @@ async function startWater(){
     body += '&duration=' + d;
   } else if (selModeDat !== 'd') {
     body += '&depth=' + selDepth;   // b535: eighths; Demo/Chase send none
+    body += '&passes=' + selPasses; // b559
   }
   const sol=solState();
   if (solEnabled && sol.enabled && SOL_MODE_MAP[selModeDat]) {

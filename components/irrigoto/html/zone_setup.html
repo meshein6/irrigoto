@@ -157,6 +157,19 @@ header{
 }
 
 /* ── D-Pad ── */
+/* b556: zone coverage picker */
+#coverage-row{flex-shrink:0;padding:2px 16px 8px;}
+.cov-label{font-size:10px;letter-spacing:.08em;color:var(--text-dim);
+  text-transform:uppercase;margin-bottom:5px;}
+.cov-btns{display:flex;gap:6px;}
+.covb{flex:1;padding:8px 0;background:var(--btn);
+  border:1px solid var(--border);border-radius:var(--radius-sm);
+  color:var(--text-mid);font-size:12px;font-family:inherit;cursor:pointer;
+  transition:all .1s;}
+.covb.sel{color:var(--green);border-color:var(--green);
+  background:var(--green-dim);box-shadow:0 0 10px var(--green-glow);}
+.cov-note{font-size:10px;color:var(--text-dim);margin-top:5px;min-height:12px;}
+
 #dpad-section{
   flex-shrink:0;display:flex;align-items:center;
   justify-content:center;gap:16px;padding:12px 16px;
@@ -315,6 +328,20 @@ header{
   <div class="rcel"><div class="rlabel">Bearing</div><div class="rval" id="v-bearing">--.-°</div></div>
   <div class="rcel" style="position:relative;"><div class="rlabel">Throw</div><div class="rval" id="v-throw">-- ft</div><button id="btn-trim" class="water-off" onclick="doTrim()" title="Trim to actual">⊙ trim</button></div>
   <div class="rcel"><div class="rlabel">Points</div><div class="rval" id="v-points">0 / 36</div></div>
+</div>
+
+<!-- b556: coverage is a property of the ZONE -- how close together the
+     watering rings sit, which follows the zone's size and shape and does not
+     change run to run. Depth and passes belong to a run and live in the Water
+     modal instead. Saved with the zone. -->
+<div id="coverage-row">
+  <div class="cov-label">Ring coverage</div>
+  <div class="cov-btns">
+    <button class="covb" data-cov="0" onclick="setCoverage(0)">Standard</button>
+    <button class="covb" data-cov="1" onclick="setCoverage(1)">Fine</button>
+    <button class="covb" data-cov="2" onclick="setCoverage(2)">Finest</button>
+  </div>
+  <div class="cov-note" id="cov-note">&nbsp;</div>
 </div>
 
 <div id="dpad-section">
@@ -1011,6 +1038,7 @@ function applyState(s){
   // b550: say which state it is in, not just glow. The green-on-dark glow
   // alone is hard to read outdoors, and it is the one control where guessing
   // wrong means water on the ground.
+  if (typeof s.coverage === 'number' && !_covEdited) paintCoverage(s.coverage);
   const wb=document.getElementById('btn-water');
   wb.classList.toggle('on',s.water);
   wb.textContent = s.water ? '💧 Water ON' : '💧 Water OFF';
@@ -1086,6 +1114,7 @@ async function doAct(cmd){
     applyFresh(seq, j);
     if(cmd==='save'){
       toast('Zone saved ✓');
+      _covEdited = false;   // b556: saved, so the device is authoritative again
       // Zone geometry changed -- clear cached heatmap data so stale coverage
       // is not shown.  Files were deleted server-side; clear JS state too.
       lastRun=null; waterCSVRows=null; draw();
@@ -1156,6 +1185,29 @@ function holdStop(){
 ['pointerup','pointercancel'].forEach(function(ev){ window.addEventListener(ev, holdStop); });
 window.addEventListener('blur', holdStop);
 document.addEventListener('visibilitychange', function(){ if(document.hidden) holdStop(); });
+
+// ── Zone coverage ───────────────────────────────────────────────
+// b556: ring spacing for this zone. Scales the pitch the firmware generates
+// rings at -- and the footprint width it credits depth over, which have to
+// move together or closer rings double-count their overlap.
+let _covEdited = false;   // don't let the poll clobber a fresh choice
+const COV_NOTE = [
+  'Default spacing. Fewest rings, shortest run.',
+  'Rings 25% closer. More even, and a longer run.',
+  'Rings 50% closer. Most even; longest run, and most legs to plan.'
+];
+async function setCoverage(v){
+  _covEdited = true;
+  paintCoverage(v);
+  await doAct('set_coverage&v='+v);
+  toast('Coverage set \u2014 Save the zone to keep it');
+}
+function paintCoverage(v){
+  document.querySelectorAll('.covb').forEach(function(b){
+    b.classList.toggle('sel', +b.dataset.cov === v);
+  });
+  document.getElementById('cov-note').textContent = COV_NOTE[v] || '';
+}
 
 // ── Connection indicator ────────────────────────────────────────
 function setConn(ok){

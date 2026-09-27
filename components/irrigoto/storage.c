@@ -312,6 +312,10 @@ esp_err_t storage_zone_load(uint16_t id, char *name_out, size_t name_len,
         int np = 0;
         json_get_int(json, "num_points", &np);
         zone_out->num_points = (uint8_t)np;
+        /* b556: absent in a zone written before this build -> Standard. */
+        { int cv = 0;
+          if (json_get_int(json, "coverage", &cv) && cv >= 0 && cv <= ZONE_COVERAGE_FINEST)
+              zone_out->coverage = (uint8_t)cv; }
 
         /* Points array: "points":[{...},{...},...] */
         const char *pp = strstr(json, "\"points\":");
@@ -378,6 +382,9 @@ esp_err_t storage_zone_parse_json(const char *json, int *out_id,
     }
 
     memset(zone_out, 0, sizeof(*zone_out));
+    { int cv = 0;                                   /* b556: absent -> Standard */
+      if (json_get_int(json, "coverage", &cv) && cv >= 0 && cv <= ZONE_COVERAGE_FINEST)
+          zone_out->coverage = (uint8_t)cv; }
     int np = 0;
     json_get_int(json, "num_points", &np);
     if (np < 0) np = 0;
@@ -436,6 +443,7 @@ esp_err_t storage_zone_save(uint16_t id, const char *name, const zone_perimeter_
     fprintf(f, "  \"id\": %u,\n", id);
     fprintf(f, "  \"name\": \"%s\",\n", name ? name : "Zone");
     fprintf(f, "  \"num_points\": %u,\n", zone->num_points);
+    fprintf(f, "  \"coverage\": %u,\n", zone->coverage);   /* b556 */
     fprintf(f, "  \"points\": [\n");
     for (int i = 0; i < zone->num_points; i++) {
         const perimeter_point_t *p = &zone->points[i];
@@ -615,6 +623,7 @@ esp_err_t storage_water_save(uint16_t zone_id, const water_run_t *run)
     fprintf(f, "{\n  \"zone_id\": %u,\n  \"fw_build\": %u,\n  \"num_rings\": %u,\n"
                "  \"arc_start\": %.1f,\n  \"arc_span\": %.1f,\n"
                "  \"total_time_s\": %.1f,\n"
+               "  \"ring_footprint_mm\": %.1f,\n"   /* b556 */
                // b281: run-level supply pressure summary (back-computed from
                // per-ring avg_psi via cal's f(valve_deg)). Diagnoses well-pump
                // cycling impact on watering uniformity.
@@ -626,6 +635,7 @@ esp_err_t storage_water_save(uint16_t zone_id, const water_run_t *run)
                "  \"target_depth_mm\": %.3f,\n",
             zone_id, run->fw_build, run->num_rings,
             run->arc_start_deg, run->arc_span_deg, run->total_time_s,
+            run->ring_footprint_mm,                          /* b556 */
             run->supply_psi_min, run->supply_psi_max, run->supply_psi_avg,
             (unsigned)run->rings_supply_limited, run->target_depth_mm);
     fprintf(f, "  \"rings\": [\n");
@@ -669,6 +679,8 @@ esp_err_t storage_water_load(uint16_t zone_id, water_run_t *run)
       if (json_get_float(json, "arc_start",     &fv2)) run->arc_start_deg = fv2;
       if (json_get_float(json, "arc_span",      &fv2)) run->arc_span_deg  = fv2;
       if (json_get_float(json, "total_time_s",  &fv2)) run->total_time_s  = fv2;
+      /* b556: 0 in a pre-b556 file -> ring_covers() keeps the old fixed width */
+      if (json_get_float(json, "ring_footprint_mm", &fv2)) run->ring_footprint_mm = fv2;
       // b281: run-level supply summary (zeroes if loading a pre-b281 file)
       if (json_get_float(json, "supply_psi_min", &fv2)) run->supply_psi_min = fv2;
       if (json_get_float(json, "supply_psi_max", &fv2)) run->supply_psi_max = fv2;
