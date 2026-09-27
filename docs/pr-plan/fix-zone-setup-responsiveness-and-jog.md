@@ -129,3 +129,53 @@ stall-kick now that the approach-from-above is gone. The kick, if it appears,
 scales with supply pressure — so it is most likely to show on a high-pressure
 regulated line, and the tell is the stream hunting briefly rather than
 jumping far and returning.
+
+## 7. The model error underneath all of it (b555)
+
+Everything above treated the valve ANGLE as the stored setpoint and re-derived
+the distance from it. That is what kept generating new symptoms:
+
+- Dry, the derivation uses the valve->throw curve. Wet, the stream obeys
+  pressure and `cal_pressure_to_throw_mm` is a *different* curve. They agree
+  only while supply pressure still matches what it was at calibration, so the
+  number on screen and the stream on the lawn disagreed — reported as *"when I
+  turn it on it will jump back like 2 feet from whatever I set"*.
+- A distance step is not a fixed angular step. At 552 mm/deg a 0.25 ft press
+  is 0.14 deg, which sat inside the 1.0 deg positioning tolerance introduced
+  alongside ft-stepping — so with the water on, presses did nothing at all.
+- An interim fix stepped from the MEASURED throw to match the measured
+  readout, which fed a loop: measured -> valve angle -> more open -> higher
+  measured, running to the top in a few presses.
+- Another interim fix "corrected" at water-on with
+  `cal_throw_to_valve_deg(cal_valve_deg_to_throw_mm(V))` — the exact inverse
+  of how V was chosen, so it returned the angle already held and corrected
+  nothing. It looked right and was a no-op.
+
+The dialed **distance** (`s_web_target_mm`) is the setpoint now. Each press
+moves it by exactly the step and the readout shows it, so it never drifts on
+its own. The valve angle is only how the setpoint is pursued: a press forces
+at least `ZONE_WEB_MIN_MOVE_DEG` (0.35) of valve motion so a sub-degree
+distance step still moves the hardware, with `ZONE_WEB_MOVE_TOL_DEG` (0.25)
+beneath it so the move is not swallowed by the tolerance. Where the curve is
+steep enough that the forced minimum exceeds the requested step, the real
+increment is coarser than asked — that is the hardware's resolution, not a
+defect, and it is why the control is specified in distance rather than angle.
+
+At water-on the loop is closed on the measurement: error in mm converted to
+degrees through the local slope of the throw curve, at most 4 deg per pass and
+at most two passes, never a hunting loop. It logs `want X ft, measured Y ft --
+valve A -> B (slope N mm/deg, pass n)`, so a persistent gap is visible and
+diagnosable — and a large one means the pressure calibration has drifted from
+current supply, which wants a recalibration rather than a bigger correction.
+
+Verified dry at b555, including the steep region where presses used to do
+nothing:
+
+```
+0.25 ft steps: 1.87 2.12 2.37 2.62 2.87 3.12   deltas 0.25 x5
+1.0  ft steps: 4.12 5.12 6.12 7.12 8.12 9.12   deltas 1.00 x5
+at 21+ ft:     21.37 21.62 21.87 22.12 22.37   deltas 0.25 x4
+```
+
+The wet path — that a dialed distance is actually delivered once the water is
+on — still needs eyes on the stream.

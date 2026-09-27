@@ -14782,6 +14782,10 @@ static float              s_web_valve_deg     = -1.0f;
 static float              s_web_meas_psi      = 0.0f;   // last measured PSI (0 when water off)
 static float              s_web_meas_throw_mm = 0.0f;   // last measured throw (0 when water off)
 static bool               s_web_hold_step     = false;  // b554: this request is one step of a d-pad hold
+// b555: the dialed DISTANCE in mm -- the real setpoint. -1 = nothing dialed
+// this session (fresh page load), in which case the readout previews cal max
+// and the Water button opens wide, as before.
+static float              s_web_target_mm     = -1.0f;
 static httpd_handle_t     s_zone_server     = NULL;
 static SemaphoreHandle_t  s_zone_mutex      = NULL;
 // b406: sized to hold the full state JSON for a max-size zone. The points
@@ -14799,6 +14803,8 @@ static char               s_zone_json_buf[3072];
 #define ZONE_WEB_PRES_MAX     100.0f
 #define ZONE_WEB_PSI_SCALE      6.28f
 #define ZONE_WEB_VALVE_STEP_DEG 0.5f  // open-loop valve step per button press (deg)
+#define ZONE_WEB_MIN_MOVE_DEG   0.35f // b555: smallest valve move a press may command
+#define ZONE_WEB_MOVE_TOL_DEG   0.25f // b555: must be < MIN_MOVE or presses no-op
 #define ZONE_WEB_SETTLE_MS      300   // settle time after valve move before reading PSI
 
 // The *_html.h payloads are guarded raw-string fragments: they expand to
@@ -14941,9 +14947,11 @@ static int zone_build_json(char *buf, int maxlen)
     // settle on purpose -- so feeding it to the readout made the number jump
     // around under their thumb. The page shows this while a button is held and
     // the measured throw once it is released.
-    float cmd_throw_ft = (s_web_valve_deg >= zone_display_floor_deg())
-                       ? cal_valve_deg_to_throw_mm(s_web_valve_deg) / 304.8f
-                       : 0.0f;
+    float cmd_throw_ft = (s_web_target_mm > 0.0f)
+                       ? s_web_target_mm / 304.8f
+                       : ((s_web_valve_deg >= zone_display_floor_deg())
+                          ? cal_valve_deg_to_throw_mm(s_web_valve_deg) / 304.8f
+                          : cal_get_max_throw_mm() / 304.8f);
 
     float cal_hi_deg = cal_throw_to_valve_deg(cal_get_max_throw_mm());
     if (cal_hi_deg <= 0.0f || cal_hi_deg > VALVE_OPEN_DEG) cal_hi_deg = VALVE_OPEN_DEG;
@@ -15036,6 +15044,7 @@ static esp_err_t zone_page_handler(httpd_req_t *req)
     // correct when revisiting a zone.  s_web_valve_deg = -1 is the sentinel
     // meaning "valve position not yet set by this session".
     s_web_valve_deg     = -1.0f;
+    s_web_target_mm     = -1.0f;   // b555: nothing dialed yet this session
     s_web_water         = false;
     s_web_meas_psi      = 0.0f;
     s_web_meas_throw_mm = 0.0f;
@@ -15121,33 +15130,41 @@ static esp_err_t zone_act_handler(httpd_req_t *req)
     // clamped at the table's first throw for a while and then snapped to 0.
     const float zone_floor_deg = cal_get_min_valve_deg();
 
-    // One step of the d-pad, in whichever unit the client asked for.
-    // up = +1 / down = -1. Returns the new valve angle, already clamped to
-    // the calibrated span.
-    float (*const _unused)(void) = NULL; (void)_unused;
+    // One step of the d-pad.
+    //
+    // b555: the setpoint is a DISTANCE (s_web_target_mm); the valve angle is
+    // how we try to reach it. Earlier builds made the valve angle the setpoint
+    // and re-derived the distance from it, which is what produced the whole
+    // family of complaints: a step of 0.25 ft is only 0.14 deg where the throw
+    // curve is steep, so presses silently did nothing; and the distance the
+    // readout promised while dry was a different calibration curve from the
+    // one that governs the stream once water is flowing.
+    //
+    // Keeping the dialed distance as the thing being stored means the readout
+    // never moves on its own, every press changes it by exactly the step, and
+    // the wet correction in water_toggle has a real target to aim at.
     #define ZONE_STEP_VALVE(_dir) do {                                        \
-        if (s_web_valve_deg < zone_floor_deg) s_web_valve_deg = zone_floor_deg;\
-        if (step_ft > 0.0f) {                                                 \
-            /* b553: with the water ON the readout shows the MEASURED throw   \
-               (pressure -> throw) while this stepped from the PREDICTED one  \
-               (valve -> throw). Those are different curves whenever supply   \
-               pressure has drifted from cal time, so "+0.25 ft" did not move \
-               the number on screen by 0.25 ft -- it jumped. Step from        \
-               whatever is being displayed. */                                \
-            float _cur = (s_web_water && s_web_meas_throw_mm > 10.0f)         \
-                         ? s_web_meas_throw_mm                                \
-                         : cal_valve_deg_to_throw_mm(s_web_valve_deg);        \
-            float _tgt = _cur + (_dir) * step_ft * 304.8f;                    \
-            float _lo  = cal_get_min_throw_mm(), _hi = cal_get_max_throw_mm();\
-            if (_tgt < _lo) _tgt = _lo;                                       \
-            if (_tgt > _hi) _tgt = _hi;                                       \
-            float _vd = cal_throw_to_valve_deg(_tgt);                         \
-            /* No usable cal: fall back to the angular step rather than
-               freezing the control. */                                       \
-            s_web_valve_deg = (_vd > 0.0f) ? _vd                              \
-                                           : s_web_valve_deg + (_dir) * step_deg; \
+        float _lo = cal_get_min_throw_mm(), _hi = cal_get_max_throw_mm();     \
+        if (s_web_target_mm < 0.0f)                                           \
+            s_web_target_mm = (s_web_valve_deg >= zone_floor_deg)             \
+                            ? cal_valve_deg_to_throw_mm(s_web_valve_deg) : _lo;\
+        float _step_mm = (step_ft > 0.0f) ? step_ft * 304.8f                  \
+                                          : step_deg * 150.0f; /* no ft given */\
+        s_web_target_mm += (_dir) * _step_mm;                                 \
+        if (s_web_target_mm < _lo) s_web_target_mm = _lo;                     \
+        if (s_web_target_mm > _hi) s_web_target_mm = _hi;                     \
+        float _vd = cal_throw_to_valve_deg(s_web_target_mm);                  \
+        if (_vd > 0.0f) {                                                     \
+            /* A distance step is not always a valve step: the curve reaches  \
+               552 mm/deg on this unit, so 0.25 ft there is 0.14 deg, inside  \
+               the positioning tolerance -- the valve would not move and the  \
+               stream would not change. Force at least ZONE_WEB_MIN_MOVE_DEG. \
+               Where that bites, the hardware simply cannot resolve the step. */\
+            if (fabsf(_vd - s_web_valve_deg) < ZONE_WEB_MIN_MOVE_DEG)         \
+                _vd = s_web_valve_deg + (_dir) * ZONE_WEB_MIN_MOVE_DEG;       \
+            s_web_valve_deg = _vd;                                            \
         } else {                                                              \
-            s_web_valve_deg += (_dir) * step_deg;                             \
+            s_web_valve_deg += (_dir) * step_deg;   /* no usable cal */       \
         }                                                                     \
         if (s_web_valve_deg < zone_floor_deg) s_web_valve_deg = zone_floor_deg;\
         if (s_web_valve_deg > VALVE_OPEN_DEG) s_web_valve_deg = VALVE_OPEN_DEG;\
@@ -15185,7 +15202,7 @@ static esp_err_t zone_act_handler(httpd_req_t *req)
         // per press. Here the human is watching the stream and correcting by
         // eye, so a few tenths of a foot of positional error costs nothing
         // and the excursion costs everything. Runs are untouched.
-            valve_goto_interactive(s_web_valve_deg, 1.0f, 4000);
+            valve_goto_interactive(s_web_valve_deg, ZONE_WEB_MOVE_TOL_DEG, 4000);
             s_valve_last_dir = 1;
             vTaskDelay(pdMS_TO_TICKS(ZONE_WEB_SETTLE_MS));
             float psi = 0.0f;
@@ -15205,7 +15222,7 @@ static esp_err_t zone_act_handler(httpd_req_t *req)
         // Open-loop: step valve angle down, then read PSI to derive throw
         ZONE_STEP_VALVE(-1);
         if (s_web_water) {
-            valve_goto_interactive(s_web_valve_deg, 1.0f, 4000);   // b550: see pres_up
+            valve_goto_interactive(s_web_valve_deg, ZONE_WEB_MOVE_TOL_DEG, 4000);   // b550: see pres_up
             s_valve_last_dir = -1;
             vTaskDelay(pdMS_TO_TICKS(ZONE_WEB_SETTLE_MS));
             float psi = 0.0f;
@@ -15230,7 +15247,7 @@ static esp_err_t zone_act_handler(httpd_req_t *req)
         s_web_hold_step = true;
         ZONE_STEP_VALVE(+1);
         if (s_web_water) {
-            valve_goto_interactive(s_web_valve_deg, 1.0f, 4000);   // b550
+            valve_goto_interactive(s_web_valve_deg, ZONE_WEB_MOVE_TOL_DEG, 4000);   // b550
             s_valve_last_dir =  1;
             // b553: advance the measured base by the step we just commanded.
             // No PSI read here on purpose -- this is the hold-repeat path and
@@ -15245,7 +15262,7 @@ static esp_err_t zone_act_handler(httpd_req_t *req)
         s_web_hold_step = true;
         ZONE_STEP_VALVE(-1);
         if (s_web_water) {
-            valve_goto_interactive(s_web_valve_deg, 1.0f, 4000);   // b550
+            valve_goto_interactive(s_web_valve_deg, ZONE_WEB_MOVE_TOL_DEG, 4000);   // b550
             s_valve_last_dir = -1;
             // b553: advance the measured base by the step we just commanded.
             // No PSI read here on purpose -- this is the hold-repeat path and
@@ -15268,10 +15285,11 @@ static esp_err_t zone_act_handler(httpd_req_t *req)
             // dialed angle away ("full strength whatever the button says"),
             // pinned at_max so the up arrow latched orange, and left ~77 deg
             // of travel to step back down half a degree at a time.
-            bool wide = (s_web_valve_deg < 0.0f);
+            bool wide = (s_web_target_mm < 0.0f && s_web_valve_deg < 0.0f);
             if (wide) {
                 s_web_pres_pct  = ZONE_WEB_PRES_MAX;
                 s_web_valve_deg = VALVE_OPEN_DEG;
+                s_web_target_mm = cal_get_max_throw_mm();
             }
             // b552: valve_goto() routes a friction-zone target to
             // valve_goto_jog, which opens past it to VALVE_FRICTION_HI + 2
@@ -15282,46 +15300,59 @@ static esp_err_t zone_act_handler(httpd_req_t *req)
             // pulsed approach, drop the excursion.
             // Tight tolerance (1.0 deg) only at the hard stop, where
             // predictive braking otherwise parks 1-2 deg short of it.
-            // What the readout promised while the water was off.
-            float want_mm = wide ? cal_get_max_throw_mm()
-                                 : cal_valve_deg_to_throw_mm(s_web_valve_deg);
-            valve_goto_interactive(s_web_valve_deg, wide ? 1.0f : 2.0f, 10000);
+            // The distance the user actually asked for.
+            float want_mm = (s_web_target_mm > 0.0f) ? s_web_target_mm
+                                                     : cal_get_max_throw_mm();
+            valve_goto_interactive(s_web_valve_deg, wide ? 1.0f : ZONE_WEB_MOVE_TOL_DEG, 10000);
             s_valve_last_dir = 1;
-            // Read initial PSI so throw display is live from the start
             vTaskDelay(pdMS_TO_TICKS(ZONE_WEB_SETTLE_MS));
-            float psi = 0.0f;
-            if (mprls_read_quiet(&psi) && psi > 0.1f) {
+
+            // b555: close the loop on the DIALED DISTANCE.
+            //
+            // Dry, the valve angle is chosen from the valve->throw curve.
+            // Wet, the stream obeys pressure, and cal_pressure_to_throw_mm is
+            // a different curve -- they agree only while supply pressure still
+            // matches what it was at calibration. That gap is the reported
+            // "jump back like 2 feet from whatever I set".
+            //
+            // b553 tried to fix this with cal_throw_to_valve_deg(want_mm),
+            // which is the exact inverse of how the angle was chosen in the
+            // first place, so it always returned the angle already held and
+            // corrected precisely nothing. A correction has to be driven by
+            // the MEASUREMENT: take the error in mm and convert it to degrees
+            // through the local slope of the throw curve.
+            //
+            // Two bounded passes, not a loop. b543 established that repeated
+            // hunting is what makes the stream visibly wander.
+            for (int pass = 0; pass < 2; pass++) {
+                float psi = 0.0f;
+                if (!mprls_read_quiet(&psi) || psi <= 0.1f) break;
                 s_web_meas_psi      = psi;
                 s_web_meas_throw_mm = cal_pressure_to_throw_mm(psi);
-
-                // b553: land on the dialed DISTANCE, not just the dialed valve
-                // angle. Dry, the readout predicts throw from the valve angle;
-                // wet, it measures it from pressure. Those are different cal
-                // curves and they only agree if supply pressure still matches
-                // what it was at calibration -- so turning the water on moved
-                // the stream a few feet from what the user had set. One bounded
-                // correction, never a loop: the b543 finding was that repeated
-                // hunting is what makes the stream visibly overshoot.
                 float err_mm = want_mm - s_web_meas_throw_mm;
-                if (want_mm > 10.0f && fabsf(err_mm) > 152.0f) {   // > 0.5 ft out
-                    float corr_deg = cal_throw_to_valve_deg(want_mm);
-                    if (corr_deg > 0.0f) {
-                        float lo = cal_get_min_valve_deg();
-                        if (corr_deg < lo)             corr_deg = lo;
-                        if (corr_deg > VALVE_OPEN_DEG) corr_deg = VALVE_OPEN_DEG;
-                        INFO("Zone water on: dialed %.1f ft, measured %.1f ft -- "
-                             "correcting valve %.2f -> %.2f deg",
-                             want_mm / 304.8f, s_web_meas_throw_mm / 304.8f,
-                             s_web_valve_deg, corr_deg);
-                        s_web_valve_deg = corr_deg;
-                        valve_goto_interactive(corr_deg, 1.0f, 6000);
-                        vTaskDelay(pdMS_TO_TICKS(ZONE_WEB_SETTLE_MS));
-                        if (mprls_read_quiet(&psi) && psi > 0.1f) {
-                            s_web_meas_psi      = psi;
-                            s_web_meas_throw_mm = cal_pressure_to_throw_mm(psi);
-                        }
-                    }
-                }
+                if (fabsf(err_mm) <= 152.0f) break;          // within 0.5 ft
+                // Local slope mm per deg, measured off the cal table either
+                // side of where we are.
+                float v  = s_web_valve_deg;
+                float t1 = cal_valve_deg_to_throw_mm(v + 0.5f);
+                float t0 = cal_valve_deg_to_throw_mm(v - 0.5f);
+                float slope = (t1 - t0);                      // mm per 1.0 deg
+                if (slope < 20.0f) break;                     // flat/no cal: give up
+                float dv = err_mm / slope;
+                if (dv >  4.0f) dv =  4.0f;                   // bounded per pass
+                if (dv < -4.0f) dv = -4.0f;
+                float nv = v + dv;
+                float lo = cal_get_min_valve_deg();
+                if (nv < lo)             nv = lo;
+                if (nv > VALVE_OPEN_DEG) nv = VALVE_OPEN_DEG;
+                if (fabsf(nv - v) < 0.1f) break;
+                INFO("Zone water on: want %.1f ft, measured %.1f ft -- valve "
+                     "%.2f -> %.2f deg (slope %.0f mm/deg, pass %d)",
+                     want_mm / 304.8f, s_web_meas_throw_mm / 304.8f,
+                     v, nv, slope, pass + 1);
+                s_web_valve_deg = nv;
+                valve_goto_interactive(nv, ZONE_WEB_MOVE_TOL_DEG, 6000);
+                vTaskDelay(pdMS_TO_TICKS(ZONE_WEB_SETTLE_MS));
             }
         } else {
             valve_goto(VALVE_CLOSED_DEG, 2.0f, 10000, false);
