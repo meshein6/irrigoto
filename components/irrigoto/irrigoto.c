@@ -9850,7 +9850,18 @@ static float serp_ff_valve(int ring, float ring_throw, bool direct, float corr,
 // SERP_V_APPROACH_OVS below the target and come back up to it from below.
 // Nozzle is stationary at the turn point; ~0.5 s per closing turn; no
 // pressure feedback involved (Rob: no hunting, keep the flow continuous).
-#define SERP_V_APPROACH_OVS   3.0f
+// b574: 3.0 -> 1.0 deg. This is a deliberate undershoot with the stream ON:
+// the valve is driven below the ring's target angle and brought back up, so
+// the ball always lands from the same side and pressure hysteresis is
+// repeatable. At 3 deg it is 0.6-5.4 ft of throw error on this unit's curve
+// (58-552 mm/deg), held for up to SERP_V_APPROACH_MS, at every inward ring
+// change -- the reported "when it changes distance it undershoots for a
+// second". b413 measured the direction-dependent stopping bias at ~2.8 deg
+// MOTOR side, and the AS5600L sits on the valve OUTPUT shaft where lash is
+// far smaller, so 1 deg establishes the same consistent approach for a third
+// of the excursion. Tunable: raise it if throws start landing inconsistently
+// on inward rings.
+#define SERP_V_APPROACH_OVS   1.0f
 #define SERP_V_APPROACH_MS    1500u
 static void serp_valve_settle_from_below(chase_motor_t *vm, float v1, int *v_dir_io)
 {
@@ -10472,8 +10483,41 @@ static bool serpentine_glide_legs(const serpentine_leg_t *legs, int n,
             float ro   = ring_throws[ring];
             float ri   = (ring == num_rings - 1) ? ro * 0.92f
                                                  : ring_throws[ring + 1];
+            // b574: credit the ring's depth WEIGHTED BY ARC SHARE.
+            //
+            // nozzle_precip_depth_mm() returns the depth on the wedge just
+            // swept -- the arc length cancels out of the maths, because a
+            // shorter sweep takes proportionally less time over
+            // proportionally less ground. So it is a per-wedge figure, and
+            // adding it once per wedge into a single per-RING counter says
+            // the same ground was watered twice.
+            //
+            // That is exactly what happened on a zone with a waist. A ring
+            // with arcs in two lobes is swept once per lobe -- same radius,
+            // opposite sides of the yard -- and both credited
+            // cumulative_depth[ring]. Measured on the 2026-09-27 Sections
+            // run, ring 20 within a single pass:
+            //     r20 sweep 35.8 deg ... cum 2.29 mm
+            //     r20 sweep 42.4 deg ... cum 5.20 mm
+            // against a 3.175 mm target. The firmware then believed r20 was
+            // over target and dropped it from pass 2, while each lobe had in
+            // fact received about 2.5 mm. Every multi-arc ring was
+            // under-watered by roughly its arc count, and runs "completed"
+            // early on double-counted depth.
+            //
+            // Weighting by arc share makes the counter the ring's
+            // area-weighted mean depth, which is what a per-ring number has
+            // to mean: sweeping both halves of a ring to 2.5 mm leaves the
+            // ring at 2.5 mm, not 5.
+            float _ring_span = 0.0f;
+            for (int _q = 0; _q < n; _q++)
+                if (legs[_q].kind == SERPENTINE_LEG_SWEEP
+                        && legs[_q].ring == L->ring)
+                    _ring_span += legs[_q].arc_span;
+            float _share = (_ring_span > 0.5f && L->arc_span > 0.0f)
+                         ? (L->arc_span / _ring_span) : 1.0f;
             cumulative_depth[ring] +=
-                nozzle_precip_depth_mm(ro, ri, meas_dps, avg_psi);
+                nozzle_precip_depth_mm(ro, ri, meas_dps, avg_psi) * _share;
 
             float _at = (avg_psi > 0.1f) ? cal_pressure_to_throw_mm(avg_psi) : ro;
             float _arc_s = (dirn > 0)
