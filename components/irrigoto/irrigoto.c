@@ -10724,6 +10724,39 @@ static void water_serpentine_passes(
     }
     if (plan_max_passes < passes) passes = plan_max_passes;   // run as many as needed
 
+    // b578: duration, known before the first drop. Each ring is charged its
+    // own sweep time times the number of passes IT needs -- the multipass
+    // only revisits rings that are still short, so charging every ring for
+    // every pass overestimates badly. Plus a measured per-ring transition
+    // cost and the cleanup tail.
+    if (!dry) {
+        const float _OVH_PER_RING_S = 2.5f;   // valve move + connector, measured
+        const float _TAIL_S         = 25.0f;  // closeout, flush, valve close
+        float _tl2[WATER_MAX_ARCS_PER_RING], _th2[WATER_MAX_ARCS_PER_RING];
+        float _secs = _TAIL_S;
+        for (int i = 0; i < num_rings && i < WATER_RUN_MAX_RINGS; i++) {
+            if (plan_passes[i] == 0) continue;
+            float _ro = ring_throws[i];
+            float _ri = (i == num_rings - 1) ? _ro * 0.92f : ring_throws[i + 1];
+            int _na = serpentine_arc_bounds(zone, have_zone, _ro, sector_throw,
+                          act_max_throw, zone_arc_start, zone_arc_end,
+                          zone_arc_deg, _tl2, _th2);
+            float _active = 0.0f;
+            for (int a = 0; a < _na; a++)
+                _active += fmodf(_th2[a] - _tl2[a] + 360.0f, 360.0f);
+            if (_active < 0.5f) continue;
+            float _dps = (serpentine_dps > 0.0f) ? serpentine_dps
+                       : serpentine_ring_dps(_ro, _ri, _active, depth_mm, spd, have_spd);
+            if (_dps < 0.1f) continue;
+            _secs += ((_active / _dps) + _OVH_PER_RING_S) * (float)plan_passes[i];
+        }
+        s_water_est_min   = (int)(_secs / 60.0f) + 1;
+        s_eta_anchor_secs = _secs;
+        s_eta_anchor_tick = xTaskGetTickCount();
+        INFO("Serpentine estimate: %d min (%.0f s) -- fixed at run start, "
+             "not revised mid-run", s_water_est_min, _secs);
+    }
+
     for (int pass = 0; pass < passes; pass++) {
         bool skip[WATER_RUN_MAX_RINGS];
         int  todo = 0;
@@ -10844,65 +10877,19 @@ static void water_serpentine_passes(
                  pass + 1, i0 + 1, _hi, _depbuf);
         }
 
-        // b505: refresh the web/HA time estimate at every pass end.
-        // Serpentine never updated s_water_est_min after the preamble, so
-        // HA showed the initial number for the whole run. Same physics as
-        // smooth's pass-end update: remaining deficit volume over the
-        // measured flow, plus the measured per-pass overhead times the
-        // passes the slowest-gaining ring still needs, plus the cleanup
-        // tail. Ring areas mirror the b503 expected-volume rule (sector
-        // activity at the ring radius) so multi-lobe rings are not charged
-        // the full zone arc.
-        if (!dry) {
-            float _rem_vol_L = 0.0f, _done_vol_L = 0.0f;
-            int   _worst_left = 0;
-            for (int i = 0; i < num_rings && i < WATER_RUN_MAX_RINGS; i++) {
-                float _ro = ring_throws[i];
-                if (_ro < 1.0f || ring_unwaterable[i]) continue;
-                float _ri = (i == num_rings - 1) ? _ro * 0.92f : ring_throws[i + 1];
-                if (_ri >= _ro) continue;
-                float _tol = s_ring_footprint_mm * (_ro / act_max_throw) * 0.5f;
-                int _ac = 0;
-                for (int s = 0; s < WATER_SECTORS; s++)
-                    if (_ro <= sector_throw[s] + _tol) _ac++;
-                if (_ac == 0) continue;
-                float _area = (float)M_PI * (_ro*_ro - _ri*_ri) / 1.0e6f
-                              * ((float)_ac / (float)WATER_SECTORS);
-                float _def = depth_mm - cumulative_depth[i];
-                if (_def > 0.0f) {
-                    _rem_vol_L += _def * _area;
-                    float _gain = cumulative_depth[i] - s_serp_prev_cum[i];
-                    int _left = (_gain > 0.02f) ? (int)ceilf(_def / _gain)
-                                                : (passes - pass - 1);
-                    if (_left > _worst_left) _worst_left = _left;
-                }
-                _done_vol_L += fminf(cumulative_depth[i], depth_mm) * _area;
-                s_serp_prev_cum[i] = cumulative_depth[i];
-            }
-            int _passes_left = passes - pass - 1;
-            if (_worst_left < _passes_left) _passes_left = _worst_left;
-            float _avg_psi  = (*run_psi_n > 0) ? (*run_psi_sum / (float)*run_psi_n) : 3.0f;
-            float _flow_lpm = NOZZLE_FLOW_K * powf(_avg_psi, NOZZLE_FLOW_N) / 1000.0f;
-            if (_flow_lpm < 0.05f) _flow_lpm = 1.0f;
-            float _elapsed_s   = (float)pdTICKS_TO_MS(xTaskGetTickCount() - t_start) / 1000.0f;
-            float _pump_done_s = _done_vol_L / _flow_lpm * 60.0f;
-            float _ovh_s       = _elapsed_s - _pump_done_s;
-            if (_ovh_s < 0.0f) _ovh_s = 0.0f;
-            float _ovh_per_pass = _ovh_s / (float)(pass + 1);
-            if (_ovh_per_pass < 5.0f) _ovh_per_pass = 5.0f;
-            const float _TAIL_S = 30.0f;
-            float _secs = _rem_vol_L / _flow_lpm * 60.0f
-                        + _ovh_per_pass * (float)_passes_left + _TAIL_S;
-            s_water_est_min   = (int)(_secs / 60.0f) + 1;
-            s_eta_anchor_secs = _secs;
-            s_eta_anchor_tick = xTaskGetTickCount();
-            INFO("Serpentine pass %d done: vol %.1f/%.1fL @ %.2f psi (%.1f L/min), "
-                 "rem pump %.0fs + ovh %.0fs/pass x %d + tail %.0fs = %d min",
-                 pass + 1, _done_vol_L, _done_vol_L + _rem_vol_L, _avg_psi, _flow_lpm,
-                 _rem_vol_L / _flow_lpm * 60.0f, _ovh_per_pass, _passes_left,
-                 _TAIL_S, s_water_est_min);
-        }
-    }
+        // b578: the estimate is NOT refreshed here any more.
+        //
+        // b505 recomputed it at every pass end from remaining deficit volume
+        // over measured flow. That made sense while the pass count itself was
+        // discovered from measurement -- but since b575 the schedule is fixed
+        // before any water flows, so the duration is known at the start and a
+        // mid-run revision can only mean the estimate and the plan disagree.
+        // The owner saw exactly that: "the time updated mid cycle".
+        //
+        // The one-shot estimate is computed from plan_passes in the preamble
+        // above; s_eta_anchor_* then ticks it down so HA still sees minutes
+        // decreasing without the number itself moving.
+    }   // pass loop
 }
 
 static void phase_chase_water_zone(void)

@@ -285,6 +285,28 @@
       if (!lobes || ringsIn[i].spans.length > lobes.length) lobes = ringsIn[i].spans;
     }
     if (!lobes || lobes.length < 2) return null;   /* nothing to section */
+
+    /* b578: order the lobes by how far OUT they reach, mirroring the
+     * firmware. The lobe list comes from ringSpans(), which walks the zone
+     * arc, so it is in BEARING order -- and b575 changed the firmware to
+     * process lobes by reach instead, so the two disagreed about which side
+     * to start on. That is the reported "it started on the opposite side of
+     * what preview showed". The rule is the same one the planner uses: the
+     * lobe containing the outermost ring goes first. */
+    var order = [], li;
+    for (li = 0; li < lobes.length; li++) {
+        var edge = ringsIn.length;               /* outermost ring index in this lobe */
+        for (var ri2 = 0; ri2 < ringsIn.length; ri2++) {
+            var hit = false;
+            for (var sj = 0; sj < ringsIn[ri2].spans.length; sj++)
+                if (spanOverlaps(ringsIn[ri2].spans[sj], lobes[li])) { hit = true; break; }
+            if (hit) { edge = ri2; break; }
+        }
+        order.push({ lobe: lobes[li], edge: edge });
+    }
+    order.sort(function (a, b) { return a.edge - b.edge; });
+    lobes = order.map(function (o) { return o.lobe; });
+
     var out = [], visit = 0;
     for (var L = 0; L < lobes.length; L++) {
       for (i = 0; i < ringsIn.length; i++) {
