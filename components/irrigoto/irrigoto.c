@@ -420,8 +420,14 @@ static bool                 s_smooth_accum_mode = false;
 static volatile int16_t    s_live_ring     = -1;
 static volatile int8_t     s_live_pass     = 0;
 static volatile float      s_live_bearing  = 0.0f;
-static volatile float      s_live_throw_mm = 0.0f;
+static volatile float      s_live_throw_mm = 0.0f;   // what the plan asked for
+static volatile float      s_live_throw_act = 0.0f;  // b580: what it is doing
 static volatile TickType_t s_live_tick     = 0;
+// b580: the run's shape, so a live view can say "pass 2 of 4" and draw the
+// planned ring the nozzle is supposed to be on. Set when the schedule is
+// built; both 0 when nothing is running.
+static volatile int8_t     s_live_passes_total = 0;
+static volatile int16_t    s_live_rings_total  = 0;
 
 static void water_csv_write_row(FILE *f, float t_s, int ring_, int arc_,
     int sector_, float nozzle_target, float nozzle_actual,
@@ -437,9 +443,12 @@ static void water_csv_write_row(FILE *f, float t_s, int ring_, int arc_,
     // while the run task is driving it.
     s_live_ring     = (int16_t)ring_;
     s_live_pass     = (int8_t)pass_type;
-    s_live_bearing  = nozzle_actual;
-    s_live_throw_mm = (throw_actual > 100.0f) ? throw_actual : throw_target;
-    s_live_tick     = xTaskGetTickCount();
+    s_live_bearing   = nozzle_actual;
+    // b580: keep these apart. Conflating them hid exactly the thing the owner
+    // is trying to see -- the stream landing short of where the plan put it.
+    s_live_throw_mm  = throw_target;
+    s_live_throw_act = (throw_actual > 100.0f) ? throw_actual : 0.0f;
+    s_live_tick      = xTaskGetTickCount();
 
     // Smooth aggregate mode: accumulate into per-(ring,sector) bucket, don't write.
     if (s_smooth_accum_mode) {
@@ -10484,7 +10493,38 @@ static bool serpentine_glide_legs(const serpentine_leg_t *legs, int n,
         if (radial && !dry_leg
                 && v0 <= VALVE_CAL_START_DEG + 2.0f
                 && v1 >  VALVE_CAL_START_DEG + 2.0f) {
-            vTaskDelay(pdMS_TO_TICKS(1800));
+            // b579: wait for pressure to actually stabilise, don't guess at
+            // 1800 ms.
+            //
+            // The owner reports the first sweeps landing a couple of feet
+            // short and later ones being fine -- the signature of watering
+            // while the supply is still coming up, not of a calibration
+            // error. Two things made it worse: the reach-ordering in b575/578
+            // means the run now STARTS on the outermost ring, the one needing
+            // the highest pressure and so the least tolerant of a transient;
+            // and 1800 ms was a fixed guess (b427) that happens to be enough
+            // for a mid-distance ring and not for the far one.
+            //
+            // Poll until two consecutive reads agree, the same test
+            // nozzle_sweep_pulse already uses, capped so a dead supply still
+            // falls through to the existing no-flow detection.
+            const uint32_t PS_MAX_MS = 9000, PS_STEP_MS = 150;
+            float _p0 = 0.0f, _p1 = 0.0f;
+            uint32_t _w = 0;
+            mprls_read_quiet(&_p0);
+            while (_w < PS_MAX_MS) {
+                vTaskDelay(pdMS_TO_TICKS(PS_STEP_MS));
+                _w += PS_STEP_MS;
+                TOUCH_ACTIVITY();
+                if (s_water_abort) break;
+                if (!mprls_read_quiet(&_p1)) continue;
+                // Settled: a real reading that has stopped climbing.
+                if (_p1 > 0.15f && fabsf(_p1 - _p0) < 0.04f && _w >= 600) break;
+                _p0 = _p1;
+            }
+            INFO("serpentine: supply settled at %.2f PSI after %u ms "
+                 "(first wet sweep waits for pressure, not a fixed delay)",
+                 _p1, (unsigned)_w);
             TOUCH_ACTIVITY();
         }
 
@@ -10633,8 +10673,55 @@ static void water_serpentine_passes(
     // (blend 0.6 old / 0.4 new of target/actual, clamped 0.5..1.6).
     // Replaces the global pressure_scale that b428 removed: corr learns
     // each ring's real supply behavior from its own measured throw.
+    // b579: corr is seeded from the PREVIOUS run and then held.
+    //
+    // b575 froze it at 1.0 so the planned path would be the path that ran.
+    // That worked, but it also discarded the only thing correcting for the
+    // throw calibration being off -- so rings landed wherever the cal said,
+    // and the outermost one came up short.
+    //
+    // Seeding from history keeps both properties: the correction is decided
+    // before the run and never changes during it, so every pass sweeps the
+    // same radius and the plan stays exact -- and it still converges on
+    // reality across runs instead of re-learning from zero each time.
+    //
+    // Rings are matched by RADIUS, not index, because a coverage change
+    // shifts the whole ladder. Only ratios inside the b433 plausibility band
+    // are trusted: below ~1.5 PSI the pressure->throw model over-reads up to
+    // 2x, and the previous run recorded 1.19x and 1.60x on its two outermost
+    // rings for exactly that reason. Seeding from those would drive the valve
+    // the wrong way.
     float corr[WATER_RUN_MAX_RINGS];
     for (int i = 0; i < WATER_RUN_MAX_RINGS; i++) corr[i] = 1.0f;
+    if (!dry && storage_ready()) {
+        water_run_t _prev;
+        memset(&_prev, 0, sizeof(_prev));
+        if (storage_water_load(s_water_zone_id, &_prev) == ESP_OK
+                && _prev.num_rings > 0) {
+            int _seeded = 0;
+            for (int i = 0; i < num_rings && i < WATER_RUN_MAX_RINGS; i++) {
+                float _ro = ring_throws[i];
+                if (_ro < 100.0f) continue;
+                /* nearest previous ring by radius, within half a pitch */
+                int   _best = -1; float _bd = 1e9f;
+                for (int q = 0; q < _prev.num_rings && q < WATER_RUN_MAX_RINGS; q++) {
+                    float _d = fabsf(_prev.rings[q].throw_mm - _ro);
+                    if (_d < _bd) { _bd = _d; _best = q; }
+                }
+                if (_best < 0 || _bd > s_ring_pitch_mm * 0.5f + 40.0f) continue;
+                float _t = _prev.rings[_best].throw_mm;
+                float _a = _prev.rings[_best].actual_throw_mm;
+                if (_t < 100.0f || _a < 100.0f) continue;
+                float _ratio = _a / _t;
+                if (_ratio < 0.75f || _ratio > 1.25f) continue;   /* b433 band */
+                corr[i] = fmaxf(0.5f, fminf(1.6f, _t / _a));
+                _seeded++;
+            }
+            if (_seeded)
+                INFO("Serpentine: seeded throw correction on %d ring(s) from "
+                     "the previous run (held for this run)", _seeded);
+        }
+    }
 
     // b432: inner/direct-valve rings are NOT deferred anymore. The throw cal
     // reaches ~330 mm on this fleet, so nearly every ring is cal-addressable
@@ -10707,6 +10794,8 @@ static void water_serpentine_passes(
             plan_passes[i] = (uint8_t)n1;
             if (n1 > plan_max_passes) plan_max_passes = n1;
         }
+        s_live_passes_total = (int8_t)plan_max_passes;   // b580
+        s_live_rings_total  = (int16_t)num_rings;
         INFO("Serpentine plan: %d pass(es) scheduled up front for %.2f mm "
              "target (deterministic -- measurement no longer re-plans)",
              plan_max_passes, depth_mm);
@@ -17951,7 +18040,9 @@ static esp_err_t api_status_handler(httpd_req_t *req)
         // is -- a sweep samples every couple of degrees, so anything much
         // older than that means the nozzle is transiting between arcs.
         "\"live_ring\":%d,\"live_pass\":%d,\"live_deg\":%.1f,"
-        "\"live_throw_mm\":%.0f,\"live_age_ms\":%lu,"
+        "\"live_throw_mm\":%.0f,\"live_throw_act\":%.0f,"
+        "\"live_passes_total\":%d,\"live_rings_total\":%d,"
+        "\"live_age_ms\":%lu,"
         "\"led_expander\":\"%s\"}",   // which 0x20 part led_expander_detect() picked
         FW_BUILD, wifi_get_rssi(),
         (unsigned)(used/1024), (unsigned)(total/1024),
@@ -17960,6 +18051,9 @@ static esp_err_t api_status_handler(httpd_req_t *req)
         s_web_water_mode ? (int)s_live_ring : -1,
         s_web_water_mode ? (int)s_live_pass : 0,
         (double)s_live_bearing, (double)s_live_throw_mm,
+        (double)s_live_throw_act,
+        s_web_water_mode ? (int)s_live_passes_total : 0,
+        s_web_water_mode ? (int)s_live_rings_total  : 0,
         (unsigned long)(s_live_tick
             ? (xTaskGetTickCount() - s_live_tick) * portTICK_PERIOD_MS : 999999u),
         s_led_expander==LED_EXP_SX1502 ? "SX1502" :
