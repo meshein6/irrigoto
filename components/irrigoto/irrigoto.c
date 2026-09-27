@@ -17594,12 +17594,29 @@ static esp_err_t api_run_plan_handler(httpd_req_t *req)
     float est_s = 0.0f, lo_dps = 1e6f, hi_dps = 0.0f;
     RUN_PLAN_WALK(per_pass_mm, rings, n_fast, n_slow, lo_dps, hi_dps, est_s);
     if (rings == 0) { lo_dps = hi_dps = 0.0f; }
+    (void)est_s;   /* b566: replaced by the per-ring multipass sum below */
 
     // How deep the slowest pass actually gets on the ring that does worst,
     // and therefore how many passes the adaptive multipass will need. Solve
     // it the same way the solver does, inverted: at the clamped speed,
     // deposit = requested_depth x (requested_dps / clamped_dps).
+    // b566: how long the run really takes, summed PER RING.
+    //
+    // The previous estimate multiplied one whole pass by the pass count, and
+    // the pass count came from the single worst ring. Both are wrong the same
+    // way: the adaptive multipass only re-waters rings that fell short, so
+    // passes 2..N sweep a handful of outer rings, not the zone. One outer
+    // ring needing four passes was inflating the whole estimate fourfold --
+    // reported as "4 passes, 13 min" for 1/8" when a single pass over this
+    // zone is about three minutes of sweeping.
+    //
+    // So: per ring, work out what one slow pass deposits, how many passes
+    // that ring therefore needs, and charge only that ring's own sweep time
+    // that many times. The run's pass COUNT is the worst ring's; the run's
+    // DURATION is the sum.
     float worst_frac = 1.0f;
+    int   need_passes = 1, n_short = 0;
+    float est_s_total = 0.0f;
     {
         float t = zmax; int r2 = 0;
         while (t >= act_min && r2 < WATER_MAX_RINGS_CAL) {
@@ -17616,15 +17633,18 @@ static esp_err_t api_run_plan_handler(httpd_req_t *req)
             // faster than asked lays down want/got of what was requested.
             float frac = (got > 0.01f && want > 0.0f) ? (want / got) : 1.0f;
             if (frac > 1.0f) frac = 1.0f;       // pinned fast = over-applies, not short
+            if (frac < 0.02f) frac = 0.02f;
             if (frac < worst_frac) worst_frac = frac;
+            if (frac < 0.99f) n_short++;
+            int rp = (int)ceilf(1.0f / frac);
+            if (rp < 1) rp = 1;
+            if (rp > need_passes) need_passes = rp;
+            est_s_total += (ad / got) * (float)rp;   // this ring's own time
             r2++; t -= sp;
         }
     }
-    if (worst_frac < 0.02f) worst_frac = 0.02f;
-    int need_passes = (int)ceilf(1.0f / worst_frac);
-    if (need_passes < 1) need_passes = 1;
     passes = need_passes;
-    float est_min = est_s * (float)need_passes / 60.0f;
+    float est_min = est_s_total / 60.0f;
 
     const char *clamp = "none";
     char advice[220];
@@ -17647,10 +17667,15 @@ static esp_err_t api_run_plan_handler(httpd_req_t *req)
                                   "(assuming 10.9 deg/s) -- run the speed cal.");
     } else if (need_passes > 1) {
         clamp = "slow";
+        // b566: say how much of the zone is short rather than guessing where.
+        // On the measured zone the required speed is nearly uniform across
+        // rings -- 10.2 to 11.4 deg/s -- so "the outermost rings" was wrong:
+        // essentially every ring wants a slower sweep than the floor allows.
         snprintf(advice, sizeof(advice),
-                 "One slow pass reaches about %.0f%% of this depth, so the run "
-                 "will make %d passes.%s", (double)(worst_frac * 100.0f),
-                 need_passes,
+                 "%d of %d rings need a slower sweep than the nozzle can hold "
+                 "(the worst reaches about %.0f%% of target in one pass), so "
+                 "the run makes up to %d passes over those rings.%s",
+                 n_short, rings, (double)(worst_frac * 100.0f), need_passes,
                  floor_cal ? "" : " Slow-speed limit is not calibrated "
                                   "(assuming 10.9 deg/s) -- run the speed cal.");
     }
