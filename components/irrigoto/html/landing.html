@@ -148,6 +148,23 @@ section{margin-bottom:18px;}
   padding:10px 12px;margin:-8px 0 14px;}
 .mode-help.show{display:block;}
 .mode-help b{color:var(--text);}
+/* b582: opt-in live view button, sits in the watering bar */
+.live-btn{margin-left:auto;background:var(--green-dim);border:1px solid var(--green);
+  color:var(--green);border-radius:5px;font-size:10px;letter-spacing:.05em;
+  padding:3px 8px;cursor:pointer;font-family:inherit;white-space:nowrap;}
+.live-btn:active{opacity:.75;}
+
+/* Run history (b535) */
+.run-row{display:flex;gap:8px;padding:7px 0;border-bottom:1px solid var(--border);
+  align-items:baseline;font-size:12px;}
+.run-row:last-child{border-bottom:none;}
+.run-when{color:var(--text-mid);font-family:'Courier New',monospace;font-size:11px;
+  width:86px;flex-shrink:0;}
+.run-what{flex:1;min-width:0;}
+.run-what small{display:block;color:var(--text-mid);font-size:11px;}
+.run-vol{font-family:'Courier New',monospace;color:var(--green);text-align:right;
+  white-space:nowrap;flex-shrink:0;}
+.run-vol.bad{color:var(--orange);}
 /* Path preview (b535) */
 #path-row{display:flex;gap:12px;align-items:center;margin:0 0 14px;}
 #path-thumb{flex-shrink:0;cursor:pointer;border-radius:50%;}
@@ -424,6 +441,11 @@ function renderZones(zones){
             <div class="watering-bar" id="wbar-${z.id}" style="display:none">
               <div class="pulse-dot"></div>
               <span class="watering-label" id="wlabel-${z.id}">Watering&hellip;</span>
+              <!-- b582: the live view is opt-in. The card stays a plain zone
+                   outline; this opens the big view only when asked. -->
+              <button class="live-btn" id="wlive-${z.id}"
+                      onclick="openLiveView(${z.id})"
+                      title="Watch the run against its planned path">&#9678; Live</button>
             </div>
             <div class="zone-name-wrap">
               <input class="zone-name" type="text" value="${z.name||'Zone #'+z.id}"
@@ -508,6 +530,10 @@ function selDepthBtn(btn){
 // pattern the solution mL estimate uses. The arithmetic stays on the device,
 // where the pressure cal and speed map live.
 let _planSeq = 0;
+let _lastPlan = null;   // b569: ring_passes for the full-run preview
+// b570: last live nozzle position from /api/status, drawn over the planned
+// path while a run is on. Null when nothing is running.
+let _live = null;
 function refreshRunPlan(){
   const el = document.getElementById('plan-note');
   if (!el) return;
@@ -519,6 +545,8 @@ function refreshRunPlan(){
     .then(p => {
       if (seq !== _planSeq) return;           // a newer pick already answered
       if (!p || !p.ok) { el.textContent = ''; el.className = ''; return; }
+      _lastPlan = p;
+      renderPathThumb();   // the thumbnail is the whole run, so it moves too
       const mins = p.est_min >= 1 ? Math.round(p.est_min) + ' min' : '< 1 min';
       if (p.clamp === 'none') {
         el.className = 'plan-ok';
@@ -614,7 +642,10 @@ function zonePathOpts(pass){
   return { mode: selModeDat, pass: pass|0,
            act_max_throw: (pathZone && pathZone.act_max_throw) || 10058,
            act_min_throw: (pathZone && pathZone.act_min_throw) || 0,
-           coverage: (pathZone && pathZone.coverage) | 0 };   // b561
+           coverage: (pathZone && pathZone.coverage) | 0,   // b561
+           ringPasses: _lastPlan && _lastPlan.ring_passes,   // b569: full run
+           ringMm:     _lastPlan && _lastPlan.ring_mm,       // b573: match by radius
+           live: _live };                                    // b570
 }
 function renderPathThumb(){
   const row = document.getElementById('path-row');
@@ -645,6 +676,9 @@ function openPathFull(){
     act_max_throw: pathZone.act_max_throw, act_min_throw: pathZone.act_min_throw,
     mode: selModeDat, lockMode: true, depth8: selDepth,
     coverage: (pathZone && pathZone.coverage) | 0,   // b564: draw the zone's real ring pitch
+    ringPasses: _lastPlan && _lastPlan.ring_passes,  // b569: every pass, not one lap
+    ringMm:     _lastPlan && _lastPlan.ring_mm,      // b573: match by radius
+    live: _live,                                     // b570: the real nozzle
     title: pathZone.name || 'Zone',
   });
 }
@@ -761,7 +795,73 @@ function renderWinter(winter, leftS){
 let activeWaterZoneId = -1;
 let lastWaterMode = 0;
 
+// b570: while a run is on, track the nozzle at a pace you can actually watch.
+// The main /api/all poll is every 8 s -- fine for state, useless for a moving
+// dot -- so this pulls the much smaller /api/status instead, and only while
+// something is running. It stops itself the moment the run ends.
+let _liveTimer = null;
+function startLivePoll(){
+  if (_liveTimer) return;
+  const tick = async () => {
+    try {
+      const st = await fetch('/api/status', {cache:'no-store'}).then(r => r.json());
+      if (!st.watering) { stopLivePoll(); return; }
+      _live = { deg: st.live_deg, throw_mm: st.live_throw_mm,
+                throw_act: st.live_throw_act, ring: st.live_ring,
+                pass: st.live_pass, passes_total: st.live_passes_total,
+                rings_total: st.live_rings_total, age_ms: st.live_age_ms };
+      // b582: push into the live overlay if it is open. The card radar is
+      // left as the plain zone outline -- the owner only wants the live view
+      // when they ask for it.
+      if (typeof IrrigotoPath !== 'undefined' && IrrigotoPath.isOpen())
+        IrrigotoPath.updateLive(_live);
+    } catch(e) { /* a dropped poll is not worth a visible error */ }
+    // b582: 0.5 s while the live view is open -- the device samples about
+    // every 140 ms at these sweep speeds, so half a second actually shows
+    // movement. When the overlay is closed only the watering-bar label needs
+    // refreshing, so back off rather than poll at 2 Hz for a line of text.
+    const open = (typeof IrrigotoPath !== 'undefined') && IrrigotoPath.isOpen();
+    if (_liveTimer) _liveTimer = setTimeout(tick, open ? 500 : 2000);
+  };
+  _liveTimer = setTimeout(tick, 0);
+}
+// b582: the live view is a button, not always-on.
+//
+// b570 drew the marker on the Water modal thumbnail, which is closed during a
+// run. b581 moved it onto the zone card radar, which works but paints over
+// the zone outline for the whole run. This opens the big shared overlay on
+// demand instead, and the card stays as it was.
+function openLiveView(id){
+  const z = _zoneCache && _zoneCache[id];
+  if (!z || !z.points || z.points.length < 2 || typeof IrrigotoPath === 'undefined') return;
+  IrrigotoPath.openPreview({
+    points: z.points,
+    act_max_throw: z.act_max_throw, act_min_throw: z.act_min_throw,
+    coverage: z.coverage | 0,
+    mode: String(lastWaterMode || 9), lockMode: true, depth8: selDepth,
+    ringPasses: _lastPlan && _lastPlan.ring_passes,
+    ringMm:     _lastPlan && _lastPlan.ring_mm,
+    live: _live,
+    title: (z.name || ('Zone ' + id)) + ' \u00b7 live'
+  });
+  // Don't make the user wait out the slow tick for the first frame.
+  if (_liveTimer) { clearTimeout(_liveTimer); _liveTimer = null; startLivePoll(); }
+}
+
+// b583: no per-update annotations on the card. They rewrote the watering bar
+// twice a second and made the zone card unreadable. The live numbers belong
+// in the live overlay; the card keeps whatever the countdown puts there, and
+// for Serpentine/Sections that estimate is fixed at run start (b578) so it
+// does not move as the run progresses.
+
+function stopLivePoll(){
+  if (_liveTimer) clearTimeout(_liveTimer);
+  _liveTimer = null;
+  if (_live) { _live = null; renderPathThumb(); }
+}
+
 function updateWateringState(watering, mode, estMin, waterZoneId, cleanupPass) {
+  if (watering) startLivePoll(); else stopLivePoll();
   lastWateringState = !!watering;
   lastCleanupPass   = cleanupPass || 0;
   lastWaterMode     = watering ? (mode || 0) : 0;
@@ -770,6 +870,10 @@ function updateWateringState(watering, mode, estMin, waterZoneId, cleanupPass) {
   // update so they react within the 8 s poll without waiting for the
   // 30 s schedule refresh.
   if (typeof paintSchedDots === 'function') paintSchedDots();
+  // b582: the Live button only exists while that zone is running.
+  document.querySelectorAll('[id^="wlive-"]').forEach(function(b){
+    b.style.display = (watering && ('wlive-' + waterZoneId) === b.id) ? '' : 'none';
+  });
 
   document.querySelectorAll('[id^="wbar-"]').forEach(el=>{
     const zid = parseInt(el.id.split('-')[1]);

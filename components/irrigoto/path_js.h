@@ -140,6 +140,7 @@ R"PATHJS(
     var zmax = Math.max.apply(null, throws);
     var zmin = (actMin && actMin > 50) ? actMin : Math.min.apply(null, throws);
     var pitch = 700 * coverageScale(coverage);
+    ringThrows.lastPitch = pitch;   /* b573: build() matches rings by radius */
     var rings = [], t = zmax;
     while (t >= zmin && rings.length < RING_MAX) {
       rings.push(t);
@@ -287,6 +288,28 @@ R"PATHJS(
       if (!lobes || ringsIn[i].spans.length > lobes.length) lobes = ringsIn[i].spans;
     }
     if (!lobes || lobes.length < 2) return null;   /* nothing to section */
+
+    /* b578: order the lobes by how far OUT they reach, mirroring the
+     * firmware. The lobe list comes from ringSpans(), which walks the zone
+     * arc, so it is in BEARING order -- and b575 changed the firmware to
+     * process lobes by reach instead, so the two disagreed about which side
+     * to start on. That is the reported "it started on the opposite side of
+     * what preview showed". The rule is the same one the planner uses: the
+     * lobe containing the outermost ring goes first. */
+    var order = [], li;
+    for (li = 0; li < lobes.length; li++) {
+        var edge = ringsIn.length;               /* outermost ring index in this lobe */
+        for (var ri2 = 0; ri2 < ringsIn.length; ri2++) {
+            var hit = false;
+            for (var sj = 0; sj < ringsIn[ri2].spans.length; sj++)
+                if (spanOverlaps(ringsIn[ri2].spans[sj], lobes[li])) { hit = true; break; }
+            if (hit) { edge = ri2; break; }
+        }
+        order.push({ lobe: lobes[li], edge: edge });
+    }
+    order.sort(function (a, b) { return a.edge - b.edge; });
+    lobes = order.map(function (o) { return o.lobe; });
+
     var out = [], visit = 0;
     for (var L = 0; L < lobes.length; L++) {
       for (i = 0; i < ringsIn.length; i++) {
@@ -318,6 +341,7 @@ R"PATHJS(
 
     var arc = zoneArc(points);
     var thr = ringThrows(points, actMax, actMin, arc, opts.coverage | 0);
+    var pitch = ringThrows.lastPitch || 700;
     if (!thr.length) return null;
 
     var plan = planOrder(modeKey, thr.length, opts.pass || 0, !!opts.sequential);
@@ -351,27 +375,81 @@ R"PATHJS(
      * connectors stay dry. */
     var serpish = (modeKey === 'serpentine' || modeKey === 'sections');
     var turnFloor = Math.max(actMin || 0, 500);
-    var moves = [], prev = null;
-    for (var mi = 0; mi < rings.length; mi++) {
-      var MR = rings[mi];
-      var ord = MR.spans.slice().sort(function (a, b) {
-        return MR.cw ? (a.lo - b.lo) : (b.lo - a.lo);
-      });
-      for (var mj = 0; mj < ord.length; mj++) {
-        var msp = ord[mj];
-        var mfrom = MR.cw ? msp.lo : (msp.lo + msp.span);
-        var mto   = MR.cw ? (msp.lo + msp.span) : msp.lo;
-        if (prev) {
-          var turn = serpish
-            ? buildTurn(points, prev.deg, prev.r, mfrom, MR.throw_mm, turnFloor)
-            : { wet: false };
-          if (turn.wet) moves.push({ type: 'turn', from: prev, wps: turn.wps });
-          else moves.push({ type: 'hop', from: prev,
-                            to: { deg: mfrom, r: MR.throw_mm } });
+
+    /* b569: the WHOLE run, not one representative lap.
+     *
+     * ringPasses[i] is how many passes ring i needs, from /api/run_plan --
+     * the firmware solves it from the deposit each slow pass achieves. Pass 1
+     * sweeps every ring; pass k sweeps only the rings still short, which is
+     * exactly what skip[] does in water_serpentine_passes, so a four-pass run
+     * is one full lap plus three progressively smaller ones rather than four
+     * laps. Serpentine and Sections alternate direction per pass
+     * (out_to_in = pass % 2), so later passes are drawn running the other way
+     * round, as they will.
+     *
+     * With no ringPasses (or a length that does not line up with the ring
+     * ladder) this degrades to the single pass it always drew, rather than
+     * inventing a run. */
+    /* b573: match the firmware's pass counts to our rings BY RADIUS.
+     * Requiring the two ladders to be the same length meant one extra ring
+     * here -- the page had no act_min_throw, so it floored at a different
+     * radius -- silently threw the whole thing away and the preview drew a
+     * single pass. Nearest radius within half a pitch is unambiguous: the
+     * ladders differ at the ends, not in spacing. */
+    var rp = opts.ringPasses, rm = opts.ringMm;
+    var usePasses = !!(rp && rp.length);
+    var passFor = function (idx) {
+      if (!usePasses) return 1;
+      if (rm && rm.length === rp.length) {
+        var want = rings[idx].throw_mm;
+        var best = -1, bd = 1e9;
+        for (var q = 0; q < rm.length; q++) {
+          var d = Math.abs(rm[q] - want);
+          if (d < bd) { bd = d; best = q; }
         }
-        moves.push({ type: 'sweep', ring: MR.ring, visit: mi, r: MR.throw_mm,
-                     from: mfrom, to: mto, cw: MR.cw });
-        prev = { r: MR.throw_mm, deg: mto };
+        return (best >= 0 && bd < pitch) ? rp[best] : 1;
+      }
+      return idx < rp.length ? rp[idx] : 1;
+    };
+    var nPasses = 1;
+    if (usePasses) rp.forEach(function (v) { if (v > nPasses) nPasses = v; });
+    if (nPasses > 12) nPasses = 12;        /* a drawing, not an endurance test */
+
+    var moves = [], prev = null;
+    for (var pp = 0; pp < nPasses; pp++) {
+      /* Rings still owed water on this pass. */
+      var live = [];
+      for (var q = 0; q < rings.length; q++) {
+        var need = passFor(q);
+        if (need > pp) live.push(rings[q]);
+      }
+      if (!live.length) break;
+      /* Later passes of serpentine/sections run the other way round. */
+      if (pp % 2 === 1 && serpish) live = live.slice().reverse();
+
+      for (var mi = 0; mi < live.length; mi++) {
+        var MR = live[mi];
+        /* Direction flips per pass for the serpentine family. */
+        var cwp = (pp % 2 === 1 && serpish) ? !MR.cw : MR.cw;
+        var ord = MR.spans.slice().sort(function (a, b) {
+          return cwp ? (a.lo - b.lo) : (b.lo - a.lo);
+        });
+        for (var mj = 0; mj < ord.length; mj++) {
+          var msp = ord[mj];
+          var mfrom = cwp ? msp.lo : (msp.lo + msp.span);
+          var mto   = cwp ? (msp.lo + msp.span) : msp.lo;
+          if (prev) {
+            var turn = serpish
+              ? buildTurn(points, prev.deg, prev.r, mfrom, MR.throw_mm, turnFloor)
+              : { wet: false };
+            if (turn.wet) moves.push({ type: 'turn', from: prev, wps: turn.wps });
+            else moves.push({ type: 'hop', from: prev,
+                              to: { deg: mfrom, r: MR.throw_mm } });
+          }
+          moves.push({ type: 'sweep', ring: MR.ring, visit: mi, pass: pp,
+                       r: MR.throw_mm, from: mfrom, to: mto, cw: cwp });
+          prev = { r: MR.throw_mm, deg: mto };
+        }
       }
     }
 
@@ -382,6 +460,7 @@ R"PATHJS(
       arc: arc,
       lobes: sectioned ? (sectioned[sectioned.length - 1].lobe + 1) : 1,
       rings: rings,
+      passes: nPasses,
       coverage: opts.coverage | 0,
       scale_mm: opts.scale_mm || (actMax + 914),
       orderVaries: plan.orderVaries,
@@ -399,13 +478,19 @@ R"PATHJS(
     var n = geom.rings.length;
     var thin = !!o.thumb;
 
+    /* b569: ringsOnly draws WHERE the water lands and nothing about HOW the
+     * nozzle gets there -- no direction colouring, no arrows, no connectors,
+     * no marker. Zone Setup uses it: at that point the zone and its ring
+     * spacing are the subject, and the sweep order belongs to the run. */
+    var ringsOnly = !!o.ringsOnly;
     for (var i = 0; i < n; i++) {
       var R = geom.rings[i];
       var r = (R.throw_mm / scale) * maxR;
       if (!(r > 0) || r > maxR * 1.02) continue;
       /* Fade with visit order so the sequence reads without a legend. */
       var al = 0.75 - 0.45 * (i / (n - 1 || 1));
-      var col = R.cw ? 'rgba(80,180,255,' + al + ')' : 'rgba(255,160,60,' + al + ')';
+      var col = ringsOnly ? 'rgba(80,180,255,.55)'
+              : R.cw ? 'rgba(80,180,255,' + al + ')' : 'rgba(255,160,60,' + al + ')';
       for (var s = 0; s < R.spans.length; s++) {
         var sp = R.spans[s], sa = rad(sp.lo);
         ctx.beginPath();
@@ -414,7 +499,7 @@ R"PATHJS(
         ctx.lineWidth = thin ? 1.2 : 1.8;
         ctx.setLineDash([]);
         ctx.stroke();
-        if (!thin && sp.span > 8) arrow(ctx, cx, cy, r, sp, R.cw);
+        if (!thin && !ringsOnly && sp.span > 8) arrow(ctx, cx, cy, r, sp, R.cw);
       }
     }
 
@@ -425,7 +510,7 @@ R"PATHJS(
      * return from a dryReturn flag on the ring and drew a straight radial
      * line, which was wrong for both: it never drew the boundary-hug turns at
      * all, and it drew a straight chord where the nozzle rides an arc. */
-    if (!geom.moves) return;
+    if (ringsOnly || !geom.moves) return;
     geom.moves.forEach(function (mv) {
       if (mv.type === 'turn') {
         ctx.beginPath();
@@ -465,8 +550,9 @@ R"PATHJS(
     geom.moves.forEach(function (mv) {
       if (mv.type === 'sweep') {
         var len = mv.r * (Math.abs(angDelta(mv.from, mv.to)) * Math.PI / 180);
-        segs.push({ dry: false, ring: mv.ring, visit: mv.visit, r: mv.r,
-                    from: mv.from, to: mv.to, cw: mv.cw, len: Math.max(len, 1) });
+        segs.push({ dry: false, ring: mv.ring, visit: mv.visit, pass: mv.pass || 0,
+                    r: mv.r, from: mv.from, to: mv.to, cw: mv.cw,
+                    len: Math.max(len, 1) });
       } else if (mv.type === 'turn') {
         /* Wet, and followed waypoint by waypoint so the scrubber traces the
          * boundary the way the glide engine does. */
@@ -510,7 +596,8 @@ R"PATHJS(
                    dry: !!sg.dry, turn: !!sg.turn, ring: -1 };
         }
         return { r_mm: sg.r, bearing: sg.from + (sg.to - sg.from) * f,
-                 dry: false, ring: sg.ring, visit: sg.visit, cw: sg.cw };
+                 dry: false, ring: sg.ring, visit: sg.visit,
+                 pass: sg.pass || 0, cw: sg.cw };
       }
       acc += sg.len;
     }
@@ -560,6 +647,34 @@ R"PATHJS(
 
   /* Draw a whole thumbnail: background disc, zone outline, then the path.
    * Used by the Water modal and the schedule entry cards. */
+  /* b570: where the nozzle actually is, from /api/status, drawn on top of the
+   * planned path. This is the point of closing the loop between preview and
+   * run: the same picture, with the real thing moving over it. A stale
+   * reading (the nozzle transiting between arcs, where no sample is taken)
+   * is drawn hollow rather than frozen solid, so a stopped dot never reads
+   * as a live one. */
+  function drawLive(ctx, live, o) {
+    if (!live || !(live.throw_mm > 0)) return;
+    var r = (live.throw_mm / o.scale_mm) * o.maxR;
+    if (!(r > 0) || r > o.maxR * 1.05) return;
+    var a = rad(live.deg);
+    var x = o.cx + Math.cos(a) * r, y = o.cy + Math.sin(a) * r;
+    var fresh = (live.age_ms || 0) < 2500;
+    ctx.beginPath();
+    ctx.arc(x, y, fresh ? 5 : 4, 0, Math.PI * 2);
+    if (fresh) {
+      ctx.fillStyle = 'rgba(120,255,180,.95)';
+      ctx.fill();
+      ctx.beginPath(); ctx.arc(x, y, 9, 0, Math.PI * 2);
+      ctx.strokeStyle = 'rgba(120,255,180,.45)';
+    } else {
+      ctx.strokeStyle = 'rgba(120,255,180,.5)';
+    }
+    ctx.lineWidth = 1.5; ctx.setLineDash([]); ctx.stroke();
+  }
+
+  var _lastThumbScale = 6000;   /* b571: last scale thumb() drew at */
+
   function thumb(canvas, points, opts) {
     if (!canvas || !canvas.getContext) return false;
     var ctx = canvas.getContext('2d');
@@ -580,6 +695,11 @@ R"PATHJS(
     /* Fit the thumbnail to the zone; full reach wastes most of the disc. */
     var zmax = Math.max.apply(null, points.map(function (p) { return p.throw_mm; }));
     var scale = Math.max(zmax * 1.12, 600);
+    /* b571: module-level, NOT ov.lastScale -- ov is null until the overlay
+     * is first opened, and thumb() runs well before that (the Water modal
+     * draws its thumbnail on open). Writing through the null threw inside
+     * openModal, so the modal never appeared and Water Zone did nothing. */
+    _lastThumbScale = scale;
 
     ctx.strokeStyle = 'rgba(120,140,130,.45)';
     ctx.lineWidth = 1;
@@ -606,6 +726,9 @@ R"PATHJS(
     /* Sprinkler at the centre. */
     ctx.fillStyle = 'rgba(0,232,122,.9)';
     ctx.beginPath(); ctx.arc(cx, cy, 2, 0, Math.PI * 2); ctx.fill();
+
+    if (opts.live) drawLive(ctx, opts.live,
+                            { cx: cx, cy: cy, maxR: maxR, scale_mm: scale });
     return at || true;
   }
 
@@ -635,7 +758,6 @@ R"PATHJS(
       '<div class="ipo-scrub">' +
         '<button class="ipo-btn ipo-play" aria-label="Play">&#9654;</button>' +
         '<input type="range" min="0" max="1000" step="1" value="0" aria-label="Position along the path">' +
-        '<span class="ipo-at">start</span>' +
       '</div>' +
       '<div class="ipo-note"></div>';
     var css = document.createElement('style');
@@ -653,8 +775,6 @@ R"PATHJS(
         'cursor:pointer;font-family:inherit;}' +
       '#irr-path-ov .ipo-btn.sel{border-color:var(--green);background:var(--green-dim);color:var(--green);}' +
       '#irr-path-ov .ipo-scrub input{flex:1;min-width:0;}' +
-      '#irr-path-ov .ipo-at{font-family:"Courier New",monospace;font-size:11px;' +
-        'min-width:96px;text-align:right;}' +
       '#irr-path-ov .ipo-note{width:min(92vw,620px);font-size:11px;' +
         'color:var(--text-mid);text-align:center;min-height:14px;}';
     document.head.appendChild(css);
@@ -667,7 +787,6 @@ R"PATHJS(
       pass: el.querySelector('.ipo-pass'),
       play: el.querySelector('.ipo-play'),
       range: el.querySelector('input'),
-      at: el.querySelector('.ipo-at'),
       note: el.querySelector('.ipo-note'),
       opts: null, mode: '7', passIdx: 0, t: 0, timer: null,
       variants: [], passNoteText: ''
@@ -751,16 +870,26 @@ R"PATHJS(
        * the zone was set to -- the Sections preview in particular looked
        * unaffected by coverage because the lobe ordering runs on top of a
        * ring list that was built at the wrong pitch. */
-      coverage: ov.opts.coverage | 0
+      coverage: ov.opts.coverage | 0,
+      /* b569: the scrubber now walks the WHOLE run, every pass, so there is
+       * nothing left for a pass stepper to step through. */
+      ringPasses: ov.opts.ringPasses,
+      ringMm: ov.opts.ringMm
     };
     var at = thumb(ov.cv, ov.opts.points, o);
+    if (ov.opts.live) {
+      var c = ov.cv, W = c.width, H = c.height;
+      drawLive(c.getContext('2d'), ov.opts.live,
+               { cx: W / 2, cy: H / 2, maxR: Math.min(W, H) / 2 - 2,
+                 scale_mm: _lastThumbScale || 6000 });
+    }
     var label = (MODES[ov.mode] || {}).label || '';
     ov.title.textContent = (ov.opts.title ? ov.opts.title + ' \u00b7 ' : '') + label;
-    ov.at.textContent = (at && at.r_mm !== undefined)
-      ? (at.dry ? 'moving \u00b7 dry'
-                : at.turn ? 'turning \u00b7 wet'
-                : 'ring ' + (at.ring + 1) + ' \u00b7 ' + (at.r_mm / 304.8).toFixed(1) + "'")
-      : (ov.t <= 0 ? 'start' : '');
+    /* b572: no per-frame readout here. It was a monospace span in the same
+     * flex row as the scrubber, and once b569 added the pass number the text
+     * outgrew its min-width and resized the slider as playback moved -- the
+     * bar jittered under the thumb. The marker on the canvas already shows
+     * where the nozzle is. */
   }
 
   function openPreview(opts) {
@@ -773,11 +902,9 @@ R"PATHJS(
     ov.mode = MODES[opts.mode] ? opts.mode : '7';
     ov.passIdx = 0; ov.t = 0; ov.range.value = 0;
     var mk = (MODES[ov.mode] || MODES['1']).key;
-    ov.variants = passVariants(mk);
-    ov.passNoteText = passNote(mk, opts.depth8);
-    /* Nothing to step through when every pass looks the same. */
-    ov.pass.style.display = ov.variants.length ? '' : 'none';
-    ovPassLabel();
+    ov.variants = [];
+    ov.passNoteText = '';
+    ov.pass.style.display = 'none';   /* b569: the scrub covers every pass */
     /* Locked: the caller already chose the mode, so show it as a static chip
      * rather than letting the preview disagree with the run that will happen. */
     ov.modes.innerHTML = '';
@@ -795,11 +922,6 @@ R"PATHJS(
         b.addEventListener('click', function () {
           ov.mode = m;
           var k = (MODES[m] || MODES['1']).key;
-          ov.variants = passVariants(k);
-          ov.passNoteText = passNote(k, ov.opts.depth8);
-          if (ov.passIdx >= ov.variants.length) ov.passIdx = 0;
-          ov.pass.style.display = ov.variants.length ? '' : 'none';
-          ovPassLabel();
           ov.modes.querySelectorAll('.ipo-btn').forEach(function (x) { x.classList.toggle('sel', x === b); });
           ovDraw();
         });
@@ -814,7 +936,18 @@ R"PATHJS(
   root.IrrigotoPath = {
     openPreview: openPreview, closePreview: ovClose,
     MODES: MODES, build: build, draw: draw, thumb: thumb, normPoints: normPoints,
-    flatten: flatten, pointAt: pointAt, marker: marker,
+    flatten: flatten, pointAt: pointAt, marker: marker, drawLive: drawLive,
+    /* b582: feed new live data to an open overlay. Returns false when the
+     * overlay is closed, so the caller can stop polling for it. */
+    updateLive: function (live) {
+      if (!ov || !ov.el || !ov.el.classList.contains('open')) return false;
+      ov.opts.live = live;
+      ovDraw();
+      return true;
+    },
+    isOpen: function () {
+      return !!(ov && ov.el && ov.el.classList.contains('open'));
+    },
     zoneArc: zoneArc, ringThrows: ringThrows, ringSpans: ringSpans,
     pointInZone: pointInZone
   };

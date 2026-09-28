@@ -107,6 +107,47 @@ typedef struct {
     water_ring_data_t rings[WATER_RUN_MAX_RINGS];
 } water_run_t;
 
+// ── Deterministic run plan ───────────────────────────────────────────────────
+// The whole run, decided before it starts. Built by plan_build() from the
+// zone, the mode, the depth and ONE live supply-pressure reading; executed
+// verbatim. Measurement during the run is monitoring, not control.
+//
+// Every quantity here comes from the same function the executor uses, because
+// a planner that computes anything its own way reintroduces exactly the
+// preview-vs-run divergence this exists to remove.
+#define PLAN_MAX_RINGS   36      // matches WATER_MAX_RINGS_CAL
+#define PLAN_MAX_ARCS     6      // matches WATER_MAX_ARCS_PER_RING
+
+typedef struct {
+    float   throw_mm;            // ring radius
+    float   inner_mm;            // next ring inward, for the annulus area
+    float   valve_deg;           // commanded valve angle
+    float   psi_pred;            // pressure the cal predicts at that angle
+    float   dps;                 // commanded sweep speed, already clamped
+    float   area_m2;             // swept annulus area, arcs only
+    float   depth_per_pass_mm;   // what one sweep deposits, per the executor's model
+    float   sweep_s;             // one pass over this ring
+    uint8_t passes;              // how many passes THIS ring needs
+    uint8_t n_arcs;
+    float   arc_lo[PLAN_MAX_ARCS];
+    float   arc_span[PLAN_MAX_ARCS];
+} plan_ring_t;
+
+typedef struct {
+    uint8_t     ok;              // 0 = could not plan (no zone / no cal)
+    uint8_t     n_rings;
+    uint8_t     n_passes;        // max over rings -- how many the run makes
+    uint8_t     coverage;
+    uint8_t     mode;
+    uint8_t     depth8;
+    float       target_depth_mm;
+    float       supply_psi;      // the single live input it was planned from
+    float       est_sweep_s;     // time actually spraying
+    float       est_total_s;     // + measured per-transition overhead
+    float       dps_min, dps_max;
+    plan_ring_t ring[PLAN_MAX_RINGS];
+} water_plan_t;
+
 // ── Watering schedule ────────────────────────────────────────────────────────
 // One entry per "fire this zone at this time on these days" rule. Stored in
 // NVS as a single blob; pushed/queried via HA service or web UI.

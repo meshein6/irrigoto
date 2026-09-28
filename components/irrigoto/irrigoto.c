@@ -355,6 +355,23 @@ static water_sector_accum_t s_smooth_accum[WATER_RUN_MAX_RINGS][36];
 static bool                 s_smooth_accum_mode = false;
 
 // Write one binary row to the open water log file.
+// b570: live nozzle position during a run, for the page to draw a marker on
+// the same path preview it already shows. Written only by
+// water_csv_write_row() below; read by /api/status. Stale after a couple of
+// seconds means the nozzle is between sweeps (a transit or a valve move),
+// which the page shows as "moving" rather than freezing the dot.
+static volatile int16_t    s_live_ring     = -1;
+static volatile int8_t     s_live_pass     = 0;
+static volatile float      s_live_bearing  = 0.0f;
+static volatile float      s_live_throw_mm = 0.0f;   // what the plan asked for
+static volatile float      s_live_throw_act = 0.0f;  // b580: what it is doing
+static volatile TickType_t s_live_tick     = 0;
+// b580: the run's shape, so a live view can say "pass 2 of 4" and draw the
+// planned ring the nozzle is supposed to be on. Set when the schedule is
+// built; both 0 when nothing is running.
+static volatile int8_t     s_live_passes_total = 0;
+static volatile int16_t    s_live_rings_total  = 0;
+
 static void water_csv_write_row(FILE *f, float t_s, int ring_, int arc_,
     int sector_, float nozzle_target, float nozzle_actual,
     float valve_target, float valve_actual,
@@ -362,6 +379,20 @@ static void water_csv_write_row(FILE *f, float t_s, int ring_, int arc_,
     float psi_target, float psi_actual,
     float bearing_rad, uint8_t pass_type)
 {
+    // b570: latch where the nozzle is, for the live run view. Every sweep
+    // function calls this on its own sampling cadence, so one hook here
+    // covers pulse, gentle/smooth and the serpentine glide without touching
+    // any of them -- and without the HTTP handler reaching for the AS5600
+    // while the run task is driving it.
+    s_live_ring     = (int16_t)ring_;
+    s_live_pass     = (int8_t)pass_type;
+    s_live_bearing   = nozzle_actual;
+    // b580: keep these apart. Conflating them hid exactly the thing the owner
+    // is trying to see -- the stream landing short of where the plan put it.
+    s_live_throw_mm  = throw_target;
+    s_live_throw_act = (throw_actual > 100.0f) ? throw_actual : 0.0f;
+    s_live_tick      = xTaskGetTickCount();
+
     // Smooth aggregate mode: accumulate into per-(ring,sector) bucket, don't write.
     if (s_smooth_accum_mode) {
         if ((unsigned)ring_ < WATER_RUN_MAX_RINGS && (unsigned)sector_ < 36) {
@@ -9217,10 +9248,54 @@ static int serpentine_build_pass_plan(
                 }
             }
         }
-        if (n_lobes > 1)
-            INFO("Serpentine: section-by-section, %d lobe(s)", n_lobes);
-        else
+        // b575: order the lobes by how far OUT they reach, not by bearing.
+        //
+        // serpentine_arc_bounds returns arcs sorted by CW distance from
+        // zone_arc_start, so the lobe list was in bearing order and the run
+        // started with whichever lobe happened to come first round the
+        // circle. On the measured zone that is the 260-340 deg lobe, which
+        // only reaches out to ring 19, so the run began mid-distance, worked
+        // inward to ring 31, then jumped to the 80-100 deg lobe and started
+        // again from ring 1 -- the outermost ring in the zone. Each lobe was
+        // correctly outer->inner; the lobes were in the wrong order, and from
+        // the yard it reads as starting in the middle and jumping about.
+        //
+        // Sort by the extreme ring in the direction this pass travels, so an
+        // out->in pass starts at the globally outermost ring and an in->out
+        // pass starts at the innermost.
+        if (n_lobes > 1) {
+            int lobe_edge[WATER_MAX_ARCS_PER_RING];
+            for (int L = 0; L < n_lobes; L++)
+                lobe_edge[L] = out_to_in ? WATER_RUN_MAX_RINGS : -1;
+            for (int ring = 0; ring < num_rings && ring < WATER_RUN_MAX_RINGS; ring++) {
+                if (skip[ring]) continue;
+                int na0 = serpentine_arc_bounds(zone, have_zone, ring_throws[ring],
+                              sector_throw, act_max_throw, zone_arc_start,
+                              zone_arc_end, zone_arc_deg, tl, th);
+                for (int a = 0; a < na0; a++)
+                    for (int L = 0; L < n_lobes; L++)
+                        if (serp_arc_overlaps(tl[a], th[a], lobe_lo[L], lobe_hi[L])) {
+                            if (out_to_in) { if (ring < lobe_edge[L]) lobe_edge[L] = ring; }
+                            else           { if (ring > lobe_edge[L]) lobe_edge[L] = ring; }
+                            break;   // lowest-index lobe wins, as in the sweep loop
+                        }
+            }
+            for (int a = 0; a < n_lobes - 1; a++)
+                for (int b = a + 1; b < n_lobes; b++) {
+                    bool swap = out_to_in ? (lobe_edge[b] < lobe_edge[a])
+                                          : (lobe_edge[b] > lobe_edge[a]);
+                    if (swap) {
+                        int ei = lobe_edge[a]; lobe_edge[a] = lobe_edge[b]; lobe_edge[b] = ei;
+                        float f = lobe_lo[a]; lobe_lo[a] = lobe_lo[b]; lobe_lo[b] = f;
+                        f = lobe_hi[a];       lobe_hi[a] = lobe_hi[b]; lobe_hi[b] = f;
+                    }
+                }
+            INFO("Serpentine: section-by-section, %d lobe(s); order by reach: "
+                 "%s ring %d first", n_lobes,
+                 out_to_in ? "outermost" : "innermost", lobe_edge[0] + 1);
+        } else {
             sections = false;   // single lobe: ring-major already never crosses
+        }
     }
 
     int  prev_sec = -1;   // b541: which section the last emitted arc belonged to
@@ -9556,44 +9631,12 @@ static float serp_ff_valve(int ring, float ring_throw, bool direct, float corr,
 // SERP_V_APPROACH_OVS below the target and come back up to it from below.
 // Nozzle is stationary at the turn point; ~0.5 s per closing turn; no
 // pressure feedback involved (Rob: no hunting, keep the flow continuous).
-#define SERP_V_APPROACH_OVS   3.0f
-#define SERP_V_APPROACH_MS    1500u
-static void serp_valve_settle_from_below(chase_motor_t *vm, float v1, int *v_dir_io)
-{
-    const int      OPEN_DIR  = -1;      // matches VALVE_OPEN_DIR in glide_legs
-    const uint16_t DUTY_HI   = 220, DUTY_LO = 70;
-    const float    TOL       = 0.8f, DECEL = 4.0f;
-    float v_pre = fmaxf(v1 - SERP_V_APPROACH_OVS, VALVE_CAL_START_DEG + 0.5f);
-    if (v_pre >= v1 - 0.3f) return;     // no room below: nothing to gain
-    uint16_t raw = 0; float cur = v1;
-    // Phase A: make sure we are BELOW the target (closing direction).
-    chase_motor_apply(vm, 0, 0); vTaskDelay(pdMS_TO_TICKS(50));
-    TickType_t t0 = xTaskGetTickCount();
-    while ((uint32_t)pdTICKS_TO_MS(xTaskGetTickCount() - t0) < SERP_V_APPROACH_MS) {
-        if (!as5600_read(ADDR_AS5600L, &raw, NULL, NULL)) break;
-        cur = cal_unwrap_deg_near(raw * (360.0f / 4096.0f), VALVE_CLOSED_DEG + 40.0f);  // b517
-        if (cur <= v_pre + TOL) break;
-        float d = cur - v_pre; uint16_t duty = DUTY_HI;
-        if (d < DECEL) duty = (uint16_t)(DUTY_LO + (DUTY_HI - DUTY_LO) * (d / DECEL));
-        chase_motor_apply(vm, -OPEN_DIR, duty);
-        vTaskDelay(pdMS_TO_TICKS(30));
-    }
-    chase_motor_apply(vm, 0, 0); vTaskDelay(pdMS_TO_TICKS(60));
-    // Phase B: approach the target from below (opening direction).
-    t0 = xTaskGetTickCount();
-    while ((uint32_t)pdTICKS_TO_MS(xTaskGetTickCount() - t0) < SERP_V_APPROACH_MS) {
-        if (!as5600_read(ADDR_AS5600L, &raw, NULL, NULL)) break;
-        cur = cal_unwrap_deg_near(raw * (360.0f / 4096.0f), VALVE_CLOSED_DEG + 40.0f);  // b517
-        if (cur >= v1 - TOL) break;
-        float d = v1 - cur; uint16_t duty = DUTY_HI;
-        if (d < DECEL) duty = (uint16_t)(DUTY_LO + (DUTY_HI - DUTY_LO) * (d / DECEL));
-        chase_motor_apply(vm, OPEN_DIR, duty);
-        vTaskDelay(pdMS_TO_TICKS(30));
-    }
-    chase_motor_apply(vm, 0, 0);
-    if (v_dir_io) *v_dir_io = 0;
-    s_valve_last_dir = OPEN_DIR;
-}
+// b576: the from-below re-approach helper is gone. It drove the valve past a
+// ring's target and back up so the ball always landed from the same side --
+// with the stream ON, so every inward ring change sprayed short for up to
+// 1.5 s. The stiction nudge inside the valve chase does the part that
+// mattered (getting a stuck ball moving) without leaving the planned
+// distance.
 
 // b520: runtime dry hop for a sweep whose nozzle is not at the arc entry.
 // Close the valve in place, rotate the shortest way to the entry with the
@@ -9689,8 +9732,49 @@ static bool serpentine_glide_legs(const serpentine_leg_t *legs, int n,
     const float    MIN_SWEEP_DEG = 1.0f;  // below this a leg is radial
     const uint16_t V_CHASE_DUTY  = 220;
     const uint16_t V_MIN_DUTY    = 70;
-    const float    V_TOL_DEG     = 0.8f;
-    const float    V_DECEL_DEG   = 4.0f;
+    // b585: 0.8 -> 0.20 deg. The ring ladder commands valve moves of
+    // 0.43-0.97 deg between consecutive rings on this zone, so a 0.8 deg
+    // tolerance swallowed 13 of 19 of them -- the chase said "already within
+    // tolerance", the valve never moved, and consecutive rings swept at the
+    // SAME physical distance. That is the reported "goes back and forth at
+    // the same distance" and "distances aren't adjusting granularly". The
+    // encoder resolves 360/4096 = 0.088 deg, so 0.20 is about 2.3 counts:
+    // tight, but comfortably inside the smallest step we need to make.
+    const float    V_TOL_DEG     = 0.20f;
+    // b576: the chase eases duty down to V_MIN_DUTY as it nears the target,
+    // and V_MIN_DUTY is 70 -- the exact duty this codebase records the valve
+    // STALLING at ("Frontyard f9e994 stalls at duty 70", b521). So the last
+    // fraction of a degree was being attempted at stall threshold, which is
+    // why the per-ring feed-forward measured 4-11.5 s on inner rings and why
+    // the stream took a second to settle onto a new distance.
+    //
+    // Instead of creeping, detect that the valve has stopped moving and give
+    // it one short boosted pulse to break static friction, then resume the
+    // normal chase. Bounded: a pulse only fires after V_STUCK_MS of no
+    // encoder movement, lasts V_NUDGE_MS, and at most V_NUDGE_MAX per leg, so
+    // a genuinely jammed valve still falls through to the existing fault
+    // paths rather than being hammered.
+    // b585: harder and sooner. Sub-degree ring steps are exactly where
+    // static friction dominates -- there is no run-up to build momentum -- so
+    // a gentle nudge just dwells at stall. Still bounded, so a genuinely
+    // jammed valve reaches the existing fault paths instead of being hammered.
+    const uint32_t V_STUCK_MS    = 90;     // 150 -> 90: react before it settles
+    const uint32_t V_NUDGE_MS    = 100;    // owner-specified pulse width
+    const uint16_t V_NUDGE_DUTY  = 420;    // 320 -> 420
+    const int      V_NUDGE_MAX   = 10;     // 6 -> 10: more small steps per leg
+    float      v_seen_pos   = -1.0f;       // encoder angle at last movement
+    TickType_t v_seen_tick  = 0;
+    TickType_t v_nudge_end  = 0;
+    int        v_nudges     = 0;
+    // b585: 4.0 -> 1.0 deg. Deceleration starting 4 deg out meant a
+    // sub-degree ring step spent its ENTIRE travel inside the easing ramp,
+    // which works out to duty ~76 -- the duty b521 records this valve
+    // stalling at. So even the steps that cleared the old tolerance were
+    // attempted too gently to move.
+    const float    V_DECEL_DEG   = 1.0f;
+    // And the ramp floor is raised off the stall threshold. V_MIN_DUTY (70)
+    // is kept for other uses; the chase never eases below this.
+    const uint16_t V_EASE_FLOOR  = 140;
     const float    V_LAG_DEG     = 5.0f;
     const float    V_NOM_DPS     = 8.0f;  // timeout estimates only
     const uint32_t TICK_MS       = 30;
@@ -9947,10 +10031,31 @@ static bool serpentine_glide_legs(const serpentine_leg_t *legs, int n,
                 if (v_abs < V_DECEL_DEG) {
                     float t    = v_abs / V_DECEL_DEG;
                     float ease = 0.5f * (1.0f - cosf((float)M_PI * t));
-                    vd = (uint16_t)((float)V_MIN_DUTY
-                            + ease * (float)(V_CHASE_DUTY - V_MIN_DUTY));
+                    vd = (uint16_t)((float)V_EASE_FLOOR
+                            + ease * (float)(V_CHASE_DUTY - V_EASE_FLOOR));
                 } else {
                     vd = V_CHASE_DUTY;
+                }
+                // b576: stiction nudge. Track real movement; if the encoder
+                // has not budged while we are still outside tolerance, the
+                // eased-down duty is below what this valve needs to start
+                // moving, so pulse it.
+                TickType_t _nw = xTaskGetTickCount();
+                if (v_seen_pos < 0.0f || fabsf(cur_v - v_seen_pos) > 0.05f) {
+                    v_seen_pos  = cur_v;
+                    v_seen_tick = _nw;
+                } else if (v_nudge_end == 0 && v_nudges < V_NUDGE_MAX
+                           && (uint32_t)pdTICKS_TO_MS(_nw - v_seen_tick) > V_STUCK_MS) {
+                    v_nudge_end = _nw + pdMS_TO_TICKS(V_NUDGE_MS);
+                    v_nudges++;
+                    v_seen_tick = _nw;   // don't re-arm until it moves or times out
+                }
+                if (v_nudge_end != 0) {
+                    if ((int32_t)(_nw - v_nudge_end) < 0) {
+                        if (vd < V_NUDGE_DUTY) vd = V_NUDGE_DUTY;
+                    } else {
+                        v_nudge_end = 0;
+                    }
                 }
                 if (v_dir && want != v_dir) {
                     chase_motor_reverse_fast(&vm, vd);
@@ -10119,12 +10224,13 @@ static bool serpentine_glide_legs(const serpentine_leg_t *legs, int n,
 
         if (!ok) break;
 
-        // b515: closing leg -> re-approach the ring's valve target from below
-        // so the ball lands where the encoder says (see helper above).
-        if (!dry_leg && (v1 < v0 - 0.5f)) {
-            serp_valve_settle_from_below(&vm, v1, &v_dir);
-            TOUCH_ACTIVITY();
-        }
+        // b576: the from-below re-approach is gone. It drove the valve past
+        // the ring's target and back up so the ball always landed from the
+        // same side -- but it did that with the stream ON, so every inward
+        // ring change sprayed short for up to 1.5 s, which is the reported
+        // "undershoots for a second when it changes distance". Its real job
+        // was getting a stuck ball to move, and the stiction nudge in the
+        // chase above does that without leaving the planned distance.
 
         // b427: PSI settle after a flow-starting valve open (run start, or
         // reopen after a dry hop). The valve chase reaches the ring target
@@ -10135,7 +10241,38 @@ static bool serpentine_glide_legs(const serpentine_leg_t *legs, int n,
         if (radial && !dry_leg
                 && v0 <= VALVE_CAL_START_DEG + 2.0f
                 && v1 >  VALVE_CAL_START_DEG + 2.0f) {
-            vTaskDelay(pdMS_TO_TICKS(1800));
+            // b579: wait for pressure to actually stabilise, don't guess at
+            // 1800 ms.
+            //
+            // The owner reports the first sweeps landing a couple of feet
+            // short and later ones being fine -- the signature of watering
+            // while the supply is still coming up, not of a calibration
+            // error. Two things made it worse: the reach-ordering in b575/578
+            // means the run now STARTS on the outermost ring, the one needing
+            // the highest pressure and so the least tolerant of a transient;
+            // and 1800 ms was a fixed guess (b427) that happens to be enough
+            // for a mid-distance ring and not for the far one.
+            //
+            // Poll until two consecutive reads agree, the same test
+            // nozzle_sweep_pulse already uses, capped so a dead supply still
+            // falls through to the existing no-flow detection.
+            const uint32_t PS_MAX_MS = 9000, PS_STEP_MS = 150;
+            float _p0 = 0.0f, _p1 = 0.0f;
+            uint32_t _w = 0;
+            mprls_read_quiet(&_p0);
+            while (_w < PS_MAX_MS) {
+                vTaskDelay(pdMS_TO_TICKS(PS_STEP_MS));
+                _w += PS_STEP_MS;
+                TOUCH_ACTIVITY();
+                if (s_water_abort) break;
+                if (!mprls_read_quiet(&_p1)) continue;
+                // Settled: a real reading that has stopped climbing.
+                if (_p1 > 0.15f && fabsf(_p1 - _p0) < 0.04f && _w >= 600) break;
+                _p0 = _p1;
+            }
+            INFO("serpentine: supply settled at %.2f PSI after %u ms "
+                 "(first wet sweep waits for pressure, not a fixed delay)",
+                 _p1, (unsigned)_w);
             TOUCH_ACTIVITY();
         }
 
@@ -10177,8 +10314,41 @@ static bool serpentine_glide_legs(const serpentine_leg_t *legs, int n,
             float ro   = ring_throws[ring];
             float ri   = (ring == num_rings - 1) ? ro * 0.92f
                                                  : ring_throws[ring + 1];
+            // b574: credit the ring's depth WEIGHTED BY ARC SHARE.
+            //
+            // nozzle_precip_depth_mm() returns the depth on the wedge just
+            // swept -- the arc length cancels out of the maths, because a
+            // shorter sweep takes proportionally less time over
+            // proportionally less ground. So it is a per-wedge figure, and
+            // adding it once per wedge into a single per-RING counter says
+            // the same ground was watered twice.
+            //
+            // That is exactly what happened on a zone with a waist. A ring
+            // with arcs in two lobes is swept once per lobe -- same radius,
+            // opposite sides of the yard -- and both credited
+            // cumulative_depth[ring]. Measured on the 2026-09-27 Sections
+            // run, ring 20 within a single pass:
+            //     r20 sweep 35.8 deg ... cum 2.29 mm
+            //     r20 sweep 42.4 deg ... cum 5.20 mm
+            // against a 3.175 mm target. The firmware then believed r20 was
+            // over target and dropped it from pass 2, while each lobe had in
+            // fact received about 2.5 mm. Every multi-arc ring was
+            // under-watered by roughly its arc count, and runs "completed"
+            // early on double-counted depth.
+            //
+            // Weighting by arc share makes the counter the ring's
+            // area-weighted mean depth, which is what a per-ring number has
+            // to mean: sweeping both halves of a ring to 2.5 mm leaves the
+            // ring at 2.5 mm, not 5.
+            float _ring_span = 0.0f;
+            for (int _q = 0; _q < n; _q++)
+                if (legs[_q].kind == SERPENTINE_LEG_SWEEP
+                        && legs[_q].ring == L->ring)
+                    _ring_span += legs[_q].arc_span;
+            float _share = (_ring_span > 0.5f && L->arc_span > 0.0f)
+                         ? (L->arc_span / _ring_span) : 1.0f;
             cumulative_depth[ring] +=
-                nozzle_precip_depth_mm(ro, ri, meas_dps, avg_psi);
+                nozzle_precip_depth_mm(ro, ri, meas_dps, avg_psi) * _share;
 
             float _at = (avg_psi > 0.1f) ? cal_pressure_to_throw_mm(avg_psi) : ro;
             float _arc_s = (dirn > 0)
@@ -10250,8 +10420,69 @@ static void water_serpentine_passes(
     // (blend 0.6 old / 0.4 new of target/actual, clamped 0.5..1.6).
     // Replaces the global pressure_scale that b428 removed: corr learns
     // each ring's real supply behavior from its own measured throw.
+    // b579: corr is seeded from the PREVIOUS run and then held.
+    //
+    // b575 froze it at 1.0 so the planned path would be the path that ran.
+    // That worked, but it also discarded the only thing correcting for the
+    // throw calibration being off -- so rings landed wherever the cal said,
+    // and the outermost one came up short.
+    //
+    // Seeding from history keeps both properties: the correction is decided
+    // before the run and never changes during it, so every pass sweeps the
+    // same radius and the plan stays exact -- and it still converges on
+    // reality across runs instead of re-learning from zero each time.
+    //
+    // Rings are matched by RADIUS, not index, because a coverage change
+    // shifts the whole ladder. Only ratios inside the b433 plausibility band
+    // are trusted: below ~1.5 PSI the pressure->throw model over-reads up to
+    // 2x, and the previous run recorded 1.19x and 1.60x on its two outermost
+    // rings for exactly that reason. Seeding from those would drive the valve
+    // the wrong way.
     float corr[WATER_RUN_MAX_RINGS];
     for (int i = 0; i < WATER_RUN_MAX_RINGS; i++) corr[i] = 1.0f;
+    if (!dry && storage_ready()) {
+        water_run_t _prev;
+        memset(&_prev, 0, sizeof(_prev));
+        if (storage_water_load(s_water_zone_id, &_prev) == ESP_OK
+                && _prev.num_rings > 0) {
+            int _seeded = 0;
+            for (int i = 0; i < num_rings && i < WATER_RUN_MAX_RINGS; i++) {
+                float _ro = ring_throws[i];
+                if (_ro < 100.0f) continue;
+                /* nearest previous ring by radius, within half a pitch */
+                int   _best = -1; float _bd = 1e9f;
+                for (int q = 0; q < _prev.num_rings && q < WATER_RUN_MAX_RINGS; q++) {
+                    float _d = fabsf(_prev.rings[q].throw_mm - _ro);
+                    if (_d < _bd) { _bd = _d; _best = q; }
+                }
+                if (_best < 0 || _bd > s_ring_pitch_mm * 0.5f + 40.0f) continue;
+                float _t = _prev.rings[_best].throw_mm;
+                float _a = _prev.rings[_best].actual_throw_mm;
+                if (_t < 100.0f || _a < 100.0f) continue;
+                float _ratio = _a / _t;
+                if (_ratio < 0.75f || _ratio > 1.25f) continue;   /* b433 band */
+                // b583: seed on UNDER-throw only.
+                //
+                // Correcting an over-read closes the valve and shortens the
+                // throw, and b433 already established that the
+                // pressure->throw model over-reads at low PSI -- "over-throw
+                // is not re-fired; beyond +25% it's artifact, within it the
+                // water still landed inside the splash band". The previous
+                // run recorded 1.19x on the outermost ring, which is inside
+                // the plausibility band and so was trusted here: corr became
+                // 1/1.19 = 0.84, the run aimed at 0.84 x 10.5 = 8.8 ft, and
+                // the stream landed about two feet short of the grass. That
+                // was this seeding, not the calibration -- the cal round
+                // trips to within 0.00 ft on every walked point.
+                if (_ratio > 0.98f) continue;   /* over-read: leave it alone */
+                corr[i] = fmaxf(0.5f, fminf(1.6f, _t / _a));
+                _seeded++;
+            }
+            if (_seeded)
+                INFO("Serpentine: seeded throw correction on %d ring(s) from "
+                     "the previous run (held for this run)", _seeded);
+        }
+    }
 
     // b432: inner/direct-valve rings are NOT deferred anymore. The throw cal
     // reaches ~330 mm on this fleet, so nearly every ring is cal-addressable
@@ -10277,20 +10508,126 @@ static void water_serpentine_passes(
     memset(s_serp_prev_cum, 0, sizeof(s_serp_prev_cum));
     serp_ff_reset();   // b513: cache the cal table, forget stale supply samples
 
+    // b575: THE PASS SCHEDULE IS DECIDED HERE, BEFORE ANY WATER FLOWS.
+    //
+    // It used to be decided pass by pass from measured depth
+    // (depth_ok = cumulative_depth[i] >= depth_mm), which meant the run was
+    // unknowable in advance: which rings appeared in pass 2, how many passes
+    // there would be, and how long it would take were all consequences of
+    // what earlier passes measured. Nothing could be previewed past pass 1
+    // and nothing could be estimated except from history.
+    //
+    // Now each ring's pass count comes from the same arithmetic the planner
+    // and the preview use: what one sweep deposits at the speed the solver
+    // will command, and how many of those it takes to reach target.
+    //
+    //   dps  = serpentine_ring_dps(...)          the speed that will be used
+    //   d1   = nozzle_precip_depth_mm(..., dps)  what one sweep deposits
+    //   n    = ceil(target / d1)                 passes that ring needs
+    //
+    // Both functions are the ones the executor itself uses, so the schedule
+    // cannot disagree with what happens. Measurement continues and is still
+    // logged and reported -- it just no longer changes the plan.
+    uint8_t plan_passes[WATER_RUN_MAX_RINGS];
+    int     plan_max_passes = 1;
+    {
+        float _tl[WATER_MAX_ARCS_PER_RING], _th[WATER_MAX_ARCS_PER_RING];
+        for (int i = 0; i < WATER_RUN_MAX_RINGS; i++) plan_passes[i] = 0;
+        for (int i = 0; i < num_rings && i < WATER_RUN_MAX_RINGS; i++) {
+            if (ring_unwaterable[i]) continue;
+            float ro = ring_throws[i];
+            float ri = (i == num_rings - 1) ? ro * 0.92f : ring_throws[i + 1];
+            int na = serpentine_arc_bounds(zone, have_zone, ro, sector_throw,
+                         act_max_throw, zone_arc_start, zone_arc_end,
+                         zone_arc_deg, _tl, _th);
+            if (na == 0) continue;
+            float active = 0.0f;
+            for (int a = 0; a < na; a++)
+                active += fmodf(_th[a] - _tl[a] + 360.0f, 360.0f);
+            if (active < 0.5f) continue;
+            float dps = (serpentine_dps > 0.0f) ? serpentine_dps
+                      : serpentine_ring_dps(ro, ri, active, depth_mm, spd, have_spd);
+            float psi = cal_throw_to_psi(ro) * pressure_scale;
+            float d1  = nozzle_precip_depth_mm(ro, ri, dps, psi);
+            int   n1  = (d1 > 0.0005f) ? (int)ceilf(depth_mm / d1) : 1;
+            if (n1 < 1) n1 = 1;
+            if (n1 > passes) n1 = passes;   // the caller's cap is the backstop
+            plan_passes[i] = (uint8_t)n1;
+            if (n1 > plan_max_passes) plan_max_passes = n1;
+        }
+        s_live_passes_total = (int8_t)plan_max_passes;   // b580
+        s_live_rings_total  = (int16_t)num_rings;
+        INFO("Serpentine plan: %d pass(es) scheduled up front for %.2f mm "
+             "target (deterministic -- measurement no longer re-plans)",
+             plan_max_passes, depth_mm);
+        for (int i0 = 0; i0 < num_rings && i0 < WATER_RUN_MAX_RINGS; i0 += 12) {
+            char _b[200]; int _o = 0;
+            for (int i = i0; i < i0 + 12 && i < num_rings
+                             && i < WATER_RUN_MAX_RINGS; i++) {
+                int _n = snprintf(_b + _o, sizeof(_b) - _o, " r%d=%u",
+                                  i + 1, (unsigned)plan_passes[i]);
+                if (_n < 0 || _n >= (int)(sizeof(_b) - _o)) break;
+                _o += _n;
+            }
+            INFO("Serpentine plan passes/ring [%d-%d]:%s", i0 + 1, i0 + 12, _b);
+        }
+    }
+    if (plan_max_passes < passes) passes = plan_max_passes;   // run as many as needed
+
+    // b578: duration, known before the first drop. Each ring is charged its
+    // own sweep time times the number of passes IT needs -- the multipass
+    // only revisits rings that are still short, so charging every ring for
+    // every pass overestimates badly. Plus a measured per-ring transition
+    // cost and the cleanup tail.
+    if (!dry) {
+        const float _OVH_PER_RING_S = 2.5f;   // valve move + connector, measured
+        const float _TAIL_S         = 25.0f;  // closeout, flush, valve close
+        float _tl2[WATER_MAX_ARCS_PER_RING], _th2[WATER_MAX_ARCS_PER_RING];
+        float _secs = _TAIL_S;
+        for (int i = 0; i < num_rings && i < WATER_RUN_MAX_RINGS; i++) {
+            if (plan_passes[i] == 0) continue;
+            float _ro = ring_throws[i];
+            float _ri = (i == num_rings - 1) ? _ro * 0.92f : ring_throws[i + 1];
+            int _na = serpentine_arc_bounds(zone, have_zone, _ro, sector_throw,
+                          act_max_throw, zone_arc_start, zone_arc_end,
+                          zone_arc_deg, _tl2, _th2);
+            float _active = 0.0f;
+            for (int a = 0; a < _na; a++)
+                _active += fmodf(_th2[a] - _tl2[a] + 360.0f, 360.0f);
+            if (_active < 0.5f) continue;
+            float _dps = (serpentine_dps > 0.0f) ? serpentine_dps
+                       : serpentine_ring_dps(_ro, _ri, _active, depth_mm, spd, have_spd);
+            if (_dps < 0.1f) continue;
+            _secs += ((_active / _dps) + _OVH_PER_RING_S) * (float)plan_passes[i];
+        }
+        s_water_est_min   = (int)(_secs / 60.0f) + 1;
+        s_eta_anchor_secs = _secs;
+        s_eta_anchor_tick = xTaskGetTickCount();
+        INFO("Serpentine estimate: %d min (%.0f s) -- fixed at run start, "
+             "not revised mid-run", s_water_est_min, _secs);
+    }
+
     for (int pass = 0; pass < passes; pass++) {
         bool skip[WATER_RUN_MAX_RINGS];
         int  todo = 0;
         for (int i = 0; i < num_rings && i < WATER_RUN_MAX_RINGS; i++) {
-            bool depth_ok = (pass > 0 && cumulative_depth[i] >= depth_mm);
+            // b575: from the schedule, not from measured depth.
+            bool depth_ok = (plan_passes[i] > 0) ? (pass >= plan_passes[i])
+                                                 : true;
             if (depth_ok && !ring_unwaterable[i]) {
                 water_ring_data_t *r = &s_last_water_run.rings[i];
                 if (r->throw_mm > 100.0f && r->actual_throw_mm > 100.0f) {
                     float ratio = r->actual_throw_mm / r->throw_mm;
+                    // b575: report, do not re-plan. Re-firing a ring because
+                    // its MEASURED throw came up short is the same
+                    // measurement-driven re-planning that made the run
+                    // unknowable. The deviation still matters -- it says the
+                    // throw cal is off for that ring -- so it is logged only.
                     if (ratio >= 0.75f && ratio < 0.90f && throw_retries[i] < 3) {
                         throw_retries[i]++;
-                        depth_ok = false;   // re-fire for throw convergence
-                        INFO("Serpentine ring %d: depth ok but throw %.2fx -- "
-                             "re-fire %u/3", i + 1, ratio, throw_retries[i]);
+                        INFO("Serpentine ring %d: throw %.2fx of target "
+                             "(plan unchanged -- recalibrate if persistent)",
+                             i + 1, ratio);
                     }
                 }
             }
@@ -10347,27 +10684,29 @@ static void water_serpentine_passes(
                     continue;
                 bool _under = r->actual_throw_mm < r->throw_mm;
                 if (_under && r->avg_psi < psi_min) continue;   // cold-start
+                // b575: corr shifted each ring's VALVE ANGLE between passes
+                // from its measured throw, so pass 2 swept a different radius
+                // than pass 1 -- the planned path was not the path that ran.
+                // The plan is authoritative now: corr stays 1.0 and the
+                // correction it would have made is logged, so a ring whose
+                // throw is consistently off gets fixed in calibration instead
+                // of silently mid-run.
                 float new_corr = fmaxf(0.5f, fminf(1.6f,
                                        r->throw_mm / r->actual_throw_mm));
-                float old_corr = corr[i];
-                corr[i] = old_corr * 0.6f + new_corr * 0.4f;
-                if (fabsf(corr[i] - 1.0f) > 0.05f)
-                    INFO("  Serpentine ring %d corr %.3f->%.3f (%.0f->%.0fmm, psi %.2f)",
-                         i + 1, old_corr, corr[i],
-                         r->throw_mm, r->actual_throw_mm, r->avg_psi);
+                // Report against new_corr, not corr[i] -- corr[i] is held at
+                // 1.0 now, so testing it would silence the very deviation
+                // this line exists to surface.
+                if (fabsf(new_corr - 1.0f) > 0.05f)
+                    INFO("  Serpentine ring %d throw %.0f->%.0fmm (psi %.2f) "
+                         "-- would have corrected x%.3f, plan held",
+                         i + 1, r->throw_mm, r->actual_throw_mm,
+                         r->avg_psi, new_corr);
             }
-            // Pass 0: un-credit rings whose water landed in the wrong ring
-            // (smooth's seed gate -- |corr-1| > 0.20 means the deposit
-            // geometry was off by more than a ring's worth).
-            if (pass == 0) {
-                for (int i = 0; i < num_rings && i < WATER_RUN_MAX_RINGS; i++) {
-                    if (fabsf(corr[i] - 1.0f) > 0.20f && cumulative_depth[i] > 0.0f) {
-                        INFO("  Serpentine ring %d: pass 0 depth not credited (corr %.3f)",
-                             i + 1, corr[i]);
-                        cumulative_depth[i] = 0.0f;
-                    }
-                }
-            }
+            // b575: the pass-0 un-credit is gone with corr. It discarded
+            // depth whose deposit geometry looked off by more than a ring's
+            // worth -- another measurement changing the run. The schedule no
+            // longer depends on credited depth, so there is nothing to
+            // un-credit.
         }
 
         // Per-ring cumulative depth dump (catch-cup aid, smooth's format;
@@ -10388,65 +10727,19 @@ static void water_serpentine_passes(
                  pass + 1, i0 + 1, _hi, _depbuf);
         }
 
-        // b505: refresh the web/HA time estimate at every pass end.
-        // Serpentine never updated s_water_est_min after the preamble, so
-        // HA showed the initial number for the whole run. Same physics as
-        // smooth's pass-end update: remaining deficit volume over the
-        // measured flow, plus the measured per-pass overhead times the
-        // passes the slowest-gaining ring still needs, plus the cleanup
-        // tail. Ring areas mirror the b503 expected-volume rule (sector
-        // activity at the ring radius) so multi-lobe rings are not charged
-        // the full zone arc.
-        if (!dry) {
-            float _rem_vol_L = 0.0f, _done_vol_L = 0.0f;
-            int   _worst_left = 0;
-            for (int i = 0; i < num_rings && i < WATER_RUN_MAX_RINGS; i++) {
-                float _ro = ring_throws[i];
-                if (_ro < 1.0f || ring_unwaterable[i]) continue;
-                float _ri = (i == num_rings - 1) ? _ro * 0.92f : ring_throws[i + 1];
-                if (_ri >= _ro) continue;
-                float _tol = s_ring_footprint_mm * (_ro / act_max_throw) * 0.5f;
-                int _ac = 0;
-                for (int s = 0; s < WATER_SECTORS; s++)
-                    if (_ro <= sector_throw[s] + _tol) _ac++;
-                if (_ac == 0) continue;
-                float _area = (float)M_PI * (_ro*_ro - _ri*_ri) / 1.0e6f
-                              * ((float)_ac / (float)WATER_SECTORS);
-                float _def = depth_mm - cumulative_depth[i];
-                if (_def > 0.0f) {
-                    _rem_vol_L += _def * _area;
-                    float _gain = cumulative_depth[i] - s_serp_prev_cum[i];
-                    int _left = (_gain > 0.02f) ? (int)ceilf(_def / _gain)
-                                                : (passes - pass - 1);
-                    if (_left > _worst_left) _worst_left = _left;
-                }
-                _done_vol_L += fminf(cumulative_depth[i], depth_mm) * _area;
-                s_serp_prev_cum[i] = cumulative_depth[i];
-            }
-            int _passes_left = passes - pass - 1;
-            if (_worst_left < _passes_left) _passes_left = _worst_left;
-            float _avg_psi  = (*run_psi_n > 0) ? (*run_psi_sum / (float)*run_psi_n) : 3.0f;
-            float _flow_lpm = NOZZLE_FLOW_K * powf(_avg_psi, NOZZLE_FLOW_N) / 1000.0f;
-            if (_flow_lpm < 0.05f) _flow_lpm = 1.0f;
-            float _elapsed_s   = (float)pdTICKS_TO_MS(xTaskGetTickCount() - t_start) / 1000.0f;
-            float _pump_done_s = _done_vol_L / _flow_lpm * 60.0f;
-            float _ovh_s       = _elapsed_s - _pump_done_s;
-            if (_ovh_s < 0.0f) _ovh_s = 0.0f;
-            float _ovh_per_pass = _ovh_s / (float)(pass + 1);
-            if (_ovh_per_pass < 5.0f) _ovh_per_pass = 5.0f;
-            const float _TAIL_S = 30.0f;
-            float _secs = _rem_vol_L / _flow_lpm * 60.0f
-                        + _ovh_per_pass * (float)_passes_left + _TAIL_S;
-            s_water_est_min   = (int)(_secs / 60.0f) + 1;
-            s_eta_anchor_secs = _secs;
-            s_eta_anchor_tick = xTaskGetTickCount();
-            INFO("Serpentine pass %d done: vol %.1f/%.1fL @ %.2f psi (%.1f L/min), "
-                 "rem pump %.0fs + ovh %.0fs/pass x %d + tail %.0fs = %d min",
-                 pass + 1, _done_vol_L, _done_vol_L + _rem_vol_L, _avg_psi, _flow_lpm,
-                 _rem_vol_L / _flow_lpm * 60.0f, _ovh_per_pass, _passes_left,
-                 _TAIL_S, s_water_est_min);
-        }
-    }
+        // b578: the estimate is NOT refreshed here any more.
+        //
+        // b505 recomputed it at every pass end from remaining deficit volume
+        // over measured flow. That made sense while the pass count itself was
+        // discovered from measurement -- but since b575 the schedule is fixed
+        // before any water flows, so the duration is known at the start and a
+        // mid-run revision can only mean the estimate and the plan disagree.
+        // The owner saw exactly that: "the time updated mid cycle".
+        //
+        // The one-shot estimate is computed from plan_passes in the preamble
+        // above; s_eta_anchor_* then ticks it down so HA still sees minutes
+        // decreasing without the number itself moving.
+    }   // pass loop
 }
 
 static void phase_chase_water_zone(void)
@@ -11087,6 +11380,18 @@ abort:
 #define WATER_LOG_BUFFER_SIZE  24576   // 24 KB, ~500-700 log lines typical
 #define WATER_LAST_LOG_PATH    "/lfs/water/last_log.txt"   // b520: persisted copy
 
+// b586: a pinned head, so the run-start block always survives.
+//
+// The ring buffer drops the OLDEST bytes on wrap, and the oldest bytes are
+// the plan: coverage, the pass schedule per ring, the estimate, the supply
+// settle. Those are exactly what is needed to check the plan against what
+// executed, and on a completed run they were always gone. DRAM is at 93.5%
+// so the buffer cannot simply grow; 1.5 KB of pinned head is affordable and
+// captures the whole preamble. Once it is full, capture continues into the
+// ring as before, so the end of the run is still kept too.
+#define WATER_LOG_HEAD_SIZE  1536
+static char     s_watering_log_head[WATER_LOG_HEAD_SIZE];
+static volatile uint16_t s_watering_log_head_len = 0;
 static char     s_watering_log_buf[WATER_LOG_BUFFER_SIZE];
 static volatile uint16_t s_watering_log_pos = 0;
 static volatile bool     s_watering_log_wrapped = false;
@@ -11114,6 +11419,18 @@ static int water_log_vprintf(const char *fmt, va_list args)
     if (!s_watering_log_active || len <= 0) return n;
     if (len > (int)sizeof(line) - 1) len = sizeof(line) - 1;
 
+    // b586: fill the pinned head first; it is never overwritten.
+    if (s_watering_log_head_len < WATER_LOG_HEAD_SIZE) {
+        int room = WATER_LOG_HEAD_SIZE - s_watering_log_head_len;
+        int take = (len < room) ? len : room;
+        memcpy(&s_watering_log_head[s_watering_log_head_len], line, take);
+        s_watering_log_head_len = (uint16_t)(s_watering_log_head_len + take);
+        if (take == len) return n;      // wholly captured in the head
+        line[0] = '\0';                 // remainder falls through to the ring
+        memmove(line, line + take, len - take);
+        len -= take;
+    }
+
     // Append to ring buffer
     for (int i = 0; i < len; i++) {
         s_watering_log_buf[s_watering_log_pos] = line[i];
@@ -11131,6 +11448,7 @@ static void watering_log_capture_start(void)
 {
     s_watering_log_pos = 0;
     s_watering_log_wrapped = false;
+    s_watering_log_head_len = 0;   // b586
     s_watering_log_active = true;
     s_prev_vprintf = esp_log_set_vprintf(water_log_vprintf);
     INFO("Watering RAM log buffer armed (%u bytes)", WATER_LOG_BUFFER_SIZE);
@@ -11155,6 +11473,14 @@ static void watering_log_capture_stop(void)
     // in the same settle window as the run's .wbin -- no mid-run file I/O.
     FILE *f = fopen(WATER_LAST_LOG_PATH, "w");
     if (f) {
+        // b586: pinned run-start block first, so the persisted copy carries
+        // the plan and schedule too -- that copy is what survives a sleep,
+        // and it had the same hole as the RAM one.
+        if (s_watering_log_head_len > 0) {
+            fwrite(s_watering_log_head, 1, s_watering_log_head_len, f);
+            if (s_watering_log_wrapped)
+                fputs("\n# --- run start above is pinned; ring buffer below wrapped ---\n", f);
+        }
         if (s_watering_log_wrapped) {
             uint16_t pos = s_watering_log_pos;
             if (pos < WATER_LOG_BUFFER_SIZE)
@@ -16713,6 +17039,16 @@ static esp_err_t api_run_plan_handler(httpd_req_t *req)
     float worst_frac = 1.0f;
     int   need_passes = 1, n_short = 0;
     float est_s_total = 0.0f;
+    // b569: per-ring pass count, so the preview can draw the REAL run instead
+    // of one representative lap. Pass 1 covers every ring; pass k covers only
+    // rings whose count is still >= k, which is exactly what skip[] does in
+    // water_serpentine_passes. Order matches the ring ladder the preview
+    // builds from the same pitch, outer to inner. 0 = never watered.
+    uint8_t ring_passes[WATER_MAX_RINGS_CAL];
+    float   ring_mm[WATER_MAX_RINGS_CAL];
+    int     ring_passes_n = 0;
+    memset(ring_passes, 0, sizeof(ring_passes));
+    memset(ring_mm, 0, sizeof(ring_mm));
     {
         float t = zmax; int r2 = 0;
         while (t >= act_min && r2 < WATER_MAX_RINGS_CAL) {
@@ -16720,22 +17056,47 @@ static esp_err_t api_run_plan_handler(httpd_req_t *req)
             if (sp < WATER_MIN_RING_SPACING) sp = WATER_MIN_RING_SPACING;
             float in = t - sp; if (in < 0.0f) in = 0.0f;
             float ad = run_plan_active_deg(have_zone ? &z : NULL, t, active);
-            if (ad < 1.0f) { r2++; t -= sp; continue; }
+            if (ad < 1.0f) {
+                if (ring_passes_n < WATER_MAX_RINGS_CAL) {
+                    ring_mm[ring_passes_n]       = t;
+                    ring_passes[ring_passes_n++] = 0;
+                }
+                r2++; t -= sp; continue;
+            }
             float want = 0.0f;
             float got  = serpentine_ring_dps_ex(t, in, ad, per_pass_mm,
                                                 &spd, have_spd, &want);
             if (got < min_dps) got = min_dps;
-            // Deposit scales inversely with speed, so a ring forced to sweep
-            // faster than asked lays down want/got of what was requested.
-            float frac = (got > 0.01f && want > 0.0f) ? (want / got) : 1.0f;
+            // b584: count passes with the EXACT expression the run uses --
+            // nozzle_precip_depth_mm at the commanded speed -- not a clamp
+            // ratio.
+            //
+            // The ratio form (want/got) is only algebraically equal to it
+            // while serpentine_ring_dps takes the plain annulus area. Below
+            // WATER_MIN_ELLIPSE_THROW_MM it substitutes a splash-band area
+            // instead, so the two drift apart on the inner rings and the
+            // preview predicted about four passes where the firmware
+            // scheduled two. Sharing one expression is the whole point of
+            // the deterministic model; two of them is how the preview and
+            // the run disagreed in the first place.
+            //
+            // pressure_scale is 1.0 here: it is measured at full open during
+            // a run and a regulated supply leaves it at 1.0 anyway (b535).
+            float psi_r = cal_throw_to_psi(t);
+            float d1    = nozzle_precip_depth_mm(t, in, got, psi_r);
+            float frac  = (d1 > 0.0005f) ? (d1 / depth_mm) : 1.0f;
             if (frac > 1.0f) frac = 1.0f;       // pinned fast = over-applies, not short
             if (frac < 0.02f) frac = 0.02f;
             if (frac < worst_frac) worst_frac = frac;
             if (frac < 0.99f) n_short++;
-            int rp = (int)ceilf(1.0f / frac);
+            int rp = (d1 > 0.0005f) ? (int)ceilf(depth_mm / d1) : 1;
             if (rp < 1) rp = 1;
             if (rp > need_passes) need_passes = rp;
             est_s_total += (ad / got) * (float)rp;   // this ring's own time
+            if (ring_passes_n < WATER_MAX_RINGS_CAL) {
+                ring_mm[ring_passes_n]       = t;
+                ring_passes[ring_passes_n++] = (uint8_t)(rp > 255 ? 255 : rp);
+            }
             r2++; t -= sp;
         }
     }
@@ -16778,7 +17139,29 @@ static esp_err_t api_run_plan_handler(httpd_req_t *req)
     // advice is built only from the fixed strings above -- no quotes,
     // backslashes or control characters -- so it is valid JSON as it stands.
 
-    char buf[560];
+    // b573: ring_mm alongside ring_passes. The preview builds its own ring
+    // ladder and the two did not agree -- 31 here against 33 there, because
+    // the page was never told the zone's inner throw limit -- so the
+    // length-equality check silently rejected the data and the preview fell
+    // back to drawing a single pass. Publishing the radii lets the preview
+    // match by position instead of trusting two ladders to come out the same.
+    char rp_js[180], rm_js[240];
+    {
+        int k = 0;
+        rp_js[k++] = '[';
+        for (int i = 0; i < ring_passes_n && k < (int)sizeof(rp_js) - 8; i++)
+            k += snprintf(rp_js + k, sizeof(rp_js) - k, "%s%u",
+                          i ? "," : "", (unsigned)ring_passes[i]);
+        rp_js[k++] = ']'; rp_js[k] = '\0';
+        k = 0;
+        rm_js[k++] = '[';
+        for (int i = 0; i < ring_passes_n && k < (int)sizeof(rm_js) - 10; i++)
+            k += snprintf(rm_js + k, sizeof(rm_js) - k, "%s%.0f",
+                          i ? "," : "", (double)ring_mm[i]);
+        rm_js[k++] = ']'; rm_js[k] = '\0';
+    }
+
+    char buf[1180];   /* b573: + ring_mm */
     int n = snprintf(buf, sizeof(buf),
         "{\"ok\":true,\"zone\":%d,\"depth8\":%d,\"depth_mm\":%.2f,"
         "\"passes\":%d,\"per_pass_mm\":%.3f,\"rings\":%d,"
@@ -16787,12 +17170,13 @@ static esp_err_t api_run_plan_handler(httpd_req_t *req)
         "\"rings_at_max\":%d,\"rings_at_min\":%d,"
         "\"clamp\":\"%s\",\"est_min\":%.1f,\"coverage\":%u,"
         "\"active_deg\":%.0f,\"speed_floor_cal\":%s,\"pass_frac\":%.2f,"
-        "\"advice\":\"%s\"}",
+        "\"ring_passes\":%s,\"ring_mm\":%s,\"advice\":\"%s\"}",
         zone_id, depth8, depth_mm, passes, per_pass_mm, rings,
         (double)lo_dps, (double)hi_dps, (double)min_dps, (double)max_dps,
         n_fast, n_slow, clamp, (double)est_min,
         (unsigned)(have_zone ? z.coverage : 0),
-        (double)active, floor_cal ? "true" : "false", (double)worst_frac, advice);
+        (double)active, floor_cal ? "true" : "false", (double)worst_frac,
+        rp_js, rm_js, advice);
     if (n >= (int)sizeof(buf)) n = sizeof(buf) - 1;
     httpd_resp_send(req, buf, n);
     return ESP_OK;
@@ -16818,16 +17202,35 @@ static esp_err_t api_status_handler(httpd_req_t *req)
 {
     size_t used=0, total=0;
     if (storage_ready()) storage_usage(&used, &total);
-    char buf[256];
+    char buf[420];   /* b570: grew for the live-position fields */
     HTTP_CONN_CLOSE(req);
     int n = snprintf(buf, sizeof(buf),
         "{\"fw_build\":%u,\"wifi_rssi\":%d,"
         "\"storage_used_kb\":%u,\"storage_total_kb\":%u,"
-        "\"watering\":%s,\"water_mode\":%d,\"water_est_min\":%d,\"cleanup_pass\":%d}",
+        "\"watering\":%s,\"water_mode\":%d,\"water_est_min\":%d,\"cleanup_pass\":%d,"
+        // b570: where the nozzle is right now, so the page can put a marker
+        // on the path it is already drawing. live_age_ms says how fresh it
+        // is -- a sweep samples every couple of degrees, so anything much
+        // older than that means the nozzle is transiting between arcs.
+        "\"live_ring\":%d,\"live_pass\":%d,\"live_deg\":%.1f,"
+        "\"live_throw_mm\":%.0f,\"live_throw_act\":%.0f,"
+        "\"live_passes_total\":%d,\"live_rings_total\":%d,"
+        "\"live_age_ms\":%lu,"
+        "\"led_expander\":\"%s\"}",   // which 0x20 part led_expander_detect() picked
         FW_BUILD, wifi_get_rssi(),
         (unsigned)(used/1024), (unsigned)(total/1024),
         s_web_water_mode?"true":"false", s_web_water_mode, s_water_est_min,
-        s_water_cleanup_pass);
+        s_water_cleanup_pass,
+        s_web_water_mode ? (int)s_live_ring : -1,
+        s_web_water_mode ? (int)s_live_pass : 0,
+        (double)s_live_bearing, (double)s_live_throw_mm,
+        (double)s_live_throw_act,
+        s_web_water_mode ? (int)s_live_passes_total : 0,
+        s_web_water_mode ? (int)s_live_rings_total  : 0,
+        (unsigned long)(s_live_tick
+            ? (xTaskGetTickCount() - s_live_tick) * portTICK_PERIOD_MS : 999999u),
+        s_led_expander==LED_EXP_SX1502 ? "SX1502" :
+        s_led_expander==LED_EXP_TCA6408A ? "TCA6408A" : "unknown");
     httpd_resp_set_type(req, "application/json");
     httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
     httpd_resp_send(req, buf, n);
@@ -18956,7 +19359,8 @@ static esp_err_t zone_water_trace_handler(httpd_req_t *req)
 // reboots. Cleared format: plain text, chronological order.
 static esp_err_t zone_last_log_handler(httpd_req_t *req)
 {
-    if (s_watering_log_pos == 0 && !s_watering_log_wrapped) {
+    if (s_watering_log_pos == 0 && !s_watering_log_wrapped
+            && s_watering_log_head_len == 0) {
         // b520: nothing in RAM (fresh boot after deep sleep) -- serve the
         // copy persisted at the last run's closeout, if there is one.
         FILE *f = fopen(WATER_LAST_LOG_PATH, "r");
@@ -18981,6 +19385,15 @@ static esp_err_t zone_last_log_handler(httpd_req_t *req)
     httpd_resp_set_type(req, "text/plain");
     httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
     HTTP_CONN_CLOSE(req);
+
+    // b586: the pinned run-start block first -- the plan, the schedule and
+    // the estimate, which the ring buffer used to drop on every completed run.
+    if (s_watering_log_head_len > 0) {
+        httpd_resp_send_chunk(req, s_watering_log_head, s_watering_log_head_len);
+        if (s_watering_log_wrapped)
+            httpd_resp_sendstr_chunk(req,
+                "\n# --- run start above is pinned; the ring buffer below wrapped ---\n");
+    }
 
     if (s_watering_log_wrapped) {
         // Buffer wrapped: send tail (older portion) first, then head.
