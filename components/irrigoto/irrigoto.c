@@ -3702,6 +3702,49 @@ static bool ring_is_supply_limited(const water_ring_data_t *r,
 #define NOZZLE_FLOW_N     0.566f // flow exponent (ideal orifice = 0.5)
 
 // Precipitation depth [mm] deposited per pass by one ring.
+#define WATER_MIN_THROW_MM         461.0f
+#define WATER_MIN_ELLIPSE_THROW_MM 1829.0f
+#define WATER_INNER_SPLASH_RADIUS_MM 300.0f
+
+// b597: the radial band the stream ACTUALLY wets at this throw, as the
+// (r_outer^2 - r_inner^2) term. Multiply by pi and the arc fraction for area.
+//
+// This is the one definition. It used to exist twice, in two different units,
+// and the copies disagreed about which rings they applied to:
+//
+//   serpentine_ring_dps_ex()   substituted a 300 mm splash band below
+//                              WATER_MIN_ELLIPSE_THROW_MM, in metres, when
+//                              SOLVING for sweep speed
+//   nozzle_precip_depth_mm()   used the plain geometric annulus, in mm, when
+//                              CREDITING what that sweep deposited
+//
+// So the solver sized a sweep to lay target depth over a 300 mm band, and the
+// accounting then divided the same water by the sub-100 mm gap between
+// adjacent inner rings and reported ~4x the depth. b584 noticed the two
+// "drift apart on the inner rings" and worked around the symptom in the pass
+// counter. smooth_display_depth_mm() (below) noticed it too and corrected the
+// CSV -- explicitly leaving the control loop on the wrong number.
+//
+// That is the under-watering. Across this unit's ring ladder the geometric
+// area understates the wetted area by 1.85x overall and about 3.9x on rings
+// inside 6 ft, so every pass was credited ~1.85x what it delivered,
+// ceil(target / deposit) scheduled about half the passes needed, and runs
+// "completed" at ~50% of target. Measured: 4.76 mm applied against a 9.525 mm
+// (3/8") request.
+//
+// A stream landing inside ~6 ft wets roughly a 300 mm radial band; it cannot
+// lay a stripe into an 80 mm gap. Beyond that the ellipse narrows and the
+// geometric annulus is the honest figure.
+static inline float nozzle_wetted_area_diff_mm2(float r_outer_mm,
+                                                float r_inner_mm)
+{
+    if (r_outer_mm >= WATER_MIN_ELLIPSE_THROW_MM)
+        return r_outer_mm * r_outer_mm - r_inner_mm * r_inner_mm;
+    float o = r_outer_mm + WATER_INNER_SPLASH_RADIUS_MM * 0.5f;
+    float i = fmaxf(0.0f, r_outer_mm - WATER_INNER_SPLASH_RADIUS_MM * 0.5f);
+    return o * o - i * i;
+}
+
 // r_outer_mm -- outer radius of the ring's annular region [mm]
 // r_inner_mm -- inner radius (= next ring's throw, or r_outer*0.92 for innermost) [mm]
 // dps        -- nozzle sweep speed for this ring [deg/s]
@@ -3712,7 +3755,9 @@ static bool ring_is_supply_limited(const water_ring_data_t *r,
 static float nozzle_precip_depth_mm(float r_outer_mm, float r_inner_mm,
                                      float dps, float avg_psi)
 {
-    float area_diff = r_outer_mm * r_outer_mm - r_inner_mm * r_inner_mm; /* mm² */
+    /* b597: the area the water ACTUALLY lands on -- the same one the dps
+     * solver sizes the sweep against. See nozzle_wetted_area_diff_mm2. */
+    float area_diff = nozzle_wetted_area_diff_mm2(r_outer_mm, r_inner_mm);
     if (dps < 0.01f || area_diff < 1.0f || avg_psi < 0.05f)
         return 0.0f;
     float Q = NOZZLE_FLOW_K * powf(avg_psi, NOZZLE_FLOW_N); /* mL/min */
@@ -7283,14 +7328,58 @@ static float water_est_run_secs(uint16_t zone_id, float depth_mm, float model_s)
     if (!prev) return model_s;
     float out = model_s;
     if (storage_water_load(zone_id, prev) == ESP_OK && prev->total_time_s > 60.0f) {
-        // The stored run may have targeted a different depth; scale by the
-        // ratio, clamped so a nonsense stored target cannot run away with it.
-        float scale = 1.0f;
-        if (prev->target_depth_mm > 0.1f && depth_mm > 0.1f)
-            scale = depth_mm / prev->target_depth_mm;
-        if (scale < 0.25f) scale = 0.25f;
-        if (scale > 4.0f)  scale = 4.0f;
-        out = prev->total_time_s * scale * 1.05f;   // small margin over measured
+        // b597: scale by what the stored run DELIVERED, not by what it asked
+        // for.
+        //
+        // b587 scaled by depth_now / prev->target_depth_mm, which silently
+        // assumed the stored run hit its target. Before b597 none of them did
+        // -- they stopped at about half -- so the estimate faithfully
+        // predicted the device's behaviour and quietly laundered the
+        // shortfall. The 3/8" modal read "about 8 min" for a run that then
+        // delivered 4.76 of 9.525 mm, and replaying that duration would have
+        // promised the same half-measure again.
+        //
+        // Depth accrues linearly with time at a fixed sweep speed, so the
+        // measured delivery RATE is the honest thing to extrapolate:
+        //
+        //   rate = achieved_mm / total_time_s
+        //   time = depth_wanted / rate
+        //
+        // achieved_mm is the stored run's own area-weighted mean depth over
+        // the ground its rings swept -- volume / covered area, the one figure
+        // that is comparable with a target depth (b565).
+        float wsum = 0.0f, asum = 0.0f;
+        int nr = prev->num_rings;
+        if (nr > WATER_RUN_MAX_RINGS) nr = WATER_RUN_MAX_RINGS;
+        for (int i = 0; i < nr; i++) {
+            const water_ring_data_t *r = &prev->rings[i];
+            if (r->depth_mm <= 0.005f || r->active_deg <= 0.0f
+                    || r->throw_mm <= 1.0f) continue;
+            float ri = (i == nr - 1) ? r->throw_mm * 0.92f
+                                     : prev->rings[i + 1].throw_mm;
+            float a = nozzle_wetted_area_diff_mm2(r->throw_mm, ri)
+                      * (r->active_deg / 360.0f);
+            if (a <= 1.0f) continue;
+            wsum += r->depth_mm * a;
+            asum += a;
+        }
+        float achieved = (asum > 1.0f) ? (wsum / asum) : 0.0f;
+        if (achieved > 0.05f && depth_mm > 0.1f) {
+            float scale = depth_mm / achieved;
+            // A stored run that barely wet the ground would otherwise
+            // extrapolate to an absurd duration; the model is better than a
+            // wild number.
+            if (scale < 0.25f) scale = 0.25f;
+            if (scale > 8.0f)  scale = 8.0f;
+            out = prev->total_time_s * scale * 1.05f;
+        } else if (prev->target_depth_mm > 0.1f && depth_mm > 0.1f) {
+            // No usable per-ring depths (a pre-b565 file, say): fall back to
+            // the old target-ratio scaling rather than to nothing.
+            float scale = depth_mm / prev->target_depth_mm;
+            if (scale < 0.25f) scale = 0.25f;
+            if (scale > 4.0f)  scale = 4.0f;
+            out = prev->total_time_s * scale * 1.05f;
+        }
     }
     free(prev);
     return out;
@@ -7324,9 +7413,6 @@ static float s_ring_footprint_mm = WATER_RING_SPACING;
 #define WATER_PRESSURE_TOL           0.15f
 #define WATER_PRESSURE_ITER          8
 #define WATER_MAX_THROW_MM        8534.0f
-#define WATER_MIN_THROW_MM         461.0f
-#define WATER_MIN_ELLIPSE_THROW_MM 1829.0f
-#define WATER_INNER_SPLASH_RADIUS_MM 300.0f
 
 // Convert a geometric-annulus deposited depth into the physically-true depth
 // that matches the footprint the dps solver actually sized the sweep for.
@@ -7350,18 +7436,21 @@ static float s_ring_footprint_mm = WATER_RING_SPACING;
 // DISPLAY ONLY: callers apply this to the value written to the CSV / depth_mm,
 // never to the in-loop smooth_cumulative_depth that drives pass decisions --
 // the adaptive loop's watering behavior is intentionally left untouched.
+// b597: now the identity. nozzle_precip_depth_mm() divides by the wetted area
+// at source, so the depth every caller holds is already splash-true and
+// applying this correction again would take it 4x too LOW on inner rings.
+//
+// Kept rather than deleted, at its call sites, because the thing it existed
+// to paper over is exactly what b597 fixed: reporting was corrected here
+// while the control loop was "intentionally left untouched" on the raw
+// number. Removing the name would remove the only marker of where the two
+// definitions used to part company.
 static inline float smooth_display_depth_mm(float geo_depth,
                                             float ring_throw_mm,
                                             float inner_throw_mm)
 {
-    if (ring_throw_mm >= WATER_MIN_ELLIPSE_THROW_MM) return geo_depth;
-    float a_geo    = ring_throw_mm * ring_throw_mm
-                   - inner_throw_mm * inner_throw_mm;
-    float ro       = ring_throw_mm + WATER_INNER_SPLASH_RADIUS_MM * 0.5f;
-    float ri       = fmaxf(0.0f, ring_throw_mm - WATER_INNER_SPLASH_RADIUS_MM * 0.5f);
-    float a_splash = ro * ro - ri * ri;
-    if (a_geo <= 1.0f || a_splash <= 1.0f) return geo_depth;
-    return geo_depth * (a_geo / a_splash);
+    (void)ring_throw_mm; (void)inner_throw_mm;
+    return geo_depth;
 }
 
 // b503: recompute the live dispensed-volume estimate from the per-ring
@@ -9452,15 +9541,15 @@ static float serpentine_ring_dps_ex(float ring_throw, float inner_throw,
                             const speed_map_t *spd, bool have_spd,
                             float *out_want)
 {
-    float r_outer = ring_throw  / 1000.0f;
-    float r_inner = inner_throw / 1000.0f;
-    if (ring_throw < WATER_MIN_ELLIPSE_THROW_MM) {
-        float sr = WATER_INNER_SPLASH_RADIUS_MM / 1000.0f;
-        r_outer = ring_throw / 1000.0f + sr * 0.5f;
-        r_inner = fmaxf(0.0f, ring_throw / 1000.0f - sr * 0.5f);
-    }
+    /* b597: the shared wetted-area definition, in m^2. This function used to
+     * carry its own copy of the splash-band substitution while
+     * nozzle_precip_depth_mm used the plain annulus -- solving against one
+     * area and crediting against another, which is what made runs stop at
+     * half target. One definition now, used by both. */
     float arc_fraction = active_deg / 360.0f;
-    float ring_area = 3.14159f * (r_outer * r_outer - r_inner * r_inner)
+    float ring_area = 3.14159f
+                      * (nozzle_wetted_area_diff_mm2(ring_throw, inner_throw)
+                         / 1.0e6f)
                       * arc_fraction;
     float dps = 12.0f;
     float ref_psi = cal_throw_to_psi(ring_throw);
@@ -13515,15 +13604,12 @@ static void phase_water_zone(void)
         // analysis formula). act_min_throw is the zone edge -- often within 50mm of
         // the ring throw -- giving near-zero annular area and hitting the time_min floor.
         float inner_throw  = (ring == num_rings-1) ? ring_throw * 0.92f : ring_throws[ring+1];
-        float r_outer = ring_throw  / 1000.0f;
-        float r_inner = inner_throw / 1000.0f;
         bool  below_e = (ring_throw < WATER_MIN_ELLIPSE_THROW_MM);
-        if (below_e) {
-            float sr = WATER_INNER_SPLASH_RADIUS_MM / 1000.0f;
-            r_outer = ring_throw/1000.0f + sr*0.5f;
-            r_inner = fmaxf(0, ring_throw/1000.0f - sr*0.5f);
-        }
-        float ring_area = 3.14159f*(r_outer*r_outer - r_inner*r_inner)*arc_fraction;
+        // b597: third copy of the splash substitution, now the shared one.
+        float ring_area = 3.14159f
+                        * (nozzle_wetted_area_diff_mm2(ring_throw, inner_throw)
+                           / 1.0e6f)
+                        * arc_fraction;
 
         float nozzle_dps;
         bool  use_pulse_mode = false;
