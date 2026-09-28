@@ -54,3 +54,6 @@ Documents/
 # Editor / IDE state — per-developer, often contains user-folder paths.
 .vscode/
 .idea/
+
+# macOS Finder metadata
+.DS_Store
