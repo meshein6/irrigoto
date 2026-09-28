@@ -22539,19 +22539,23 @@ uint32_t irrigoto_schedule_version(void)
 static int schedule_estimate_duration_min(uint8_t zone, uint8_t mode, uint8_t depth)
 {
     if (zone < 1) return 30;
-    if (storage_ready()) {
-        water_run_t prev; memset(&prev, 0, sizeof(prev));
-        if (storage_water_load(zone - 1, &prev) == ESP_OK
-                && prev.total_time_s > 60.0f) {
-            // the last run may have targeted a different depth; scale
-            // by the depth ratio when it recorded one (target_depth_mm is
-            // eighths x 3.175 mm). Mode differences are not scaled.
-            float scale = 1.0f;
-            int d_now = (depth >= 1 && depth <= 8) ? depth : 1;
-            int d_prev = (int)(prev.target_depth_mm / 3.175f + 0.5f);
-            if (d_prev >= 1 && d_prev <= 8) scale = (float)d_now / (float)d_prev;
-            return (int)((prev.total_time_s * scale * 1.10f + 59.0f) / 60.0f);
-        }
+    // b594: one history estimator, not two.
+    //
+    // This had its own copy of "scale the last run by the depth ratio", with a
+    // 1.10 margin and a round-up, while water_est_run_secs() -- which the run
+    // itself and /api/run_plan use since b587 -- had the same idea with a 1.05
+    // margin. Same zone, same depth, two answers: the Upcoming card said
+    // "~12 min" beside a Water modal that said 8. Neither was wrong so much as
+    // arbitrary, and having both is how they drifted apart in the first place.
+    //
+    // Passing model_s = 0 means "history or nothing"; a zero return falls
+    // through to the per-mode table below, which is what the old code did when
+    // there was no usable run on file.
+    {
+        int   d_now  = (depth >= 1 && depth <= 8) ? depth : 1;
+        float est_s  = water_est_run_secs((uint16_t)(zone - 1),
+                                          (float)d_now * 3.175f, 0.0f);
+        if (est_s > 0.0f) return (int)((est_s + 59.0f) / 60.0f);
     }
     // Scale with the depth target (now eighths of an inch, 1..8): the per-eighth
     // base is the 1/8" time for each style, so deeper runs scale proportionally.

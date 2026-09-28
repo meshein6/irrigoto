@@ -336,14 +336,36 @@ api:
         - lambda: |-
             id(irrigoto_hw).delay_schedule_hours(hours);
 
-# Time source — HA syncs the device's system clock via the API. Cloud-free:
-# no NTP, no internet. Survives WiFi/HA outages on the ESP32 RTC until the
-# next reconnect; the schedule executor checks time(NULL) > 1.7e9 before
-# firing so it won't trigger off a never-set clock.
+# Time source. HA syncs the system clock via the API; SNTP covers the case
+# where there is no HA (b594 -- see below). The web pages also POST /api/time
+# on load, which is a convenience for AP-mode setup, not a time source.
+# The schedule executor checks time(NULL) > 1.7e9 before firing, so it will
+# never trigger off a never-set clock.
 time:
   - platform: homeassistant
     id: ha_time
     timezone: "${device_timezone}"
+  # b594: SNTP, because "no NTP" turned out to mean "no clock".
+  #
+  # Home Assistant was the only autonomous time source, and this unit runs
+  # standalone. The web pages POST /api/time on load, so the clock looked fine
+  # whenever anyone was looking at it -- and that is exactly when it does not
+  # matter. Overnight the device restarted, came up with time(NULL) at zero,
+  # and every schedule path bails on `now < 1700000000`: no firing, no
+  # catch-up, and no schedule-aware sleep to wake it for 06:00. The 06:00 run
+  # was recorded as MISSED only at 08:36 the next morning, when the page was
+  # opened and the browser handed the clock back.
+  #
+  # A schedule whose clock depends on someone opening a web page is not a
+  # schedule. SNTP costs nothing when HA is present -- both platforms set the
+  # same system clock, and whichever syncs first wins.
+  - platform: sntp
+    id: sntp_time
+    timezone: "${device_timezone}"
+    servers:
+      - 0.pool.ntp.org
+      - 1.pool.ntp.org
+      - 2.pool.ntp.org
 
 # OTA updates via ESPHome (replaces the custom curl-push OTA)
 ota:

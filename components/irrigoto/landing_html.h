@@ -966,6 +966,9 @@ function refreshRunPlan(){
       if (!p || !p.ok) { el.textContent = ''; el.className = ''; return; }
       _lastPlan = p;
       renderPathThumb();   // the thumbnail is the whole run, so it moves too
+      // b594: the dose is sized from the run length, and the run length just
+      // changed. Without this the mL figure lags a depth change by one pick.
+      if (typeof solModeChanged === 'function' && solEnabled) solModeChanged();
       const mins = p.est_min >= 1 ? Math.round(p.est_min) + ' min' : '< 1 min';
       // b587: say where the number came from. The ring model over-predicts
       // this hardware by about 2x, so once a zone has actually run, the
@@ -1079,8 +1082,29 @@ function solModeChanged(){
   document.getElementById('sol-block').style.display = applicable ? '' : 'none';
   if(!applicable) return;
   const m = SOL_MODE_MAP[selModeDat], d = selDepth;
-  const req=++solEstReq; solEstMin=0; solEst();
-  fetch('/api/solution_est?zone='+selZoneId+'&mode='+m+'&depth='+d,{cache:'no-store'})
+  const req=++solEstReq; solEstMin=0;
+  // b594: the run length the dose is sized from is the one already on screen.
+  //
+  // This asked /api/solution_est separately, and passed selZoneId -- the
+  // 0-BASED zone id -- where the endpoint wants the 1-based zone NUMBER the
+  // schedule uses. schedule_estimate_duration_min() opens with
+  // `if (zone < 1) return 30;`, so Zone #0 hit that guard and every dose was
+  // sized off a hardcoded 30 minutes. The modal read "About 8 min" in the
+  // plan note and "~30 min run · pump on 29 min 50 s · ~535 mL" four lines
+  // below it, for the same run.
+  //
+  // _lastPlan is /api/run_plan's answer for this exact zone and depth -- the
+  // number the plan note is showing. Using it means there is one run length
+  // on the screen instead of two, and no second estimator to drift.
+  if (_lastPlan && _lastPlan.ok && _lastPlan.est_min > 0) {
+    solEstMin = Math.max(1, Math.round(_lastPlan.est_min));
+    solEst();
+    return;
+  }
+  // No plan yet (the fetch is in flight, or this mode has none): fall back to
+  // the endpoint, with the zone number it actually expects.
+  solEst();
+  fetch('/api/solution_est?zone='+(selZoneId+1)+'&mode='+m+'&depth='+d,{cache:'no-store'})
     .then(r=>r.json()).then(j=>{ if(req===solEstReq){ solEstMin=+j.est_min||0; solEst(); } }).catch(()=>{});
 }
 function solEst(){
@@ -1547,6 +1571,10 @@ async function openLiveView(id){
     ringPasses: plan && plan.ring_passes,
     ringMm:     plan && plan.ring_mm,
     live: _live,
+    // b594: a run is in progress, so this is a readout, not a control. The
+    // overlay hides the play/scrub row and shows a progress bar instead --
+    // there is nothing to scrub to when the device is somewhere specific.
+    liveMode: true,
     title: (z.name || ('Zone ' + id)) + ' \u00b7 live'
   });
   show(_livePlan);

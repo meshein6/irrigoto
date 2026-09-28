@@ -33,6 +33,38 @@
     'd': { key: 'demo',       label: 'Demo' }
   };
 
+  /* b594: which modes actually follow a plan.
+   *
+   * Serpentine and Sections are scheduled up front -- every ring's pass count
+   * is solved before the first drop, and the run executes exactly that
+   * (water_serpentine_passes, b575). For those, a scrubber is meaningful:
+   * dragging it shows the run that WILL happen.
+   *
+   * Pulse, Gentle and Smooth are adaptive. Their ring order and pass count are
+   * decided during the run from measured deficit and supply trend, so any
+   * animation of them is a guess dressed up as a schedule. They get the path
+   * and a sentence saying how they use it, and no transport controls -- the
+   * honest answer to "when will it be here" is that nobody knows yet. */
+  function isDeterministic(modeKey) {
+    return modeKey === 'serpentine' || modeKey === 'sections';
+  }
+
+  /* What an adaptive mode does with the rings, in one sentence. */
+  var ADAPTIVE_NOTE = {
+    pulse:  'Pulse waters these rings outer to inner, one at a time, always '
+          + 'the same way round, swinging back dry between them. The order is '
+          + 'fixed but the run stops when the target is met, so the number of '
+          + 'laps is not known in advance.',
+    gentle: 'Gentle sweeps one direction per pass and flips each pass, '
+          + 'building depth in many light coats. It keeps going until every '
+          + 'ring reaches target, so the number of passes is decided during '
+          + 'the run.',
+    smooth: 'Smooth chooses the ring order DURING the run, from how much each '
+          + 'ring still needs and how the supply is holding up. The rings '
+          + 'below are where the water lands; the order it visits them in is '
+          + 'not decided until it runs.'
+  };
+
   function rad(d) { return (d - 90) * Math.PI / 180; }
 
   /* The two endpoints that carry zone geometry disagree on the field name:
@@ -824,6 +856,10 @@
         '<button class="ipo-btn ipo-play" aria-label="Play">&#9654;</button>' +
         '<input type="range" min="0" max="1000" step="1" value="0" aria-label="Position along the path">' +
       '</div>' +
+      /* b594: the LIVE bar. Not a control -- a readout. A run in progress has
+       * nothing to scrub to, so the transport row is hidden and this takes
+       * its place: how far through the run the device actually is. */
+      '<div class="ipo-prog"><div class="ipo-prog-fill"></div></div>' +
       '<div class="ipo-note"></div>';
     var css = document.createElement('style');
     css.textContent =
@@ -841,7 +877,13 @@
       '#irr-path-ov .ipo-btn.sel{border-color:var(--green);background:var(--green-dim);color:var(--green);}' +
       '#irr-path-ov .ipo-scrub input{flex:1;min-width:0;}' +
       '#irr-path-ov .ipo-note{width:min(92vw,620px);font-size:11px;' +
-        'color:var(--text-mid);text-align:center;min-height:14px;}';
+        'color:var(--text-mid);text-align:center;min-height:14px;}' +
+      '#irr-path-ov .ipo-prog{display:none;width:min(92vw,620px);height:6px;' +
+        'background:var(--btn);border:1px solid var(--border);border-radius:4px;' +
+        'overflow:hidden;}' +
+      '#irr-path-ov .ipo-prog.on{display:block;}' +
+      '#irr-path-ov .ipo-prog-fill{height:100%;width:0;background:var(--green);' +
+        'box-shadow:0 0 8px var(--green-glow);transition:width .4s linear;}';
     document.head.appendChild(css);
     document.body.appendChild(el);
     ov = {
@@ -851,8 +893,11 @@
       modes: el.querySelector('.ipo-modes'),
       play: el.querySelector('.ipo-play'),
       range: el.querySelector('input'),
+      scrub: el.querySelector('.ipo-scrub'),
+      prog: el.querySelector('.ipo-prog'),
+      progFill: el.querySelector('.ipo-prog-fill'),
       note: el.querySelector('.ipo-note'),
-      opts: null, mode: '7', t: 0, timer: null, playMs: 8000
+      opts: null, mode: '7', t: 0, timer: null
     };
     el.addEventListener('click', function (e) { if (e.target === el) ovClose(); });
     ov.el.querySelector('.ipo-x').addEventListener('click', ovClose);
@@ -899,6 +944,10 @@
   function ovClose() {
     if (!ov) return;
     if (ov.timer) { clearInterval(ov.timer); ov.timer = null; ov.play.innerHTML = '&#9654;'; }
+    /* b594: drop the live handle. Without this a later preview of the same
+     * zone reopens still holding the last run's position and progress. */
+    if (ov.opts) { ov.opts.live = null; ov.opts.liveMode = false; }
+    ov.prog.classList.remove('on');
     ov.el.classList.remove('open');
   }
 
@@ -924,14 +973,89 @@
        * about where the disc is, for one dot. */
       live: ov.opts.live
     };
+    /* b594: a run in progress has nothing to scrub to -- the answer to "where
+     * is it" is the live dot, not a slider the viewer drags. Suppress the
+     * planned marker while live. */
+    if (ov.opts.liveMode) delete o.scrub;
     thumb(ov.cv, ov.opts.points, o);
     var label = (MODES[ov.mode] || {}).label || '';
     ov.title.textContent = (ov.opts.title ? ov.opts.title + ' \u00b7 ' : '') + label;
+    ovChrome();
     /* b572: no per-frame readout here. It was a monospace span in the same
      * flex row as the scrubber, and once b569 added the pass number the text
      * outgrew its min-width and resized the slider as playback moved -- the
      * bar jittered under the thumb. The marker on the canvas already shows
      * where the nozzle is. */
+  }
+
+  /* b594: show the controls the situation actually supports.
+   *
+   * Three different questions get asked of this overlay, and they were all
+   * being answered with the same transport bar:
+   *
+   *   1. Zone Setup          where does the water land? (rings only, no
+   *                          overlay -- drawn inline on that page)
+   *   2. Preview, before a run
+   *        deterministic     scrub + play: this is the run that WILL happen
+   *        adaptive          path + a sentence: the order is decided at run
+   *                          time, so there is nothing truthful to animate
+   *   3. Live, during a run  progress + the real dot. A slider here invites
+   *                          dragging to a position the device is not at.
+   */
+  function ovChrome() {
+    var mk = (MODES[ov.mode] || MODES['1']).key;
+    var det = isDeterministic(mk);
+    var live = !!ov.opts.liveMode;
+
+    /* Transport: only for a deterministic preview. */
+    var showScrub = det && !live;
+    ov.scrub.style.display = showScrub ? 'flex' : 'none';
+    if (!showScrub && ov.timer) {
+      clearInterval(ov.timer); ov.timer = null; ov.play.innerHTML = '&#9654;';
+    }
+
+    /* Progress: only while live, and only when we can honestly compute it. */
+    var frac = live ? liveFraction() : -1;
+    ov.prog.classList.toggle('on', frac >= 0);
+    if (frac >= 0) ov.progFill.style.width = (frac * 100).toFixed(1) + '%';
+
+    ov.note.textContent = live ? liveNote(mk, frac)
+                        : det   ? ''
+                                : (ADAPTIVE_NOTE[mk] || '');
+  }
+
+  /* How far through the run, 0..1, or -1 when it cannot be said honestly.
+   *
+   * Deterministic modes know their total pass count up front, so
+   * (passes done + progress through this pass) / total is a real fraction.
+   * Adaptive modes do not know how many passes they will make, so there is no
+   * denominator -- reporting a percentage would be inventing one. */
+  function liveFraction() {
+    var L = ov.opts.live;
+    if (!L) return -1;
+    var mk = (MODES[ov.mode] || MODES['1']).key;
+    if (!isDeterministic(mk)) return -1;
+    var total = L.passes_total | 0, rings = L.rings_total | 0;
+    if (total < 1 || rings < 1) return -1;
+    var pass = Math.max(0, (L.pass | 0) - 1);      // live_pass is 1-based
+    var ring = Math.max(0, L.ring | 0);
+    var f = (pass + Math.min(1, ring / rings)) / total;
+    return Math.max(0, Math.min(1, f));
+  }
+
+  function liveNote(mk, frac) {
+    var L = ov.opts.live || {};
+    var bits = [];
+    if (L.pass > 0 && L.passes_total > 0)
+      bits.push('Pass ' + L.pass + ' of ' + L.passes_total);
+    if (L.ring >= 0 && L.rings_total > 0)
+      bits.push('ring ' + ((L.ring | 0) + 1) + ' of ' + L.rings_total);
+    if (frac >= 0) bits.push((frac * 100).toFixed(0) + '% through');
+    else if (!isDeterministic(mk))
+      bits.push('this mode decides its passes as it runs, so there is no '
+              + 'total to count against');
+    if ((L.age_ms || 0) > 2500) bits.push('moving between arcs');
+    return bits.join(' \u00b7 ');
   }
 
   function openPreview(opts) {
