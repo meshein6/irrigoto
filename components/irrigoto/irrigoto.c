@@ -10070,6 +10070,26 @@ static bool serpentine_glide_legs(const serpentine_leg_t *legs, int n,
                              int *ring_sweeps_out,
                              TickType_t t_start, bool dry)
 {
+    // b595: the arc each ring has swept SO FAR THIS PASS.
+    //
+    // A ring that crosses the zone in two places is swept once per arc, and
+    // the per-ring record below is written once per LEG -- by struct
+    // assignment, which overwrites. So active_deg kept only the last arc and
+    // the earlier one vanished. b574 found this shape of bug on the depth
+    // side and fixed it by arc-weighting the credit; it left the area side
+    // alone, three lines down.
+    //
+    // Everything that turns a run into litres reads active_deg:
+    // irrigoto_last_water_volume_l() sums depth x (arc x radius x width), so
+    // on this zone -- a long strip, which most rings cross twice -- the
+    // reported volume and covered area were each about half of what the run
+    // actually did. That is where "the rings only reach 2.68 m2 of a 5.04 m2
+    // zone" came from: not reach, accounting.
+    //
+    // Zeroed here because this function is called exactly once per pass.
+    static float s_ring_arc_deg[WATER_RUN_MAX_RINGS];
+    memset(s_ring_arc_deg, 0, sizeof(s_ring_arc_deg));
+
     const uint16_t N_MIN_DUTY    = 70;
     const uint16_t N_ALIGN_DUTY  = 380;   // dry reposition/transit (aim speed)
     const float    N_TOL_DEG     = 1.0f;
@@ -10700,12 +10720,16 @@ static bool serpentine_glide_legs(const serpentine_leg_t *legs, int n,
                 ? fmodf(L->b1_deg - meas_deg + 360.0f, 360.0f) : L->b1_deg;
             float _arc_e = (dirn > 0)
                 ? L->b1_deg : fmodf(L->b1_deg + meas_deg, 360.0f);
+            // b595: accumulate across this ring's arcs, don't overwrite.
+            if ((unsigned)ring < WATER_RUN_MAX_RINGS)
+                s_ring_arc_deg[ring] += meas_deg;
             s_last_water_run.rings[ring] = (water_ring_data_t){
                 .throw_mm        = ro,
                 .avg_psi         = avg_psi,
                 .actual_throw_mm = _at,
                 .dps             = meas_dps,
-                .active_deg      = meas_deg,
+                .active_deg      = ((unsigned)ring < WATER_RUN_MAX_RINGS)
+                                   ? s_ring_arc_deg[ring] : meas_deg,
                 .arc_start_deg   = _arc_s,
                 .arc_end_deg     = _arc_e,
                 .valve_deg       = L->v1_deg,

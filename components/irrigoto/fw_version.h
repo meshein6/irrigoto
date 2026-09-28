@@ -1,4 +1,4 @@
 /* Auto-incremented each time new firmware is generated.
    Do not edit manually. */
 #pragma once
-#define FW_BUILD 594
+#define FW_BUILD 595
