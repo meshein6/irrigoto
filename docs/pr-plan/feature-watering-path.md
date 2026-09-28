@@ -322,3 +322,135 @@ Still to do:
   shared-arena refactor (note: `mr_buf` cannot overlap the Smooth accumulator).
 - **Exact preview.** `GET /zone/plan?id=&mode=&depth=&pass=` returning the
   firmware's actual leg list would make the preview exact rather than a mirror.
+
+---
+
+# Deterministic rebuild (b569-b586)
+
+Owner decision after using the adaptive version: *"stop all of this old logic.
+Use the planned paths exactly as is"*, *"make sure each pass is ACTUALLY known
+in advance"*, *"run as many as needed to get the outcome"*.
+
+## The plan decides the run
+
+The pass schedule is computed **once, before any water flows**, from the
+executor's own functions:
+
+```
+dps = serpentine_ring_dps(...)          the speed that will be used
+d1  = nozzle_precip_depth_mm(..., dps)  what one sweep deposits
+n   = ceil(target / d1)                 passes that ring needs
+```
+
+`skip[]` reads that schedule instead of `cumulative_depth`. `corr` is seeded
+from the previous run and then held. The throw-retry re-fire and the pass-0
+un-credit are gone. Measurement still happens and is still logged — it no
+longer changes the plan. The full schedule is logged per ring at run start.
+
+Determinism makes passes **predictable, not absent**: outer rings still do not
+reach target in one pass at the speed floor, so the plan schedules two or
+three and says which rings, up front.
+
+## Three bugs found by looking at a real run's log
+
+**Depth was double-counted on multi-arc rings.** `nozzle_precip_depth_mm`
+returns the depth on the wedge just swept — the arc cancels, because a shorter
+sweep takes proportionally less time over proportionally less ground. Adding
+it once per wedge into a per-**ring** counter claims the same ground was
+watered twice. Measured, ring 20 inside a *single* pass:
+
+```
+r20 sweep 35.8 deg ... cum 2.29mm      <- lobe A
+r20 sweep 42.4 deg ... cum 5.20mm      <- lobe B
+```
+
+against a 3.175 mm target, after which the firmware dropped r20 from pass 2
+while each lobe had received about 2.5 mm. Every multi-arc ring was
+under-watered by roughly its arc count. Credit is now weighted by arc share.
+(The shared Gentle/Smooth loop never had this — it credits once per ring per
+pass, which is the correct semantics.)
+
+**The valve tolerance swallowed most ring steps.** The ladder moves the valve
+0.43–0.97 deg between consecutive rings. `V_TOL_DEG` was 0.8, so
+
+```c
+if (v_abs < V_TOL_DEG) { stop }
+```
+
+declared the valve already in position for **13 of 19** transitions: it never
+moved, and consecutive rings swept the same physical distance. This is the
+"goes back and forth at the same distance" and "distances aren't adjusting
+granularly" reports. Tolerance 0.8 → 0.20 (the encoder resolves 0.088 deg),
+decel band 4.0 → 1.0, and the ramp floor lifted off the stall threshold — a
+sub-degree step used to spend its entire travel in the easing ramp, which
+computes duty ~76, the duty b521 records this valve stalling at. 19 of 19
+transitions now command a move the chase executes.
+
+**Lobes were ordered by bearing.** `serpentine_arc_bounds` returns arcs sorted
+by CW distance from the zone arc start, so the run began with whichever lobe
+came first round the circle — on the measured zone the 260–340 deg lobe, which
+only reaches ring 19. The run started mid-distance, worked in to ring 31, then
+jumped to the other lobe and started again at ring 1. Each lobe was correctly
+outer→inner; the lobes were in the wrong order. Now sorted by reach, in the
+firmware **and** in `path.js` — they have to agree or the preview starts on
+the opposite side.
+
+## Valve control
+
+`serp_valve_settle_from_below` is gone. It drove the valve past a ring's
+target and back up so the ball always landed from the same side — with the
+stream ON, so every inward ring change sprayed short for up to 1.5 s. Its real
+job was getting a stuck ball moving; a bounded stiction pulse does that
+without ever leaving the planned distance (fires after 90 ms of no encoder
+movement, lasts 100 ms at duty 420, at most 10 per leg, so a jammed valve
+still reaches the existing fault paths).
+
+The first wet sweep waits for pressure to actually stabilise rather than a
+fixed 1800 ms — two consecutive reads agreeing, capped at 9 s. The
+reach-ordering means the run now starts on the outermost ring, the one least
+tolerant of a supply still coming up.
+
+## Preview and run are one artifact
+
+- Coverage reaches **every** preview entry point (it previously reached two of
+  five, which is why Sections looked unaffected by it).
+- Serpentine/Sections turns are drawn as the wet boundary-hug glides they are;
+  `dryReturn` was a guess and is gone.
+- The scrubber plays the **whole multipass run** from the firmware's own
+  `ring_passes`, so the play button plays what will happen.
+- `run_plan` counts passes with the run's own deposit expression, not a clamp
+  ratio. Those are algebraically equal only while the solver uses the plain
+  annulus area; below `WATER_MIN_ELLIPSE_THROW_MM` it substitutes a splash
+  band, and the preview predicted four passes where the run did two.
+- Zone Setup shows **rings only** — where the water goes. How the nozzle
+  travels them belongs to a run.
+
+Measured after alignment: `passes 2`, `est_min 4.9` against an observed 1.5–2
+passes and a 4.7 min run.
+
+## Live view
+
+`/api/status` publishes planned and actual throw separately (conflating them
+hid the very thing being looked for), plus the run's shape. A **Live** chip in
+the watering bar opens the shared overlay on demand: planned path, a dashed
+circle at the ring the plan says the nozzle is on, live marker on top — a
+short throw reads as the dot inside the circle. Polls at 0.5 s while open.
+
+## Diagnostics
+
+The 24 KB log ring drops the **oldest** bytes, and the oldest bytes are the
+plan. 1.5 KB of pinned head now survives the wrap in both the served and the
+persisted copy, so a completed run's log still carries its schedule.
+
+## Still open
+
+- **The flow constant.** `NOZZLE_FLOW_K = 4542` at `N = 0.566` is what the
+  schedule rests on (`ceil(target / predicted_deposit)`). Planner and executor
+  share it, so they agree with each other — that does not make it right. If a
+  run reaches its scheduled passes and the ground is dry, this is why.
+- **Transition overhead.** Sweeps totalled ~60 s of a 247 s run before the
+  valve-control work; worth re-measuring now.
+- **The 80 mm ring-spacing floor** makes Standard and Finest identical below
+  3.2 ft.
+- **Pulse / Gentle / Smooth are unchanged** and still adaptive. Their preview
+  and estimate are a model, not their behaviour.
