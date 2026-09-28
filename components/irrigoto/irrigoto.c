@@ -10060,6 +10060,40 @@ static void serp_dry_hop_to(chase_motor_t *nm, chase_motor_t *vm, int *v_dir_io,
 // same-direction joints, cosine-ease braking only into reversals/radials.
 // Does NOT close the valve or touch the rails on exit -- the caller's
 // shared closeout owns teardown.
+
+// b596: the per-ring arc bitmap -- 180 sectors of 2 degrees, matching the
+// coverage raster's bearing step. See water_ring_data_t in irrigoto_types.h
+// for why a single arc_start/arc_end pair was not enough.
+#define RING_MASK_SECTORS 180
+#define RING_MASK_DEG     2.0f
+
+static void ring_mask_mark(uint64_t m[3], float start_deg, float span_deg)
+{
+    if (span_deg <= 0.0f) return;
+    if (span_deg > 360.0f) span_deg = 360.0f;
+    int n = (int)ceilf(span_deg / RING_MASK_DEG);
+    if (n < 1) n = 1;
+    for (int k = 0; k < n; k++) {
+        float b = start_deg + (float)k * RING_MASK_DEG;
+        int   i = (int)floorf(fmodf(fmodf(b, 360.0f) + 360.0f, 360.0f) / RING_MASK_DEG);
+        if (i < 0 || i >= RING_MASK_SECTORS) continue;
+        m[i >> 6] |= (uint64_t)1u << (i & 63);
+    }
+}
+
+static bool ring_mask_any(const uint64_t m[3])
+{
+    return (m[0] | m[1] | m[2]) != 0;
+}
+
+static bool ring_mask_test(const uint64_t m[3], float bearing_deg)
+{
+    int i = (int)floorf(fmodf(fmodf(bearing_deg, 360.0f) + 360.0f, 360.0f)
+                        / RING_MASK_DEG);
+    if (i < 0 || i >= RING_MASK_SECTORS) return false;
+    return (m[i >> 6] >> (i & 63)) & 1u;
+}
+
 static bool serpentine_glide_legs(const serpentine_leg_t *legs, int n,
                              const float *ring_throws, int num_rings,
                              const bool *ring_direct, const float *valve_corr,   // b513
@@ -10086,9 +10120,12 @@ static bool serpentine_glide_legs(const serpentine_leg_t *legs, int n,
     // actually did. That is where "the rings only reach 2.68 m2 of a 5.04 m2
     // zone" came from: not reach, accounting.
     //
-    // Zeroed here because this function is called exactly once per pass.
-    static float s_ring_arc_deg[WATER_RUN_MAX_RINGS];
-    memset(s_ring_arc_deg, 0, sizeof(s_ring_arc_deg));
+    // b596: one bit per ring, "already touched in THIS pass". The first leg of
+    // a ring in a pass resets that ring's accumulated arc and bitmap; later
+    // legs add to them. Resetting the whole table here instead would wipe the
+    // record of any ring this pass does not sweep -- later passes cover only
+    // the rings still short, so most rings are not in them.
+    uint64_t pass_seen = 0;
 
     const uint16_t N_MIN_DUTY    = 70;
     const uint16_t N_ALIGN_DUTY  = 380;   // dry reposition/transit (aim speed)
@@ -10720,18 +10757,35 @@ static bool serpentine_glide_legs(const serpentine_leg_t *legs, int n,
                 ? fmodf(L->b1_deg - meas_deg + 360.0f, 360.0f) : L->b1_deg;
             float _arc_e = (dirn > 0)
                 ? L->b1_deg : fmodf(L->b1_deg + meas_deg, 360.0f);
-            // b595: accumulate across this ring's arcs, don't overwrite.
-            if ((unsigned)ring < WATER_RUN_MAX_RINGS)
-                s_ring_arc_deg[ring] += meas_deg;
+            // b595/b596: accumulate across this ring's arcs, don't overwrite.
+            // Both the swept degrees and the bearings they were swept at.
+            float    _acc_deg  = meas_deg;
+            uint64_t _acc_m[3] = {0, 0, 0};
+            if ((unsigned)ring < WATER_RUN_MAX_RINGS) {
+                bool first = !((pass_seen >> (ring & 63)) & 1u);
+                if (!first) {
+                    _acc_deg += s_last_water_run.rings[ring].active_deg;
+                    _acc_m[0] = s_last_water_run.rings[ring].arc_mask[0];
+                    _acc_m[1] = s_last_water_run.rings[ring].arc_mask[1];
+                    _acc_m[2] = s_last_water_run.rings[ring].arc_mask[2];
+                }
+                pass_seen |= (uint64_t)1u << (ring & 63);
+            }
+            ring_mask_mark(_acc_m, _arc_s, meas_deg);
+            // depth_mm is filled once at run end from the cumulative array,
+            // so this write is not its owner -- carry it rather than zeroing
+            // it, which is the habit b595 and b596 are both about.
+            float _keep_depth = s_last_water_run.rings[ring].depth_mm;
             s_last_water_run.rings[ring] = (water_ring_data_t){
                 .throw_mm        = ro,
                 .avg_psi         = avg_psi,
                 .actual_throw_mm = _at,
                 .dps             = meas_dps,
-                .active_deg      = ((unsigned)ring < WATER_RUN_MAX_RINGS)
-                                   ? s_ring_arc_deg[ring] : meas_deg,
+                .active_deg      = _acc_deg,
                 .arc_start_deg   = _arc_s,
                 .arc_end_deg     = _arc_e,
+                .arc_mask        = { _acc_m[0], _acc_m[1], _acc_m[2] },
+                .depth_mm        = _keep_depth,
                 .valve_deg       = L->v1_deg,
             };
             if (ring_sweeps_out) (*ring_sweeps_out)++;
@@ -14062,6 +14116,16 @@ static void phase_water_zone(void)
                                   : fmodf(seg_origin - seg_deg + 360.0f, 360.0f);
                 float _arc_e = cw ? fmodf(seg_origin + seg_deg, 360.0f)
                                   : seg_origin;
+                // b596: this path already knows every sector it watered --
+                // active_deg is a sector COUNT, so it never had the b595
+                // single-arc problem. But arc_start/arc_end are still "derived
+                // from last arc's seg_origin" (see above), so ring_covers()
+                // scored only that one. Build the bitmap from active[].
+                uint64_t _sm[3] = {0, 0, 0};
+                for (int _s = 0; _s < WATER_SECTORS; _s++)
+                    if (active[_s])
+                        ring_mask_mark(_sm, (float)_s * (float)WATER_SECTOR_DEG,
+                                       (float)WATER_SECTOR_DEG);
                 s_last_water_run.rings[ring] = (water_ring_data_t){
                     .throw_mm        = ring_throw,
                     .avg_psi         = _avg,
@@ -14072,6 +14136,7 @@ static void phase_water_zone(void)
                     .active_deg      = active_count * (float)WATER_SECTOR_DEG,
                     .arc_start_deg   = _arc_s,
                     .arc_end_deg     = _arc_e,
+                    .arc_mask        = { _sm[0], _sm[1], _sm[2] },
                     .head_psi        = ring_head_psi,     // b497: per-ring pressure trend
                     .tail_psi        = ring_tail_psi,
                     .valve_deg       = valve_target_deg,  // b281: for supply back-calc
@@ -21724,8 +21789,15 @@ static bool ring_covers(const water_ring_data_t *r, float bearing_deg, float r_m
 {
     if (r->active_deg <= 0.0f || r->throw_mm <= 0.0f) return false;
     if (r->depth_mm   <= 0.01f)                       return false;
+    // b596: prefer the full arc bitmap. arc_start_deg/arc_end_deg describe one
+    // contiguous arc, and a ring crossing the zone twice has two -- the second
+    // used to overwrite the first, so every other arc scored as missed ground.
+    // A zero mask means the run predates this (a stored run loaded from disk,
+    // or a mode that does not record one), so the old single-arc test stands.
     bool in_arc;
-    if (r->arc_start_deg <= r->arc_end_deg) {
+    if (ring_mask_any(r->arc_mask)) {
+        in_arc = ring_mask_test(r->arc_mask, bearing_deg);
+    } else if (r->arc_start_deg <= r->arc_end_deg) {
         in_arc = (bearing_deg >= r->arc_start_deg && bearing_deg <= r->arc_end_deg);
     } else {
         in_arc = (bearing_deg >= r->arc_start_deg || bearing_deg <= r->arc_end_deg);

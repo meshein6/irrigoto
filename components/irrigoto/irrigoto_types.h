@@ -58,8 +58,24 @@ typedef struct {
     float actual_throw_mm;
     float dps;
     float active_deg;
-    float arc_start_deg;   // actual CW sweep start for this ring
-    float arc_end_deg;     // actual CW sweep end for this ring
+    float arc_start_deg;   // actual CW sweep start for this ring (LAST arc only)
+    float arc_end_deg;     // actual CW sweep end for this ring   (LAST arc only)
+    // b596: every arc this ring swept, as a bitmap of 2-degree sectors.
+    //
+    // arc_start_deg/arc_end_deg describe ONE contiguous arc, and a ring that
+    // crosses the zone in two places sweeps two. The per-ring record is
+    // written once per leg by struct assignment, so the second arc overwrote
+    // the first and ring_covers() -- which feeds polygon_coverage_pct and the
+    // run score -- only ever saw the last one. On a long strip, where most
+    // rings cross twice, that is about half the watered ground scored as
+    // missed. (b595 fixed the same overwrite on active_deg, which is what
+    // volume is computed from; this is the bearing side of it.)
+    //
+    // 180 sectors of 2 degrees, matching the coverage raster's own bearing
+    // step exactly, so there is no quantisation to reason about. The two
+    // floats above are kept as-is: they still carry the last arc, which is
+    // what /api/water_trace has always reported.
+    uint64_t arc_mask[3];  // bit (bearing/2); 0 = no mask recorded, fall back
     float depth_mm;        // estimated precipitation depth per pass [mm]
     float valve_deg;       // b281: valve angle held for this ring (for supply back-calc)
     // b497: pressure at the START and END of this ring's sweep. avg_psi alone
