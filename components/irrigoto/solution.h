@@ -83,6 +83,13 @@ float solution_estimate_ml(const solution_cfg_t *cfg, uint8_t bottle, int est_ru
 /* Append the entry's solution fields as JSON members (leading comma included). */
 int   solution_entry_json(const schedule_entry_t *e, char *buf, size_t len);
 
+/* b587: which bottle a FUTURE occurrence of this entry will use -- `ahead` 0
+ * for its next run, 1 for the one after that. 0 = that run does not dose.
+ * Reads the same runs_since / rotation counters solution_arm_entry() does, so
+ * the Upcoming list and the dose that eventually fires cannot disagree.
+ * Assumes every intervening run waters. */
+uint8_t solution_forecast_bottle(const schedule_entry_t *e, uint8_t ahead);
+
 /* ── Run lifecycle ── */
 void  solution_arm_entry(const schedule_entry_t *e);   /* NULL / disabled = no dose */
 void  solution_arm_manual(uint8_t bottle, const solution_cfg_t *cfg);

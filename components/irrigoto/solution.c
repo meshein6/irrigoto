@@ -407,6 +407,48 @@ void solution_arm_entry(const schedule_entry_t *e)
     arm(e->id, bottle, &cfg);
 }
 
+/* b587: what a FUTURE occurrence of this entry will dose, without running it.
+ *
+ * The Upcoming list has to answer "does this one get solution, and from which
+ * bottle" for runs that have not happened. That is the same two counters
+ * solution_arm_entry() reads and solution_on_run_end() advances -- runs_since
+ * for Every-Nth, rot for the bottle rotation -- so the projection lives here,
+ * next to them, rather than being re-derived in the web layer where it would
+ * drift the first time either rule changed.
+ *
+ * `ahead` is 0 for the entry's very next run, 1 for the one after, and so on.
+ * Returns the bottle number 1..3, or 0 when that occurrence does not dose.
+ * Assumes every intervening run waters (the counters only advance on a run
+ * that actually flowed), which is the same assumption the list itself makes
+ * by showing the schedule rather than a prediction of the weather.
+ */
+uint8_t solution_forecast_bottle(const schedule_entry_t *e, uint8_t ahead)
+{
+    if (!s_enabled || !e || !e->solution_enabled) return 0;
+
+    const sol_rt_entry_t *rt = rt_find(e->id, false);
+    uint32_t runs_since = rt ? rt->runs_since : 0;
+    uint32_t rot        = rt ? rt->rot        : 0;
+
+    solution_cfg_t cfg; solution_cfg_from_entry(e, &cfg);
+    uint8_t count = popcount3(cfg.bottles);
+    if (count == 0) return 0;
+
+    uint8_t n = (e->solution_when == SOLUTION_WHEN_NTH)
+                ? (e->solution_every_n ? e->solution_every_n : SOLUTION_DEF_EVERY_N)
+                : 1;
+
+    for (uint8_t k = 0; ; k++) {
+        /* Mirrors solution_arm_entry(): this run is number runs_since + 1. */
+        bool doses = (runs_since + 1 >= n);
+        if (k == ahead)
+            return doses ? nth_set_bit(cfg.bottles, (uint8_t)(rot % count)) : 0;
+        /* And solution_on_run_end(), for a run that watered. */
+        if (doses) { runs_since = 0; rot++; } else { runs_since++; }
+        if (k == 255) return 0;            /* ahead is uint8_t; cannot spin */
+    }
+}
+
 void solution_arm_manual(uint8_t bottle, const solution_cfg_t *cfg)
 {
     solution_on_run_end();

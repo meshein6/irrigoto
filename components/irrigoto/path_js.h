@@ -57,31 +57,55 @@ R"PATHJS(
     return out;
   }
 
+  /* The polygon in cartesian mm, projected ONCE.
+   *
+   * b587: every geometry test used to re-derive each vertex from (deg,
+   * throw_mm) with its own sin and cos. Building a 34-ring preview runs
+   * pointInZone about 24,000 times (720 half-degree samples per ring), and
+   * each call projected all nine vertices again -- around 440,000 sin/cos
+   * pairs to draw one picture, all of them the same nine answers. Projecting
+   * up front cut a build from 4.9 ms to 0.9 ms, which is what the Zone Setup
+   * d-pad was waiting on between steps.
+   *
+   * The public pointInZone/perimExtent still take a points array and project
+   * on the way in, so nothing outside this file has to know. */
+  function projectPoly(pts) {
+    var n = pts.length, x = new Array(n), y = new Array(n);
+    for (var i = 0; i < n; i++) {
+      var a = pts[i].deg * Math.PI / 180;
+      x[i] = pts[i].throw_mm * Math.sin(a);
+      y[i] = pts[i].throw_mm * Math.cos(a);
+    }
+    return { x: x, y: y, n: n };
+  }
+
   /* Even-odd point-in-polygon in (bearing, throw) space, translated so the
    * test point is the origin -- same method the page used before. */
-  function pointInZone(pts, bearing, r_mm) {
+  function inPoly(P, bearing, r_mm) {
     var px = r_mm * Math.sin(bearing * Math.PI / 180),
         py = r_mm * Math.cos(bearing * Math.PI / 180),
-        crosses = 0, n = pts.length;
+        crosses = 0, n = P.n, X = P.x, Y = P.y;
     for (var i = 0; i < n; i++) {
-      var j = (i + 1) % n, pi = pts[i], pj = pts[j];
-      var x1 = pi.throw_mm * Math.sin(pi.deg * Math.PI / 180) - px,
-          y1 = pi.throw_mm * Math.cos(pi.deg * Math.PI / 180) - py,
-          x2 = pj.throw_mm * Math.sin(pj.deg * Math.PI / 180) - px,
-          y2 = pj.throw_mm * Math.cos(pj.deg * Math.PI / 180) - py;
+      var j = (i + 1) % n;
+      var y1 = Y[i] - py, y2 = Y[j] - py;
       if ((y1 > 0) !== (y2 > 0)) {
+        var x1 = X[i] - px, x2 = X[j] - px;
         var t = y1 / (y1 - y2);
         if (x1 + t * (x2 - x1) > 0) crosses++;
       }
     }
     return (crosses % 2) === 1;
   }
+  function pointInZone(pts, bearing, r_mm) {
+    return inPoly(projectPoly(pts), bearing, r_mm);
+  }
 
   /* The zone's active arc: the largest gap between vertex bearings is treated
    * as the excluded sector. Three cases force a full 360: all points at one
    * throw (sprinkler centred), the origin inside the polygon, and a long
    * straight edge that merely spans the gap (b435). */
-  function zoneArc(pts) {
+  function zoneArc(pts, P) {
+    P = P || projectPoly(pts);
     var sdegs = pts.map(function (p) { return p.deg; }).sort(function (a, b) { return a - b; });
     var mg = 0, gi = 0;
     for (var i = 0; i < sdegs.length; i++) {
@@ -96,19 +120,16 @@ R"PATHJS(
     var centred = zmax > 0 && (zmax - zmin2) / zmax < 0.05;
     if (centred) return { start: 0, span: 360, centred: true, originInside: false, gap: mg, gi: gi };
 
-    var inside = pointInZone(pts, 0, 1);
+    var inside = inPoly(P, 0, 1);
     if (inside) return { start: 0, span: 360, centred: false, originInside: true, gap: mg, gi: gi };
 
     if (span < 360 && mg > 0) {
       for (var k = 1; k <= 3; k++) {
         var gb = (sdegs[gi] + mg * k / 4) % 360;
         var gbs = Math.sin(gb * Math.PI / 180), gbc = Math.cos(gb * Math.PI / 180), best = 0;
-        for (var a = 0; a < pts.length; a++) {
-          var b = (a + 1) % pts.length, pa = pts[a], pb = pts[b];
-          var ax = pa.throw_mm * Math.sin(pa.deg * Math.PI / 180),
-              ay = pa.throw_mm * Math.cos(pa.deg * Math.PI / 180),
-              bx = pb.throw_mm * Math.sin(pb.deg * Math.PI / 180),
-              by = pb.throw_mm * Math.cos(pb.deg * Math.PI / 180);
+        for (var a = 0; a < P.n; a++) {
+          var b = (a + 1) % P.n;
+          var ax = P.x[a], ay = P.y[a], bx = P.x[b], by = P.y[b];
           var dx = bx - ax, dy = by - ay, det = gbc * dx - gbs * dy;
           if (Math.abs(det) < 1e-6) continue;
           var s = (dx * ay - dy * ax) / det, u = (gbs * ay - gbc * ax) / det;
@@ -140,7 +161,6 @@ R"PATHJS(
     var zmax = Math.max.apply(null, throws);
     var zmin = (actMin && actMin > 50) ? actMin : Math.min.apply(null, throws);
     var pitch = 700 * coverageScale(coverage);
-    ringThrows.lastPitch = pitch;   /* b573: build() matches rings by radius */
     var rings = [], t = zmax;
     while (t >= zmin && rings.length < RING_MAX) {
       rings.push(t);
@@ -156,10 +176,11 @@ R"PATHJS(
   }
 
   /* The wetted spans of one ring: walk the arc and keep what's inside. */
-  function ringSpans(pts, arc, thr) {
+  function ringSpans(pts, arc, thr, P) {
+    P = P || projectPoly(pts);
     var spans = [], spanStart = null;
     for (var o = 0; o <= arc.span + STEP_DEG; o += STEP_DEG) {
-      var bearing = (arc.start + o) % 360, inside = pointInZone(pts, bearing, thr);
+      var bearing = (arc.start + o) % 360, inside = inPoly(P, bearing, thr);
       if (inside && spanStart === null) spanStart = o;
       if (!inside && spanStart !== null) {
         spans.push({ lo: (arc.start + spanStart + 360) % 360, span: o - spanStart });
@@ -173,14 +194,11 @@ R"PATHJS(
 
   /* Max ray-polygon intersection distance at a bearing -- the zone's extent
    * there. Mirrors water_perimeter_throw() in irrigoto.c. */
-  function perimExtent(pts, bearing) {
+  function extentOf(P, bearing) {
     var bs = Math.sin(bearing * Math.PI / 180), bc = Math.cos(bearing * Math.PI / 180), best = 0;
-    for (var i = 0; i < pts.length; i++) {
-      var j = (i + 1) % pts.length, pi = pts[i], pj = pts[j];
-      var x1 = pi.throw_mm * Math.sin(pi.deg * Math.PI / 180),
-          y1 = pi.throw_mm * Math.cos(pi.deg * Math.PI / 180),
-          x2 = pj.throw_mm * Math.sin(pj.deg * Math.PI / 180),
-          y2 = pj.throw_mm * Math.cos(pj.deg * Math.PI / 180);
+    for (var i = 0; i < P.n; i++) {
+      var j = (i + 1) % P.n;
+      var x1 = P.x[i], y1 = P.y[i], x2 = P.x[j], y2 = P.y[j];
       var dx = x2 - x1, dy = y2 - y1, det = bc * dx - bs * dy;
       if (Math.abs(det) < 1e-6) continue;
       var sD = (dx * y1 - dy * x1) / det, u = (bs * y1 - bc * x1) / det;
@@ -188,6 +206,7 @@ R"PATHJS(
     }
     return best;
   }
+  function perimExtent(pts, bearing) { return extentOf(projectPoly(pts), bearing); }
 
   /* The turn between two arcs, for Serpentine and Sections.
    *
@@ -207,7 +226,7 @@ R"PATHJS(
    */
   var TURN_STEP_DEG = 4.0, TURN_MARGIN_MM = 200.0, TURN_MAX_WPS = 64;
 
-  function buildTurn(pts, fromB, fromR, toB, toR, turnFloor) {
+  function buildTurn(P, fromB, fromR, toB, toR, turnFloor) {
     var d = toB - fromB;
     while (d >  180) d -= 360;
     while (d < -180) d += 360;
@@ -218,10 +237,10 @@ R"PATHJS(
       var f = wi / nw;
       var b = ((fromB + d * f) % 360 + 360) % 360;
       var r = fromR + (toR - fromR) * f;
-      var ext = perimExtent(pts, b) - TURN_MARGIN_MM;
+      var ext = extentOf(P, b) - TURN_MARGIN_MM;
       if (ext < r) r = ext;
-      if (!pointInZone(pts, b, r)) r -= TURN_MARGIN_MM;   /* one nudge inward */
-      if (r < turnFloor || !pointInZone(pts, b, r)) return { wet: false };
+      if (!inPoly(P, b, r)) r -= TURN_MARGIN_MM;          /* one nudge inward */
+      if (r < turnFloor || !inPoly(P, b, r)) return { wet: false };
       wps.push({ deg: b, r: (wi === nw) ? toR : r });
     }
     return { wet: true, wps: wps };
@@ -339,9 +358,36 @@ R"PATHJS(
     var modeKey = (MODES[opts.mode] || MODES['1']).key;
     if (modeKey === 'chase' || modeKey === 'demo') return { modeKey: modeKey, rings: [], noPath: true };
 
-    var arc = zoneArc(points);
-    var thr = ringThrows(points, actMax, actMin, arc, opts.coverage | 0);
-    var pitch = ringThrows.lastPitch || 700;
+    var P = projectPoly(points);            /* b587: project once, reuse */
+    var arc = zoneArc(points, P);
+
+    /* b587: when the firmware has published its own ring ladder, DRAW THAT.
+     *
+     * This page rebuilt the ladder from the zone outline and the two did not
+     * come out the same -- 34 rings here against the firmware's 31, because
+     * the inner-ring rule differs at the bottom of the range. So the modal
+     * showed "10 of 31 rings" in the plan note and "34 rings" under the
+     * picture, and the preview drew three rings the run would never water.
+     * b573 papered over the consequence by matching pass counts on radius;
+     * the cause was having two ladders at all.
+     *
+     * ring_mm IS the ladder the run will sweep, so there is nothing left to
+     * derive. A ring the firmware scheduled for 0 passes is unwaterable and
+     * is dropped rather than drawn as an arc that never animates.
+     *
+     * ringThrows() stays as the fallback: Zone Setup has no run to ask about,
+     * and neither does a schedule card before its plan arrives. */
+    var rpIn = opts.ringPasses, rmIn = opts.ringMm;
+    var thr = null, fwPasses = null;
+    if (rmIn && rmIn.length && rpIn && rpIn.length === rmIn.length) {
+      thr = []; fwPasses = [];
+      for (var fq = 0; fq < rmIn.length; fq++) {
+        if (!(rmIn[fq] > 0) || !(rpIn[fq] > 0)) continue;
+        thr.push(rmIn[fq]); fwPasses.push(rpIn[fq]);
+      }
+      if (!thr.length) { thr = null; fwPasses = null; }
+    }
+    if (!thr) thr = ringThrows(points, actMax, actMin, arc, opts.coverage | 0);
     if (!thr.length) return null;
 
     var plan = planOrder(modeKey, thr.length, opts.pass || 0, !!opts.sequential);
@@ -353,7 +399,7 @@ R"PATHJS(
         visit: v,
         throw_mm: thr[ri],
         cw: plan.cw[v],
-        spans: ringSpans(points, arc, thr[ri])
+        spans: ringSpans(points, arc, thr[ri], P)
       });
     }
     /* b540: Sections reorders the visits lobe-major. Without this the preview
@@ -390,29 +436,32 @@ R"PATHJS(
      * With no ringPasses (or a length that does not line up with the ring
      * ladder) this degrades to the single pass it always drew, rather than
      * inventing a run. */
-    /* b573: match the firmware's pass counts to our rings BY RADIUS.
-     * Requiring the two ladders to be the same length meant one extra ring
-     * here -- the page had no act_min_throw, so it floored at a different
-     * radius -- silently threw the whole thing away and the preview drew a
-     * single pass. Nearest radius within half a pitch is unambiguous: the
-     * ladders differ at the ends, not in spacing. */
-    var rp = opts.ringPasses, rm = opts.ringMm;
-    var usePasses = !!(rp && rp.length);
+    /* b587: Zone Setup draws rings only and throws the move list away, but
+     * build() computed it anyway -- boundary-hug turns are point-in-polygon
+     * tested per 4 deg waypoint, so a 34-ring zone spent most of a 5 ms
+     * build on 139 moves nobody drew. That ran on every d-pad step, on a
+     * page whose responsiveness was the original complaint. Skip it. */
+    if (opts.ringsOnly) {
+      return {
+        moves: [], modeKey: modeKey,
+        modeLabel: (MODES[opts.mode] || MODES['1']).label,
+        arc: arc, lobes: 1, rings: rings, ringCount: thr.length, passes: 1,
+        coverage: opts.coverage | 0,
+        scale_mm: opts.scale_mm || (actMax + 914),
+        orderVaries: plan.orderVaries, noPath: false
+      };
+    }
+
+    /* b587: the ladder IS the firmware's now (see above), so a ring's pass
+     * count is just its own entry -- no radius matching, no tolerance, no
+     * way for the two to line up wrongly. b573's nearest-radius search
+     * existed only to reconcile two ladders that should never have been
+     * built separately. */
     var passFor = function (idx) {
-      if (!usePasses) return 1;
-      if (rm && rm.length === rp.length) {
-        var want = rings[idx].throw_mm;
-        var best = -1, bd = 1e9;
-        for (var q = 0; q < rm.length; q++) {
-          var d = Math.abs(rm[q] - want);
-          if (d < bd) { bd = d; best = q; }
-        }
-        return (best >= 0 && bd < pitch) ? rp[best] : 1;
-      }
-      return idx < rp.length ? rp[idx] : 1;
+      return fwPasses ? (fwPasses[rings[idx].ring] || 1) : 1;
     };
     var nPasses = 1;
-    if (usePasses) rp.forEach(function (v) { if (v > nPasses) nPasses = v; });
+    if (fwPasses) fwPasses.forEach(function (v) { if (v > nPasses) nPasses = v; });
     if (nPasses > 12) nPasses = 12;        /* a drawing, not an endurance test */
 
     var moves = [], prev = null;
@@ -440,7 +489,7 @@ R"PATHJS(
           var mto   = cwp ? (msp.lo + msp.span) : msp.lo;
           if (prev) {
             var turn = serpish
-              ? buildTurn(points, prev.deg, prev.r, mfrom, MR.throw_mm, turnFloor)
+              ? buildTurn(P, prev.deg, prev.r, mfrom, MR.throw_mm, turnFloor)
               : { wet: false };
             if (turn.wet) moves.push({ type: 'turn', from: prev, wps: turn.wps });
             else moves.push({ type: 'hop', from: prev,
@@ -460,6 +509,11 @@ R"PATHJS(
       arc: arc,
       lobes: sectioned ? (sectioned[sectioned.length - 1].lobe + 1) : 1,
       rings: rings,
+      /* b587: distinct rings, not ring VISITS. Sections visits each ring
+       * once per lobe, so rings.length is 42 where the ladder has 30, and
+       * the captions were reporting that as a ring count -- next to a plan
+       * note from the firmware that said 31. */
+      ringCount: thr.length,
       passes: nPasses,
       coverage: opts.coverage | 0,
       scale_mm: opts.scale_mm || (actMax + 914),
@@ -549,7 +603,15 @@ R"PATHJS(
     var segs = [];
     geom.moves.forEach(function (mv) {
       if (mv.type === 'sweep') {
-        var len = mv.r * (Math.abs(angDelta(mv.from, mv.to)) * Math.PI / 180);
+        /* b587: the span, NOT angDelta. build() writes from/to as lo and
+         * lo+span without wrapping, so their difference IS the arc; angDelta
+         * folds anything over 180 back into +/-180 and a 237 deg lobe was
+         * timed as 123. A full 360 ring -- a centred sprinkler, the common
+         * case for a round bed -- folded to exactly 0 and fell through to the
+         * 1 mm floor, so the marker crossed the whole ring in one frame while
+         * the run spends a minute on it. The picture was right and the
+         * playback was not, which is the one thing the play button is for. */
+        var len = mv.r * (Math.abs(mv.to - mv.from) * Math.PI / 180);
         segs.push({ dry: false, ring: mv.ring, visit: mv.visit, pass: mv.pass || 0,
                     r: mv.r, from: mv.from, to: mv.to, cw: mv.cw,
                     len: Math.max(len, 1) });
@@ -673,10 +735,16 @@ R"PATHJS(
     ctx.lineWidth = 1.5; ctx.setLineDash([]); ctx.stroke();
   }
 
-  var _lastThumbScale = 6000;   /* b571: last scale thumb() drew at */
-
+  /* b587: returns the geometry it drew (or null).
+   *
+   * Every caller was doing thumb(cv, pts, o) and then build(pts, o) again to
+   * read the ring count for the caption -- the same geometry computed twice
+   * per card, and two chances to pass slightly different opts and caption a
+   * picture with another picture's numbers. Nothing used the old return
+   * value (a marker point, or `true`), so handing back the geometry costs
+   * nothing and lets callers stop rebuilding. */
   function thumb(canvas, points, opts) {
-    if (!canvas || !canvas.getContext) return false;
+    if (!canvas || !canvas.getContext) return null;
     var ctx = canvas.getContext('2d');
     var W = canvas.width, H = canvas.height;
     ctx.clearRect(0, 0, W, H);
@@ -688,18 +756,19 @@ R"PATHJS(
     ctx.beginPath(); ctx.arc(cx, cy, maxR, 0, Math.PI * 2); ctx.fill();
 
     points = normPoints(points);
-    if (points.length < 2) return false;
+    if (points.length < 2) return null;
     var geom = build(points, opts);
-    if (!geom) return false;
+    if (!geom) return null;
 
-    /* Fit the thumbnail to the zone; full reach wastes most of the disc. */
+    /* Fit the thumbnail to the zone; full reach wastes most of the disc.
+     * b587: this scale is no longer stashed anywhere. b571 kept it in a
+     * module-level _lastThumbScale so the overlay could draw the live dot in
+     * a second pass at the same scale; that pass is gone -- thumb() draws it
+     * itself below, from the scale still in hand. (The original bug b571
+     * fixed was stashing it on `ov`, which is null until the overlay first
+     * opens, so the Water modal threw on open and the button did nothing.) */
     var zmax = Math.max.apply(null, points.map(function (p) { return p.throw_mm; }));
     var scale = Math.max(zmax * 1.12, 600);
-    /* b571: module-level, NOT ov.lastScale -- ov is null until the overlay
-     * is first opened, and thumb() runs well before that (the Water modal
-     * draws its thumbnail on open). Writing through the null threw inside
-     * openModal, so the modal never appeared and Water Zone did nothing. */
-    _lastThumbScale = scale;
 
     ctx.strokeStyle = 'rgba(120,140,130,.45)';
     ctx.lineWidth = 1;
@@ -716,20 +785,20 @@ R"PATHJS(
       ctx.font = '10px -apple-system,sans-serif';
       ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
       ctx.fillText(geom.modeKey === 'chase' ? 'no path' : 'demo', cx, cy);
-      return true;
+      return geom;
     }
-    var dopt = { cx: cx, cy: cy, maxR: maxR, scale_mm: scale, thumb: !!opts.thumb };
+    var dopt = { cx: cx, cy: cy, maxR: maxR, scale_mm: scale, thumb: !!opts.thumb,
+                 ringsOnly: !!opts.ringsOnly };
     draw(ctx, geom, dopt);
     /* Optional scrub marker (opts.scrub is 0..1). */
-    var at = null;
-    if (typeof opts.scrub === 'number') at = marker(ctx, flatten(geom), opts.scrub, dopt);
+    if (typeof opts.scrub === 'number') marker(ctx, flatten(geom), opts.scrub, dopt);
     /* Sprinkler at the centre. */
     ctx.fillStyle = 'rgba(0,232,122,.9)';
     ctx.beginPath(); ctx.arc(cx, cy, 2, 0, Math.PI * 2); ctx.fill();
 
     if (opts.live) drawLive(ctx, opts.live,
                             { cx: cx, cy: cy, maxR: maxR, scale_mm: scale });
-    return at || true;
+    return geom;
   }
 
   /* ── Shared full-screen preview ────────────────────────────────────────
@@ -751,7 +820,6 @@ R"PATHJS(
       '<div class="ipo-bar">' +
         '<span class="ipo-title"></span>' +
         '<span class="ipo-modes"></span>' +
-        '<button class="ipo-btn ipo-pass">Pass 1</button>' +
         '<button class="ipo-btn ipo-x" aria-label="Close">&#10005;</button>' +
       '</div>' +
       '<canvas class="ipo-cv" width="620" height="620"></canvas>' +
@@ -784,76 +852,51 @@ R"PATHJS(
       cv: el.querySelector('.ipo-cv'),
       title: el.querySelector('.ipo-title'),
       modes: el.querySelector('.ipo-modes'),
-      pass: el.querySelector('.ipo-pass'),
       play: el.querySelector('.ipo-play'),
       range: el.querySelector('input'),
       note: el.querySelector('.ipo-note'),
-      opts: null, mode: '7', passIdx: 0, t: 0, timer: null,
-      variants: [], passNoteText: ''
+      opts: null, mode: '7', t: 0, timer: null, playMs: 8000
     };
     el.addEventListener('click', function (e) { if (e.target === el) ovClose(); });
     ov.el.querySelector('.ipo-x').addEventListener('click', ovClose);
-    ov.pass.addEventListener('click', function () {
-      ov.passIdx = (ov.passIdx + 1) % Math.max(1, ov.variants.length);
-      ovPassLabel();
-      ovDraw();
-    });
     ov.range.addEventListener('input', function () { ov.t = +ov.range.value / 1000; ovDraw(); });
     ov.play.addEventListener('click', ovPlay);
     document.addEventListener('keydown', function (e) { if (e.key === 'Escape') ovClose(); });
     return ov;
   }
 
+  /* Playback pace.
+   *
+   * b569 made the scrubber walk the WHOLE run, but the timer still finished
+   * in a flat ~8 s, so a two-pass run played at double speed and a six-pass
+   * run at six times -- the longer the real run, the faster the preview of
+   * it. The play button is there to show what will happen, and the one thing
+   * it was reliably wrong about was how long.
+   *
+   * Pace it by the drawn path instead: a nominal 7 s for a single lap,
+   * growing with the number of passes, capped at 20 s so a long run is still
+   * watchable. Not real time -- a real run is minutes -- but monotonic in
+   * run length, so two runs compare the way they actually will.
+   */
+  var PLAY_BASE_MS = 7000, PLAY_MAX_MS = 20000, PLAY_TICK_MS = 33;
+
+  function ovPlayMs() {
+    var p = (ov.opts && ov.opts.ringPasses) || null, mx = 1;
+    if (p && p.length) for (var i = 0; i < p.length; i++) if (p[i] > mx) mx = p[i];
+    return Math.min(PLAY_MAX_MS, PLAY_BASE_MS * Math.sqrt(mx));
+  }
+
   function ovPlay() {
     if (ov.timer) { clearInterval(ov.timer); ov.timer = null; ov.play.innerHTML = '&#9654;'; return; }
+    if (ov.t >= 1) ov.t = 0;          /* replay from the start, not stuck at the end */
     ov.play.innerHTML = '&#9632;';
-    ov.timer = setInterval(function () {      /* ~8 s a pass, slow enough to follow */
-      ov.t += 1 / 240;
+    var step = PLAY_TICK_MS / ovPlayMs();
+    ov.timer = setInterval(function () {
+      ov.t += step;
       if (ov.t >= 1) { ov.t = 1; clearInterval(ov.timer); ov.timer = null; ov.play.innerHTML = '&#9654;'; }
       ov.range.value = Math.round(ov.t * 1000);
       ovDraw();
-    }, 33);
-  }
-
-  /* b544: show the DISTINCT pictures, not a pass count.
-   *
-   * b542 put the real caps on the button and they read as nonsense: "Pass 1
-   * of up to 30". Thirty is a safety ceiling on an adaptive loop that exits
-   * as soon as every ring meets target -- it is not a plan, and quoting it
-   * suggests the sprinkler intends thirty laps.
-   *
-   * It was also claiming variety that does not exist. Only two things change
-   * between passes: sweep direction, and for serpentine/sections whether the
-   * rings run outward or inward. Both flip every pass, so pass 3 is pass 1
-   * again. There are at most TWO different pictures for any mode, and Pulse
-   * repeats one picture depth8 times.
-   *
-   * So the control steps between those, labelled by what actually differs,
-   * and the repeat count is stated in words instead of as a fake total. */
-  function passVariants(modeKey) {
-    if (modeKey === 'chase' || modeKey === 'demo') return [];
-    if (modeKey === 'pulse') return [];               /* every pass identical */
-    if (modeKey === 'serpentine' || modeKey === 'sections')
-      return ['Outer \u2192 in', 'Inner \u2192 out'];
-    return ['Sweep one way', 'Sweep back'];           /* gentle, smooth */
-  }
-
-  /* What the run actually does with those, in plain words. */
-  function passNote(modeKey, depth8) {
-    var d = (depth8 >= 1 && depth8 <= 8) ? depth8 : 1;
-    if (modeKey === 'chase' || modeKey === 'demo') return '';
-    if (modeKey === 'pulse')
-      return d > 1 ? 'Repeats this pass ' + d + ' times' : 'One pass';
-    if (modeKey === 'smooth')
-      return 'Alternates until every ring reaches the target depth; the ring '
-           + 'order is chosen during the run';
-    return 'Alternates until every ring reaches the target depth';
-  }
-
-  function ovPassLabel() {
-    var v = ov.variants;
-    ov.pass.textContent = v.length ? v[ov.passIdx % v.length] : '';
-    if (ov.note) ov.note.textContent = ov.passNoteText || '';
+    }, PLAY_TICK_MS);
   }
 
   function ovClose() {
@@ -864,7 +907,9 @@ R"PATHJS(
 
   function ovDraw() {
     var o = {
-      mode: ov.mode, pass: ov.passIdx, scrub: ov.t,
+      /* pass 0: build() walks every pass itself from ringPasses, so the
+       * per-pass variant this used to select no longer exists. */
+      mode: ov.mode, pass: 0, scrub: ov.t,
       act_max_throw: ov.opts.act_max_throw, act_min_throw: ov.opts.act_min_throw,
       /* b564: without this the overlay drew Standard ring spacing whatever
        * the zone was set to -- the Sections preview in particular looked
@@ -874,15 +919,15 @@ R"PATHJS(
       /* b569: the scrubber now walks the WHOLE run, every pass, so there is
        * nothing left for a pass stepper to step through. */
       ringPasses: ov.opts.ringPasses,
-      ringMm: ov.opts.ringMm
+      ringMm: ov.opts.ringMm,
+      /* b587: hand the live position to thumb() instead of drawing it again
+       * afterwards. The second call re-derived the same centre and radius
+       * from the canvas and reused _lastThumbScale to get back the scale
+       * thumb() had just computed -- two places that had to stay in step
+       * about where the disc is, for one dot. */
+      live: ov.opts.live
     };
-    var at = thumb(ov.cv, ov.opts.points, o);
-    if (ov.opts.live) {
-      var c = ov.cv, W = c.width, H = c.height;
-      drawLive(c.getContext('2d'), ov.opts.live,
-               { cx: W / 2, cy: H / 2, maxR: Math.min(W, H) / 2 - 2,
-                 scale_mm: _lastThumbScale || 6000 });
-    }
+    thumb(ov.cv, ov.opts.points, o);
     var label = (MODES[ov.mode] || {}).label || '';
     ov.title.textContent = (ov.opts.title ? ov.opts.title + ' \u00b7 ' : '') + label;
     /* b572: no per-frame readout here. It was a monospace span in the same
@@ -900,11 +945,9 @@ R"PATHJS(
     ov.opts = opts;
     ov.opts.points = pts;
     ov.mode = MODES[opts.mode] ? opts.mode : '7';
-    ov.passIdx = 0; ov.t = 0; ov.range.value = 0;
-    var mk = (MODES[ov.mode] || MODES['1']).key;
-    ov.variants = [];
-    ov.passNoteText = '';
-    ov.pass.style.display = 'none';   /* b569: the scrub covers every pass */
+    ov.t = 0; ov.range.value = 0;
+    if (ov.timer) { clearInterval(ov.timer); ov.timer = null; }
+    ov.play.innerHTML = '&#9654;';
     /* Locked: the caller already chose the mode, so show it as a static chip
      * rather than letting the preview disagree with the run that will happen. */
     ov.modes.innerHTML = '';

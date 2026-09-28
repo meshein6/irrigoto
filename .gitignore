@@ -61,3 +61,4 @@ Documents/
 # Device calibration/state snapshots pulled by push.sh before an OTA.
 # Per-unit data (zone geometry, cal points) — keep local.
 cal-backups/
+.claude/

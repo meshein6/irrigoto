@@ -469,16 +469,42 @@ const SCHED_MODE_DIGIT = {0:'1', 1:'5', 2:'7', 3:'8', 4:'9'};
 
 // b536: same overlay as Zone Setup and the Water modal, with the mode LOCKED
 // to this entry's -- the preview must match the run the entry will do.
-function openEntryPreview(idx){
+// b587: show the WHOLE run here too.
+//
+// The Water modal has drawn every pass since b569, but this one still drew a
+// single lap -- so the same zone at the same depth looked like a different,
+// shorter job depending on which page you opened it from. A schedule entry
+// is a run with a mode and a depth already chosen, which is exactly the case
+// ring_passes describes.
+//
+// The plan is fetched on open rather than for every card: the thumbnails are
+// 56 px and a multipass drawing at that size is a smudge, and prefetching
+// would be one request per entry for a picture most are never opened.
+const _entryPlan = {};                       // keyed "zone:depth"
+async function openEntryPreview(idx){
   const e = state.entries[idx];
   const z = e && zoneGeom[e.zone - 1];
   if (!e || !z || !z.points || z.points.length < 2 || typeof IrrigotoPath === 'undefined') return;
-  IrrigotoPath.openPreview({
+
+  const key = (e.zone - 1) + ':' + e.depth;
+  const show = (plan) => IrrigotoPath.openPreview({
     points: z.points, act_max_throw: z.act_max_throw, act_min_throw: z.act_min_throw,
     mode: String(SCHED_MODE_DIGIT[e.mode] || '1'), lockMode: true, depth8: e.depth,
     coverage: (z && z.coverage) | 0,   // b564: draw the zone's real ring pitch
+    ringPasses: plan && plan.ring_passes,
+    ringMm:     plan && plan.ring_mm,
     title: z.name || ('Zone ' + e.zone),
   });
+  show(_entryPlan[key]);                     // open now, on whatever we have
+  if (_entryPlan[key]) return;
+  try {
+    const p = await fetch('/api/run_plan?zone=' + (e.zone - 1) + '&depth=' + e.depth,
+                          {cache:'no-store'}).then(r => r.json());
+    if (p && p.ok && p.ring_passes && p.ring_passes.length) {
+      _entryPlan[key] = p;
+      if (IrrigotoPath.isOpen()) show(p);    // still open? redraw with the real plan
+    }
+  } catch(err) { /* the single-lap drawing is already up */ }
 }
 
 function drawEntryPath(cv){
@@ -494,12 +520,11 @@ function drawEntryPath(cv){
   }
   if (wrap) wrap.style.display = 'flex';
   const o = entryPathOpts(e);
-  IrrigotoPath.thumb(cv, z.points, o);
+  const g = IrrigotoPath.thumb(cv, z.points, o);   // b587: returns the geometry
   cv.dataset.drawn = '1';
-  const g = IrrigotoPath.build(z.points, o);
   const note = wrap && wrap.querySelector('.ep-note b');
   if (note) note.textContent = (MODE_LABELS[e.mode] || 'Path') + ' path'
-    + (g && g.rings.length ? ' \u00b7 ' + g.rings.length + ' rings' : '');
+    + (g && g.ringCount ? ' \u00b7 ' + g.ringCount + ' rings' : '');
 }
 
 function drawVisiblePaths(){

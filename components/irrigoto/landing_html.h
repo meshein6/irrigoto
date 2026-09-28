@@ -224,6 +224,27 @@ section{margin-bottom:18px;}
 .run-vol{font-family:'Courier New',monospace;color:var(--green);text-align:right;
   white-space:nowrap;flex-shrink:0;}
 .run-vol.bad{color:var(--orange);}
+
+/* b587: Upcoming runs. Deliberately the same row geometry as the history
+   above it -- the two are read together ("it watered at 6, it waters again
+   at 6"), and a different layout for each would make that comparison work. */
+.up-row{display:flex;gap:8px;padding:7px 0;border-bottom:1px solid var(--border);
+  align-items:baseline;font-size:12px;}
+.up-row:last-child{border-bottom:none;}
+.up-row.next .up-when{color:var(--green);}
+/* Wider than .run-when and nowrap: history rows are fixed-width dates, but
+   these say "Tomorrow 06:00", which wrapped onto a second line at 86px and
+   made that one row twice as tall as its neighbours. */
+.up-when{color:var(--text-mid);font-family:'Courier New',monospace;font-size:11px;
+  width:98px;flex-shrink:0;white-space:nowrap;}
+.up-what{flex:1;min-width:0;}
+.up-what small{display:block;color:var(--text-mid);font-size:11px;}
+.up-in{font-family:'Courier New',monospace;color:var(--text-mid);text-align:right;
+  white-space:nowrap;flex-shrink:0;font-size:11px;}
+.up-sol{color:var(--green);}
+.up-nosol{color:var(--text-dim);}
+.up-delay{color:var(--orange);font-size:11px;margin-bottom:6px;}
+
 /* Path preview (b535) */
 #path-row{display:flex;gap:12px;align-items:center;margin:0 0 14px;}
 #path-thumb{flex-shrink:0;cursor:pointer;border-radius:50%;}
@@ -292,6 +313,13 @@ section{margin-bottom:18px;}
       <a class="sec-btn" href="/schedule">Edit</a>
     </div>
     <div id="sched-summary" class="card"><div class="empty">No schedules configured.</div></div>
+  </section>
+  <section>
+    <div class="sec-hdr">
+      <span class="sec-title">Upcoming</span>
+      <a class="sec-btn" href="/schedule">Edit</a>
+    </div>
+    <div class="card" id="upcoming-card"><div class="empty">Loading&hellip;</div></div>
   </section>
   <section>
     <div class="sec-hdr">
@@ -939,13 +967,18 @@ function refreshRunPlan(){
       _lastPlan = p;
       renderPathThumb();   // the thumbnail is the whole run, so it moves too
       const mins = p.est_min >= 1 ? Math.round(p.est_min) + ' min' : '< 1 min';
+      // b587: say where the number came from. The ring model over-predicts
+      // this hardware by about 2x, so once a zone has actually run, the
+      // measured duration is used instead -- and a number sourced from a
+      // real run deserves to be labelled as one.
+      const src = p.est_from_history ? ' (from the last run)' : ' (estimated)';
       if (p.clamp === 'none') {
         el.className = 'plan-ok';
-        el.textContent = 'One pass \u00b7 about ' + mins + ' \u00b7 sweep ' +
+        el.textContent = 'One pass \u00b7 about ' + mins + src + ' \u00b7 sweep ' +
                          p.dps_min.toFixed(0) + '\u2013' + p.dps_max.toFixed(0) + '\u00b0/s';
       } else {
         el.className = 'plan-warn';
-        el.textContent = p.advice + ' About ' + mins + ' total.';
+        el.textContent = p.advice + ' About ' + mins + src + ' total.';
       }
     })
     .catch(() => { el.textContent = ''; el.className = ''; });
@@ -1167,6 +1200,100 @@ async function loadRuns(){
   }).join('');
 }
 
+// ── Upcoming runs (b587) ────────────────────────────────────────────────────
+//
+// The Schedule card says what is configured and History says what happened;
+// neither answers "what is about to run", which is the question asked before
+// going away for a weekend or after setting a rain delay. next_run gives one
+// answer and not the shape of the week.
+//
+// The list comes from /api/upcoming rather than being expanded here, because
+// three of the four rules it has to get right already live on the device and
+// nowhere else: the day-mask walk across a DST boundary, the rain delay that
+// suppresses everything before it, and the per-entry solution rotation
+// counters (which the page cannot see at all). A second implementation in
+// JavaScript would be a second set of answers.
+const SCHED_MODE_LABELS = ['Pulse','Gentle','Smooth','Serpentine','Sections'];
+
+// Day name when it is further out than "tomorrow" -- "Wed 06:00" reads
+// better than a bare date for anything inside the coming week.
+const UP_DAY = ['Sun','Mon','Tue','Wed','Thu','Fri','Sat'];
+function fmtUpcomingWhen(epoch, tz, now){
+  const loc  = new Date((epoch + tz*60) * 1000);
+  const hm   = String(loc.getUTCHours()).padStart(2,'0') + ':' +
+               String(loc.getUTCMinutes()).padStart(2,'0');
+  // Midnight-to-midnight in the device's zone, so "today" means its today.
+  const day  = d => Math.floor((d + tz*60) / 86400);
+  const dd   = day(epoch) - day(now);
+  if (dd <= 0) return 'Today ' + hm;
+  if (dd === 1) return 'Tomorrow ' + hm;
+  if (dd < 7)  return UP_DAY[loc.getUTCDay()] + ' ' + hm;
+  return (loc.getUTCMonth()+1) + '/' + loc.getUTCDate() + ' ' + hm;
+}
+
+// How far off, as a plain duration.
+//
+// NOT relTimeFromSec: that buckets 24-48 h as "tomorrow", which is elapsed
+// hours and not the calendar. At 17:14 a Tuesday 06:00 run is 37 h out, so
+// the row read "Tue 06:00 ... tomorrow" -- the two columns contradicting
+// each other about the same run. The left column already names the day, so
+// this one only has to say how long.
+function fmtUpcomingIn(sec){
+  if (sec < 60)    return 'now';
+  if (sec < 3600)  return Math.round(sec/60) + ' min';
+  if (sec < 86400) return Math.round(sec/3600) + ' h';
+  const d = sec / 86400;
+  return (d < 10 ? d.toFixed(d < 2 ? 1 : 0) : Math.round(d)) + ' d';
+}
+
+async function loadUpcoming(){
+  const el = document.getElementById('upcoming-card');
+  if (!el) return;
+  let d;
+  try { d = await fetch('/api/upcoming?n=5', {cache:'no-store'}).then(r => r.json()); }
+  catch(e){ return; }                 // leave the last good list up
+  if (!d || !d.ok) return;
+  const tz = d.tz_offset_min || 0, now = d.now || 0;
+  const runs = d.runs || [];
+
+  let head = '';
+  if (d.delay_until && d.delay_until > now)
+    head = '<div class="up-delay">\u23f8 Watering delayed until ' +
+           escHtml(fmtLocalEpoch(d.delay_until, tz)) + '</div>';
+
+  if (!runs.length){
+    // Three different reasons for an empty list, and they need different
+    // words. "Nothing scheduled" when the device simply has no clock yet
+    // would be a wrong answer confidently given.
+    const why = (d.clock === false)
+      ? 'Waiting for the clock to sync \u2014 no run times yet.'
+      : head ? 'Nothing scheduled after the delay.'
+      : d.entries ? 'No enabled schedule entries.'
+      : 'Nothing scheduled. <a href="/schedule" style="color:var(--green)">Add a schedule &rarr;</a>';
+    el.innerHTML = head + '<div class="empty">' + why + '</div>';
+    return;
+  }
+
+  el.innerHTML = head + runs.map((r, i) => {
+    const mode  = SCHED_MODE_LABELS[r.mode] || '';
+    const depth = DEPTH_LABELS[r.depth] || '';
+    const est   = r.est_min > 0 ? ' \u00b7 ~' + r.est_min + ' min' : '';
+    // bottle 0 = this occurrence does not dose. Say so rather than leaving a
+    // blank that reads the same as "bottles are switched off entirely".
+    const sol = r.bottle
+      ? ' \u00b7 <span class="up-sol" title="Solution from bottle ' + r.bottle + '">\u2697 B'
+        + r.bottle + '</span>'
+      : '';
+    return '<div class="up-row' + (i === 0 ? ' next' : '') + '">' +
+      '<span class="up-when">' + escHtml(fmtUpcomingWhen(r.epoch, tz, now)) + '</span>' +
+      '<span class="up-what">' + escHtml(r.name || ('Zone ' + r.zone)) +
+        '<small>' + escHtml(mode) + (depth ? ' ' + depth : '') + est + sol + '</small>' +
+      '</span>' +
+      '<span class="up-in">' + escHtml(fmtUpcomingIn(r.epoch - now)) + '</span>' +
+    '</div>';
+  }).join('');
+}
+
 // ── Path preview (b535) ─────────────────────────────────────────────────────
 const PATH_DESC = {
   pulse:      'Outer ring inward, one ring at a time, always the same way round. Dashed lines are the dry swing back to the next ring.',
@@ -1195,14 +1322,15 @@ function renderPathThumb(){
   if (!pts || pts.length < 2) { row.style.display = 'none'; return; }
   row.style.display = 'flex';
   const o = zonePathOpts(0); o.thumb = true;
-  IrrigotoPath.thumb(document.getElementById('path-thumb'), pts, o);
-  const g = IrrigotoPath.build(pts, o);
+  // b587: one build, not two -- thumb() hands back what it drew, so the
+  // caption cannot end up describing a different geometry than the picture.
+  const g = IrrigotoPath.thumb(document.getElementById('path-thumb'), pts, o);
   const m = IrrigotoPath.MODES[selModeDat];
   // b539: never invent a description. If the geometry didn't resolve, say so
   // rather than falling back to Pulse's text for every mode -- which made all
   // the modes look identical. An unknown mode means a stale cached path.js.
   document.getElementById('path-mode').textContent = m
-    ? m.label + ' path' + (g && g.rings.length ? ' \u00b7 ' + g.rings.length + ' rings' : '')
+    ? m.label + ' path' + (g && g.ringCount ? ' \u00b7 ' + g.ringCount + ' rings' : '')
     : 'Path preview unavailable';
   document.getElementById('path-desc').textContent = !m
     ? 'This page is running an old cached script. Reload to update.'
@@ -1282,7 +1410,8 @@ async function reconnectNet(){
 updateWifiButtons();
 
 solLoadRates();
-loadRuns();   // b535
+loadRuns();       // b535
+loadUpcoming();   // b587
 async function refresh(){
   try{
     const d=await fetch('/api/all').then(r=>r.json());
@@ -1350,11 +1479,21 @@ let lastWaterMode = 0;
 // dot -- so this pulls the much smaller /api/status instead, and only while
 // something is running. It stops itself the moment the run ends.
 let _liveTimer = null;
+// b587: a generation counter, so only the newest poll loop survives.
+//
+// The loop rescheduled itself on `if (_liveTimer)`, which is truthy for the
+// timer that just fired as well as for a fresh one. openLiveView() restarts
+// the poll to get an immediate frame, and if it did that while a fetch was
+// in flight, the in-flight tick woke up, saw a (new) timer, and scheduled a
+// SECOND loop. Every reopen doubled the poll rate for the rest of the run.
+let _liveGen = 0;
 function startLivePoll(){
   if (_liveTimer) return;
+  const gen = ++_liveGen;
   const tick = async () => {
     try {
       const st = await fetch('/api/status', {cache:'no-store'}).then(r => r.json());
+      if (gen !== _liveGen) return;          // superseded while awaiting
       if (!st.watering) { stopLivePoll(); return; }
       _live = { deg: st.live_deg, throw_mm: st.live_throw_mm,
                 throw_act: st.live_throw_act, ring: st.live_ring,
@@ -1366,12 +1505,13 @@ function startLivePoll(){
       if (typeof IrrigotoPath !== 'undefined' && IrrigotoPath.isOpen())
         IrrigotoPath.updateLive(_live);
     } catch(e) { /* a dropped poll is not worth a visible error */ }
+    if (gen !== _liveGen) return;
     // b582: 0.5 s while the live view is open -- the device samples about
     // every 140 ms at these sweep speeds, so half a second actually shows
     // movement. When the overlay is closed only the watering-bar label needs
     // refreshing, so back off rather than poll at 2 Hz for a line of text.
     const open = (typeof IrrigotoPath !== 'undefined') && IrrigotoPath.isOpen();
-    if (_liveTimer) _liveTimer = setTimeout(tick, open ? 500 : 2000);
+    _liveTimer = setTimeout(tick, open ? 500 : 2000);
   };
   _liveTimer = setTimeout(tick, 0);
 }
@@ -1381,21 +1521,50 @@ function startLivePoll(){
 // run. b581 moved it onto the zone card radar, which works but paints over
 // the zone outline for the whole run. This opens the big shared overlay on
 // demand instead, and the card stays as it was.
-function openLiveView(id){
+// b587: draw the plan the RUN is executing, fetched from the device.
+//
+// This used to reach for _lastPlan -- /api/run_plan's answer for whichever
+// zone and depth the Water modal happened to be showing. For a scheduled run
+// that is the wrong zone or the wrong depth, and if the modal was never
+// opened it is null, so the overlay drew ONE lap over a multi-pass run and
+// the live dot wandered off the path it was supposedly following. The device
+// now publishes its own fixed schedule; that is what gets drawn.
+let _livePlan = null;
+async function openLiveView(id){
   const z = _zoneCache && _zoneCache[id];
   if (!z || !z.points || z.points.length < 2 || typeof IrrigotoPath === 'undefined') return;
-  IrrigotoPath.openPreview({
+
+  // Open immediately on whatever we have -- a tap should not wait on a fetch.
+  const show = (plan) => IrrigotoPath.openPreview({
     points: z.points,
     act_max_throw: z.act_max_throw, act_min_throw: z.act_min_throw,
     coverage: z.coverage | 0,
-    mode: String(lastWaterMode || 9), lockMode: true, depth8: selDepth,
-    ringPasses: _lastPlan && _lastPlan.ring_passes,
-    ringMm:     _lastPlan && _lastPlan.ring_mm,
+    // The running mode, not a guess. lastWaterMode comes from /api/all; the
+    // plan carries it too and is the more direct source when present.
+    mode: String((plan && plan.mode) || lastWaterMode || 9),
+    lockMode: true,
+    depth8: (plan && plan.depth8) || selDepth,
+    ringPasses: plan && plan.ring_passes,
+    ringMm:     plan && plan.ring_mm,
     live: _live,
     title: (z.name || ('Zone ' + id)) + ' \u00b7 live'
   });
+  show(_livePlan);
   // Don't make the user wait out the slow tick for the first frame.
   if (_liveTimer) { clearTimeout(_liveTimer); _liveTimer = null; startLivePoll(); }
+
+  // Then upgrade to the real plan. It is fixed at run start, so once is
+  // enough -- only the position needs polling.
+  if (_livePlan) return;
+  try {
+    const p = await fetch('/api/live_plan', {cache:'no-store'}).then(r => r.json());
+    // running:false means an adaptive mode with no up-front schedule; leave
+    // the single-lap drawing rather than claiming passes nobody planned.
+    if (p && p.ok && p.running && p.ring_passes && p.ring_passes.length) {
+      _livePlan = p;
+      if (IrrigotoPath.isOpen()) show(p);
+    }
+  } catch(e) { /* the overlay is already up on the fallback */ }
 }
 
 // b583: no per-update annotations on the card. They rewrote the watering bar
@@ -1407,11 +1576,18 @@ function openLiveView(id){
 function stopLivePoll(){
   if (_liveTimer) clearTimeout(_liveTimer);
   _liveTimer = null;
+  _liveGen++;                 // b587: orphan any tick still awaiting its fetch
+  _livePlan = null;
   if (_live) { _live = null; renderPathThumb(); }
 }
 
 function updateWateringState(watering, mode, estMin, waterZoneId, cleanupPass) {
   if (watering) startLivePoll(); else stopLivePoll();
+  // b587: a run that just ended changes both cards below -- History gains a
+  // row, and Upcoming moves on (the solution rotation advanced, and the next
+  // estimate is now seeded from a real measured duration). Refresh on the
+  // edge rather than waiting out the 30 s tick.
+  if (lastWateringState && !watering) { loadRuns(); loadUpcoming(); }
   lastWateringState = !!watering;
   lastCleanupPass   = cleanupPass || 0;
   lastWaterMode     = watering ? (mode || 0) : 0;
@@ -1676,7 +1852,11 @@ async function refreshSchedule(){
     // Silent — leave whatever was there. The /schedule page surfaces the real error.
   }
 }
-refreshSchedule(); setInterval(refreshSchedule, 30000);
+// b587: the upcoming list is schedule-derived, so it refreshes on the same
+// cadence. It also moves when a run finishes -- the solution rotation
+// advances -- which updateWateringState picks up.
+refreshSchedule(); loadUpcoming();
+setInterval(() => { refreshSchedule(); loadUpcoming(); }, 30000);
 </script>
 </body>
 </html>
