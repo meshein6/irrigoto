@@ -16203,11 +16203,15 @@ static esp_err_t api_theme_handler(httpd_req_t *req)
 
 // b437: POST /api/time  body: epoch=<unix UTC seconds>[&tz=<offset minutes>]
 // Lets the phone's browser set the device clock with zero configuration --
-// every web page POSTs its Date.now() on load. This is the standalone /
-// AP-mode time source (no HA, no NTP, no internet): the phone keeps accurate
-// time on its own, and one visit is enough to arm the schedule. Only applies
-// when the device clock is unset or has drifted > 30 s, so it never fights
-// HA's continuous sync when HA is present. The system clock is UTC; local
+// every web page POSTs its Date.now() on load. Only applies when the device
+// clock is unset or has drifted > 30 s, so it never fights a continuous sync.
+//
+// This is the LAST-RESORT source, for AP-mode setup with no internet and no
+// HA. It was written as "the standalone time source", and that is how a
+// standalone unit ended up with no clock at all between page visits: a
+// browser that has to be opened is not a time source for an unattended
+// schedule. SNTP (esphome/irrigoto-core.yaml) is the autonomous one; HA
+// covers units that have it. The system clock is UTC; local
 // interpretation uses the configured timezone (device_timezone), so tz is
 // accepted but currently informational.
 static esp_err_t api_time_handler(httpd_req_t *req)
@@ -21146,7 +21150,27 @@ static void schedule_task(void *arg)
     while (true) {
         time_t now = time(NULL);
         if (s_winter_sleep) goto sleep_poll;    // b525: no unattended watering
-        if (now < 1700000000) goto sleep_poll;  // clock-based path needs time
+        if (now < 1700000000) {
+            // Clock-based path needs time. This used to be a bare `goto` and
+            // it failed SILENTLY: a unit with no time source simply never
+            // watered, with nothing in the log to say why, and the first
+            // evidence was a dry lawn. Say it, once every 5 minutes, and only
+            // when there is actually a schedule being suspended -- a unit with
+            // no entries is not waiting on anything.
+            static TickType_t s_noclock_warn = 0;
+            TickType_t nowt = xTaskGetTickCount();
+            if (s_schedule.count > 0
+                    && (s_noclock_warn == 0
+                        || (nowt - s_noclock_warn) > pdMS_TO_TICKS(300000))) {
+                s_noclock_warn = nowt;
+                ESP_LOGW(TAG, "Schedule SUSPENDED: clock not set (%d entr%s "
+                         "waiting). Needs SNTP, Home Assistant, or a browser "
+                         "visit to set it.",
+                         (int)s_schedule.count,
+                         s_schedule.count == 1 ? "y" : "ies");
+            }
+            goto sleep_poll;
+        }
         time_t delay_until = irrigoto_schedule_get_delay_until();
         if (delay_until > now) goto sleep_poll;
         for (uint8_t i = 0; i < s_schedule.count; i++) {

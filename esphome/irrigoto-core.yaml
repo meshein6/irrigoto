@@ -334,14 +334,40 @@ api:
         - lambda: |-
             id(irrigoto_hw).delay_schedule_hours(hours);
 
-# Time source — HA syncs the device's system clock via the API. Cloud-free:
-# no NTP, no internet. Survives WiFi/HA outages on the ESP32 RTC until the
-# next reconnect; the schedule executor checks time(NULL) > 1.7e9 before
-# firing so it won't trigger off a never-set clock.
+# Time source. HA syncs the system clock via the API; SNTP covers the unit
+# that has no HA. The web pages also POST /api/time on load, which is the
+# last-resort source for AP-mode setup with no internet at all -- not a
+# substitute for either of these. The schedule executor checks
+# time(NULL) > 1.7e9 before firing, so it never triggers off an unset clock.
 time:
   - platform: homeassistant
     id: ha_time
     timezone: "${device_timezone}"
+  # SNTP, because "cloud-free, no NTP" turned out to mean "no clock" for
+  # anyone not running Home Assistant.
+  #
+  # HA was the only autonomous source. On a standalone unit the clock came
+  # solely from a browser POSTing /api/time on page load -- so it looked
+  # correct whenever someone was looking at it, which is exactly when it does
+  # not matter. Restart the device unattended and it comes up with
+  # time(NULL) at zero; every schedule path then bails on the
+  # `now < 1700000000` guard. No firing, no catch-up, and no schedule-aware
+  # sleep to wake it for the run. Observed: a 06:00 daily entry silently did
+  # not run, and was recorded as MISSED at 08:36 the next morning -- the
+  # moment someone opened the page and the browser handed the clock back.
+  #
+  # A schedule whose clock depends on someone opening a web page is not a
+  # schedule. This costs nothing where HA is present: both platforms set the
+  # same system clock, and whichever syncs first wins. Where there is no
+  # internet either (AP-mode setup, isolated VLAN), SNTP simply never syncs
+  # and /api/time remains the fallback, as before.
+  - platform: sntp
+    id: sntp_time
+    timezone: "${device_timezone}"
+    servers:
+      - 0.pool.ntp.org
+      - 1.pool.ntp.org
+      - 2.pool.ntp.org
 
 # OTA updates via ESPHome (replaces the custom curl-push OTA)
 ota:
