@@ -159,6 +159,11 @@ static struct {
     volatile bool  task_alive;
     bool           started;      /* pump ran at least once this run */
     uint32_t       pump_ms;      /* accumulated pump-on time */
+    /* b599: "an entry's run is in progress", as distinct from "a dose is
+     * armed". Every Nth run has to count the runs it does NOT dose on, and
+     * the only state saying which entry is running used to be set by arm() --
+     * which a non-dosing run never calls. See solution_arm_entry(). */
+    bool           counting;
 } s_run;
 
 static uint8_t popcount3(uint8_t m) { return (m & 1) + ((m >> 1) & 1) + ((m >> 2) & 1); }
@@ -397,6 +402,25 @@ void solution_arm_entry(const schedule_entry_t *e)
         if (rt && rt->runs_since + 1 < n) {
             ESP_LOGI(TAG, "entry %lu: run %u of %u -- no dose this time",
                      (unsigned long)e->id, rt->runs_since + 1, n);
+            /* b599: keep counting.
+             *
+             * This used to be a bare return, and solution_on_run_end() opens
+             * with `if (!s_run.armed) return;` -- armed being set only by
+             * arm(), which this path never reaches. So runs_since was only
+             * ever advanced by a run that HAD decided to dose, and the
+             * decision to dose depended on runs_since. Circular: with
+             * every_n = 5 and runs_since = 0, every run skipped, nothing
+             * incremented, and the entry never dosed at all. Not "late" --
+             * never.
+             *
+             * Mark the run as one this entry owns so its completion advances
+             * the counter. Deliberately not `armed`: that means a dose is
+             * coming, drives the pump task and is what solution_armed()
+             * reports. Nothing here doses. */
+            memset(&s_run, 0, sizeof(s_run));
+            s_run.entry_id = e->id;
+            s_run.counting = true;
+            s_run.phase    = PH_IDLE;
             return;
         }
     }
@@ -465,7 +489,10 @@ void solution_arm_manual(uint8_t bottle, const solution_cfg_t *cfg)
 
 void solution_note_flow(void)
 {
-    if (s_run.armed) s_run.flow = true;
+    /* b599: a counting-only run needs this too -- runs_since advances on
+     * `else if (s_run.flow)`, so without it a skipped run would still not
+     * count even once it is tracked. */
+    if (s_run.armed || s_run.counting) s_run.flow = true;
 }
 
 /* Every exit path lands here. Also called by arm() to clear a stale run and
@@ -477,7 +504,9 @@ void solution_on_run_end(void)
         for (int i = 0; i < 30 && s_run.task_alive; i++) vTaskDelay(pdMS_TO_TICKS(10));
     }
     pump_stop();
-    if (!s_run.armed) return;
+    /* b599: a counting-only run has no dose to tear down but still owes the
+     * rotation counters an increment. */
+    if (!s_run.armed && !s_run.counting) return;
 
     if (s_run.entry_id) {
         sol_rt_entry_t *rt = rt_find(s_run.entry_id, true);
@@ -506,8 +535,9 @@ void solution_on_run_end(void)
     } else {
         s_last.bottle = 0; s_last.ml = 0.0f; s_last.pump_s = 0;
     }
-    s_run.armed = false;
-    s_run.phase = PH_IDLE;
+    s_run.armed    = false;
+    s_run.counting = false;
+    s_run.phase    = PH_IDLE;
 }
 
 /* ── Public: status ───────────────────────────────────────────────────────── */
