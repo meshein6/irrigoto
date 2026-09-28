@@ -442,6 +442,82 @@ The 24 KB log ring drops the **oldest** bytes, and the oldest bytes are the
 plan. 1.5 KB of pinned head now survives the wrap in both the served and the
 persisted copy, so a completed run's log still carries its schedule.
 
+## Review pass (b587-b593)
+
+### There were two ring ladders
+
+`/api/all` never published `act_max_throw` or `act_min_throw`, though
+`/zone/state` always has. So `path.js` fell back to its built-in 10058 mm
+where this unit's calibration says **8424** — a 16% error in the ring pitch,
+on every page that draws a ladder. The Water modal drew **34 rings** under a
+plan note that said **31**.
+
+Publishing the two numbers fixes the fallback, but the real problem was
+having two ladders at all. Where the firmware has published `ring_mm`, the
+preview now draws **that**, and a ring scheduled for zero passes is dropped
+rather than drawn as an arc that never animates. b573's nearest-radius pass
+matching existed only to reconcile two ladders that should never have been
+built separately; it is gone.
+
+Captions counted ring *visits*, so Sections reported 42 where the ladder has
+30 — `geom.ringCount` is the distinct count. `run_plan`'s advice paired a
+waterable-only numerator with an all-rings denominator; it counts waterable
+rings now (`rings_wet`).
+
+### The estimate was twice the measured run
+
+The preview summed sweeps only; the executor also charged 2.5 s per
+ring-pass and a 25 s tail. Making them agree made both wrong:
+
+| | 31-ring Sections @ 1/8" |
+|---|---|
+| measured (b583, b573) | **3.4 min, 4.1 min** |
+| model, sweeps only | 4.9 min |
+| model + overhead + tail | 7.1 min |
+
+The sweep term *alone* (294 s) exceeds the whole measured run (206 s), so no
+overhead term reconciles them: `run_plan_active_deg` integrates over wider
+arcs than `serpentine_arc_bounds` actually sweeps. **That is still open** —
+diagnosing it needs a run to compare against.
+
+What is fixed is which number gets quoted. b578 replaced a history-anchored
+estimate with the model for serpentine and sections; pulse, gentle and smooth
+never stopped preferring history (b298: *"when we have history, history
+wins"*). `water_est_run_secs()` restores that rule for the deterministic
+modes and is called by **both** the executor and the preview — one answer,
+**3.6 min** against measured 3.4–4.1. The page says which source it used.
+
+### The live view drew the wrong plan
+
+It reached for whatever `/api/run_plan` last returned for the Water modal's
+selection — the wrong zone for a scheduled run, or `null` if the modal was
+never opened, in which case it drew one lap over a multi-pass run. The
+executor now publishes the schedule it is executing (`/api/live_plan`), fixed
+at run start, fetched once. The schedule editor's full-screen preview also
+shows the whole run rather than a single lap.
+
+The live poll rescheduled itself on a truthy timer handle, so reopening the
+view while a fetch was in flight left **two** loops running and doubled the
+poll rate for the rest of the run.
+
+### Geometry
+
+Every test re-derived each vertex from `(deg, throw_mm)` with its own `sin`
+and `cos` — about **440,000** sin/cos pairs to draw one picture, all the same
+nine answers. Projecting the polygon once takes a build from **4.9 ms to
+0.8 ms**, verified identical across 60 mode × zone × coverage combinations.
+That is what the Zone Setup d-pad was waiting on between steps.
+
+`flatten()` measured sweeps with `angDelta`, which folds anything over 180°
+back into ±180°: a 237° lobe was timed as 123°, and a **full-circle ring
+folded to exactly 0** and fell through to the 1 mm floor — the marker crossed
+a whole ring in one frame. It uses the span. Playback was a flat ~8 s however
+long the run, so the longer the real run the faster its preview; it scales.
+
+Also removed: the pass-stepper the scrubber replaced in b569 (dead since),
+and the second `build()` each caller did to caption a picture it had already
+drawn.
+
 ## Still open
 
 - **The flow constant.** `NOZZLE_FLOW_K = 4542` at `N = 0.566` is what the

@@ -371,6 +371,22 @@ static volatile TickType_t s_live_tick     = 0;
 // built; both 0 when nothing is running.
 static volatile int8_t     s_live_passes_total = 0;
 static volatile int16_t    s_live_rings_total  = 0;
+// b587: the schedule the run is ACTUALLY executing, latched when the planner
+// fixes it, and served by /api/live_plan.
+//
+// The live view used to draw whatever /api/run_plan last returned for the
+// Water modal's currently selected zone and depth. During a scheduled run
+// that is the wrong zone, the wrong depth, or -- if the modal was never
+// opened -- nothing at all, in which case the overlay drew a single lap over
+// a four-pass run. Re-deriving the plan in a second place was the mistake;
+// this publishes the first one. It is fixed at run start (b578), so the page
+// fetches it once and then only polls the position.
+static uint8_t  s_live_plan_passes[WATER_RUN_MAX_RINGS];
+static uint16_t s_live_plan_mm[WATER_RUN_MAX_RINGS];
+static volatile int16_t s_live_plan_n      = 0;   // 0 = no plan published
+static volatile int16_t s_live_plan_zone   = -1;
+static volatile uint8_t s_live_plan_mode   = 0;   // web mode digit
+static volatile uint8_t s_live_plan_depth8 = 0;
 
 static void water_csv_write_row(FILE *f, float t_s, int ring_, int arc_,
     int sector_, float nozzle_target, float nozzle_actual,
@@ -7019,6 +7035,55 @@ static void check_inactivity(void)
 #define WATER_RING_SPACING         700.0f
 #define WATER_MIN_RING_SPACING      80.0f
 
+// b587: what a run costs beyond the sweeps themselves. The executor charges
+// both of these when it fixes the duration at run start, and /api/run_plan
+// did not -- so the preview quoted 4.9 min for a run the device itself then
+// announced as 7 min. Two numbers for the same run, from the same firmware,
+// differing by 45%. They are one definition now, used by both.
+#define WATER_OVH_PER_RING_S       2.5f   // valve move + connector, measured
+#define WATER_RUN_TAIL_S          25.0f   // closeout, flush, valve close
+
+// b587: how long the run will take -- measurement first, model second.
+//
+// The ring model is not close. On the measured zone it predicts 294 s of
+// SWEEPING for a run that finishes in 206 s all-in; the sweep term alone
+// exceeds the whole run, so no overhead term can reconcile the two and the
+// per-ring active arc it integrates over must be substantially wider than
+// the arcs the executor actually sweeps (serpentine_arc_bounds clips to
+// sector_throw, run_plan_active_deg samples the raw polygon). Diagnosing
+// that needs a run to compare against, and is left alone here.
+//
+// What can be fixed now is which number gets quoted. b578 replaced a
+// history-anchored estimate with the model for serpentine and sections, and
+// the quoted minutes roughly doubled against measured runs of 3.4 and 4.1
+// min. Pulse, gentle and smooth never stopped preferring history -- b298:
+// "when we have history, history wins" -- so this restores that rule for the
+// deterministic modes and gives the preview and the executor one answer.
+//
+// The model remains the fallback for a zone that has never completed a run.
+// prev is heap-allocated: water_run_t is 1768 bytes and one of the two
+// callers is an HTTP handler on an 8 KB stack.
+static float water_est_run_secs(uint16_t zone_id, float depth_mm, float model_s)
+{
+    if (!storage_ready()) return model_s;
+    water_run_t *prev = calloc(1, sizeof(*prev));
+    if (!prev) return model_s;
+    float out = model_s;
+    if (storage_water_load(zone_id, prev) == ESP_OK && prev->total_time_s > 60.0f) {
+        // The stored run may have targeted a different depth; scale by the
+        // ratio, clamped so a nonsense stored target cannot run away with it.
+        float scale = 1.0f;
+        if (prev->target_depth_mm > 0.1f && depth_mm > 0.1f)
+            scale = depth_mm / prev->target_depth_mm;
+        if (scale < 0.25f) scale = 0.25f;
+        if (scale > 4.0f)  scale = 4.0f;
+        out = prev->total_time_s * scale * 1.05f;   // small margin over measured
+    }
+    free(prev);
+    return out;
+}
+
+
 // b555: per-zone coverage scales the ring pitch. Finer coverage lays the rings
 // closer together, which costs run time and buys uniformity on a small or
 // awkwardly shaped zone. The same factor MUST scale the assumed footprint
@@ -9133,7 +9198,15 @@ static float serpentine_ring_dps_ex(float ring_throw, float inner_throw,
         dps = Q_ref * active_deg / (per_pass_depth * 60000.0f * ring_area);
     }
     if (out_want) *out_want = dps;
-    float min_dps = have_spd ? spd->min_continuous_dps : 10.9f;
+    // b587: a speed map that exists but never established a slow-speed floor
+    // reports min_continuous_dps = 0, and "have_spd" alone then removed the
+    // floor entirely -- the solver would command a sweep slower than the
+    // nozzle can hold, which does not crawl, it stalls. /api/run_plan already
+    // substituted 10.9 in that case, so the executor and the preview were
+    // solving different problems whenever the speed cal was missing. One
+    // fallback, used by both.
+    float min_dps = (have_spd && spd->min_continuous_dps > 0.01f)
+                    ? spd->min_continuous_dps : 10.9f;
     float max_dps = (have_spd && spd->num_points > 0)
                     ? spd->deg_per_sec[spd->num_points - 1] : 118.0f;
     if (dps < min_dps) dps = min_dps;
@@ -10557,6 +10630,22 @@ static void water_serpentine_passes(
         }
         s_live_passes_total = (int8_t)plan_max_passes;   // b580
         s_live_rings_total  = (int16_t)num_rings;
+        // b587: publish the schedule itself, so the live view draws THIS plan
+        // rather than re-deriving one from the Water modal's selection.
+        {
+            int _np = (num_rings < WATER_RUN_MAX_RINGS) ? num_rings
+                                                        : WATER_RUN_MAX_RINGS;
+            for (int i = 0; i < _np; i++) {
+                s_live_plan_passes[i] = plan_passes[i];
+                float _m = ring_throws[i];
+                s_live_plan_mm[i] = (uint16_t)((_m > 0.0f && _m < 65535.0f)
+                                               ? (_m + 0.5f) : 0.0f);
+            }
+            s_live_plan_zone   = (int16_t)s_water_zone_id;
+            s_live_plan_mode   = (uint8_t)s_web_water_mode;
+            s_live_plan_depth8 = (uint8_t)(depth_mm / 3.175f + 0.5f);
+            s_live_plan_n      = (int16_t)_np;   // last: readers gate on this
+        }
         INFO("Serpentine plan: %d pass(es) scheduled up front for %.2f mm "
              "target (deterministic -- measurement no longer re-plans)",
              plan_max_passes, depth_mm);
@@ -10580,8 +10669,9 @@ static void water_serpentine_passes(
     // every pass overestimates badly. Plus a measured per-ring transition
     // cost and the cleanup tail.
     if (!dry) {
-        const float _OVH_PER_RING_S = 2.5f;   // valve move + connector, measured
-        const float _TAIL_S         = 25.0f;  // closeout, flush, valve close
+        // b587: shared with /api/run_plan so the two estimates cannot drift.
+        const float _OVH_PER_RING_S = WATER_OVH_PER_RING_S;
+        const float _TAIL_S         = WATER_RUN_TAIL_S;
         float _tl2[WATER_MAX_ARCS_PER_RING], _th2[WATER_MAX_ARCS_PER_RING];
         float _secs = _TAIL_S;
         for (int i = 0; i < num_rings && i < WATER_RUN_MAX_RINGS; i++) {
@@ -10600,11 +10690,16 @@ static void water_serpentine_passes(
             if (_dps < 0.1f) continue;
             _secs += ((_active / _dps) + _OVH_PER_RING_S) * (float)plan_passes[i];
         }
+        // b587: a completed run of this zone beats the model -- see
+        // water_est_run_secs. The model over-predicts this zone by about 2x.
+        float _model_s = _secs;
+        _secs = water_est_run_secs(s_water_zone_id, depth_mm, _model_s);
         s_water_est_min   = (int)(_secs / 60.0f) + 1;
         s_eta_anchor_secs = _secs;
         s_eta_anchor_tick = xTaskGetTickCount();
-        INFO("Serpentine estimate: %d min (%.0f s) -- fixed at run start, "
-             "not revised mid-run", s_water_est_min, _secs);
+        INFO("Serpentine estimate: %d min (%.0f s, model said %.0f s) -- fixed "
+             "at run start, not revised mid-run",
+             s_water_est_min, _secs, _model_s);
     }
 
     for (int pass = 0; pass < passes; pass++) {
@@ -11802,6 +11897,13 @@ static bool water_trace_save(uint16_t zone_id)
 static void phase_water_zone(void)
 {
     STEP("Water Zone");
+
+    // b587: a previous run's plan must not survive into this one. Only the
+    // deterministic planner (serpentine/sections) publishes one; every other
+    // mode leaves this at 0 and /api/live_plan says so, rather than handing
+    // the live view the last Sections schedule to draw over a Pulse run.
+    s_live_plan_n = 0;
+
 
     // --- Load calibration ---
     pressure_map_t cal = {0};
@@ -16413,9 +16515,19 @@ static esp_err_t api_all_handler(httpd_req_t *req)
             n=snprintf(buf,sizeof(buf),
                 "%s{\"id\":%u,\"name\":\"%s\",\"num_points\":%u,"
                 "\"coverage\":%u,"          /* b561: the preview needs the ring pitch */
+                /* b587: the throw calibration the ring ladder is built from.
+                 * /zone/state has always sent these; /api/all never did, so
+                 * the landing and schedule previews fell back to path.js's
+                 * built-in 10058 mm where this unit's cal says 8424 -- a 16%
+                 * error in the ring pitch, which is why the Water modal drew
+                 * 34 rings under a plan note that said 31. Every page that
+                 * draws a ladder now gets the same two numbers. */
+                "\"act_max_throw\":%.0f,\"act_min_throw\":%.0f,"
                 "\"min_ft\":%.1f,\"max_ft\":%.1f,\"arc_deg\":%.1f,\"points\":[",
                 count?",":"",ids[i],zrname,
-                zp.num_points,(unsigned)zp.coverage,mn/304.8f,mx/304.8f,ahi-alo);
+                zp.num_points,(unsigned)zp.coverage,
+                (double)cal_get_max_throw_mm(), (double)zone_get_min_throw_mm(&zp),
+                mn/304.8f,mx/304.8f,ahi-alo);
             httpd_resp_send_chunk(req, buf, n);
             for(int j=0;j<zp.num_points;j++){
                 n=snprintf(buf,sizeof(buf),"%s{\"deg\":%.1f,\"mm\":%.0f,\"widx\":%d}",
@@ -16981,12 +17093,12 @@ static esp_err_t api_run_plan_handler(httpd_req_t *req)
     float max_dps = (have_spd && spd.num_points > 0)
                     ? spd.deg_per_sec[spd.num_points - 1] : 118.0f;
     // The slow-speed floor is the whole safety story on the "too few passes"
-    // side, and this unit reports min_continuous_dps = 0.00 -- the speed
-    // calibration never established one. With a zero floor
-    // serpentine_ring_dps clamps nothing below, so the solver will happily
-    // command a sweep slower than the nozzle can sustain and it stalls instead
-    // of crawling. Judge against a conservative default and SAY the cal is
-    // missing, rather than quietly reporting that everything is fine.
+    // side. A unit whose speed calibration never established one reports
+    // min_continuous_dps = 0.00, and a zero floor means the solver commands a
+    // sweep slower than the nozzle can sustain -- which stalls rather than
+    // crawls. b587 moved that fallback into serpentine_ring_dps_ex so the
+    // executor uses it too; the same number is repeated here to SAY the cal
+    // is missing rather than quietly reporting that everything is fine.
     bool  floor_cal = (have_spd && spd.min_continuous_dps > 0.01f);
     float min_dps   = floor_cal ? spd.min_continuous_dps : 10.9f;
 
@@ -17038,6 +17150,13 @@ static esp_err_t api_run_plan_handler(httpd_req_t *req)
     // DURATION is the sum.
     float worst_frac = 1.0f;
     int   need_passes = 1, n_short = 0;
+    // b587: rings that will actually be swept. `rings` from RUN_PLAN_WALK
+    // counts every step of the ladder including the ones whose arc misses
+    // the polygon entirely, and the advice was pairing a waterable-only
+    // numerator with it -- "10 of 31 rings" beside a preview that drew 30,
+    // because the preview (correctly) does not draw a ring scheduled for
+    // zero passes.
+    int   rings_wet = 0;
     float est_s_total = 0.0f;
     // b569: per-ring pass count, so the preview can draw the REAL run instead
     // of one representative lap. Pass 1 covers every ring; pass k covers only
@@ -17054,7 +17173,15 @@ static esp_err_t api_run_plan_handler(httpd_req_t *req)
         while (t >= act_min && r2 < WATER_MAX_RINGS_CAL) {
             float sp = pitch * (t / act_max);
             if (sp < WATER_MIN_RING_SPACING) sp = WATER_MIN_RING_SPACING;
-            float in = t - sp; if (in < 0.0f) in = 0.0f;
+            // b587: the innermost ring has no ring below it to bound the
+            // annulus, and the executor closes it at 0.92 x its own radius
+            // (water_serpentine_passes). Using t - sp here instead made the
+            // two disagree about that one ring's area, and therefore about
+            // its pass count, on any zone whose inner limit sits above the
+            // splash-band threshold where r_inner still matters.
+            bool last = (t - sp < act_min) || (r2 + 1 >= WATER_MAX_RINGS_CAL);
+            float in = last ? t * 0.92f : t - sp;
+            if (in < 0.0f) in = 0.0f;
             float ad = run_plan_active_deg(have_zone ? &z : NULL, t, active);
             if (ad < 1.0f) {
                 if (ring_passes_n < WATER_MAX_RINGS_CAL) {
@@ -17092,7 +17219,14 @@ static esp_err_t api_run_plan_handler(httpd_req_t *req)
             int rp = (d1 > 0.0005f) ? (int)ceilf(depth_mm / d1) : 1;
             if (rp < 1) rp = 1;
             if (rp > need_passes) need_passes = rp;
-            est_s_total += (ad / got) * (float)rp;   // this ring's own time
+            rings_wet++;
+            // b587: sweep time PLUS the per-ring transition, charged once per
+            // pass over that ring -- the same expression the executor uses to
+            // fix the duration at run start. Sweeps alone left out roughly a
+            // third of a real run (43 ring-passes x 2.5 s on the measured
+            // zone), so the preview promised 4.9 min and the device then said
+            // 7. The gap was entirely this.
+            est_s_total += ((ad / got) + WATER_OVH_PER_RING_S) * (float)rp;
             if (ring_passes_n < WATER_MAX_RINGS_CAL) {
                 ring_mm[ring_passes_n]       = t;
                 ring_passes[ring_passes_n++] = (uint8_t)(rp > 255 ? 255 : rp);
@@ -17101,7 +17235,14 @@ static esp_err_t api_run_plan_handler(httpd_req_t *req)
         }
     }
     passes = need_passes;
+    est_s_total += WATER_RUN_TAIL_S;          // b587: closeout, as the run charges it
+    // b587: and then the same history-first rule the executor applies, from
+    // the same function -- otherwise the preview quotes the model's minutes
+    // and the run announces measured ones, for the same run.
+    float model_s = est_s_total;
+    est_s_total = water_est_run_secs((uint16_t)zone_id, depth_mm, model_s);
     float est_min = est_s_total / 60.0f;
+    bool  est_from_history = (est_s_total != model_s);
 
     const char *clamp = "none";
     char advice[220];
@@ -17132,7 +17273,7 @@ static esp_err_t api_run_plan_handler(httpd_req_t *req)
                  "%d of %d rings need a slower sweep than the nozzle can hold "
                  "(the worst reaches about %.0f%% of target in one pass), so "
                  "the run makes up to %d passes over those rings.%s",
-                 n_short, rings, (double)(worst_frac * 100.0f), need_passes,
+                 n_short, rings_wet, (double)(worst_frac * 100.0f), need_passes,
                  floor_cal ? "" : " Slow-speed limit is not calibrated "
                                   "(assuming 10.9 deg/s) -- run the speed cal.");
     }
@@ -17161,23 +17302,92 @@ static esp_err_t api_run_plan_handler(httpd_req_t *req)
         rm_js[k++] = ']'; rm_js[k] = '\0';
     }
 
-    char buf[1180];   /* b573: + ring_mm */
+    char buf[1240];   /* b573: + ring_mm; b587: + est_from_history */
     int n = snprintf(buf, sizeof(buf),
         "{\"ok\":true,\"zone\":%d,\"depth8\":%d,\"depth_mm\":%.2f,"
         "\"passes\":%d,\"per_pass_mm\":%.3f,\"rings\":%d,"
         "\"dps_min\":%.1f,\"dps_max\":%.1f,"
         "\"limit_dps_min\":%.1f,\"limit_dps_max\":%.1f,"
-        "\"rings_at_max\":%d,\"rings_at_min\":%d,"
+        "\"rings_at_max\":%d,\"rings_at_min\":%d,\"rings_wet\":%d,"
         "\"clamp\":\"%s\",\"est_min\":%.1f,\"coverage\":%u,"
         "\"active_deg\":%.0f,\"speed_floor_cal\":%s,\"pass_frac\":%.2f,"
+        "\"est_from_history\":%s,\"est_model_min\":%.1f,"
         "\"ring_passes\":%s,\"ring_mm\":%s,\"advice\":\"%s\"}",
         zone_id, depth8, depth_mm, passes, per_pass_mm, rings,
         (double)lo_dps, (double)hi_dps, (double)min_dps, (double)max_dps,
-        n_fast, n_slow, clamp, (double)est_min,
+        n_fast, n_slow, rings_wet, clamp, (double)est_min,
         (unsigned)(have_zone ? z.coverage : 0),
         (double)active, floor_cal ? "true" : "false", (double)worst_frac,
+        est_from_history ? "true" : "false", (double)(model_s / 60.0f),
         rp_js, rm_js, advice);
-    if (n >= (int)sizeof(buf)) n = sizeof(buf) - 1;
+    // b587: clamping a truncated snprintf and sending it anyway produces
+    // JSON that ends mid-token. The page's .json() throws, the catch clears
+    // the note, and the run plan silently shows nothing -- a failure that
+    // looks exactly like "this zone has no plan". Say what happened instead.
+    if (n >= (int)sizeof(buf)) {
+        ESP_LOGE(TAG, "run_plan response truncated (%d >= %d) -- raise buf",
+                 n, (int)sizeof(buf));
+        httpd_resp_send(req, "{\"ok\":false,\"error\":\"plan response too large\"}",
+                        HTTPD_RESP_USE_STRLEN);
+        return ESP_OK;
+    }
+    httpd_resp_send(req, buf, n);
+    return ESP_OK;
+}
+
+// b587: the plan the CURRENT run is executing -- not a re-derivation of it.
+//
+// /api/run_plan answers "what would a run of this zone at this depth do",
+// which is the right question for the Water modal and the wrong one for a
+// live view: by then the run exists and has a schedule, and asking a second
+// time can give a different answer (a scheduled run for another zone, a
+// different depth, or a modal that was never opened so there is no answer at
+// all -- the overlay then drew one lap over a multi-pass run).
+//
+// The schedule is fixed at run start (b578), so this is fetched once when the
+// live view opens; the moving parts stay in the small /api/status poll.
+//
+// GET /api/live_plan ->
+//   {"ok":true,"running":true,"zone":0,"mode":9,"depth8":1,"est_min":7,
+//    "passes":2,"ring_passes":[..],"ring_mm":[..]}
+// running:false with an empty plan means nothing is running, or the mode in
+// progress is one of the adaptive ones that has no up-front schedule.
+static esp_err_t api_live_plan_handler(httpd_req_t *req)
+{
+    WEB_TOUCH();
+    HTTP_CONN_CLOSE(req);
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
+
+    int np = (int)s_live_plan_n;
+    bool running = (s_web_water_mode != 0) && np > 0;
+    if (np > WATER_RUN_MAX_RINGS) np = WATER_RUN_MAX_RINGS;
+
+    char buf[560];
+    int n = 0, mx = 1;
+    if (running)
+        for (int i = 0; i < np; i++)
+            if (s_live_plan_passes[i] > mx) mx = s_live_plan_passes[i];
+
+    n += snprintf(buf + n, sizeof(buf) - n,
+        "{\"ok\":true,\"running\":%s,\"zone\":%d,\"mode\":%d,\"depth8\":%u,"
+        "\"est_min\":%d,\"passes\":%d,\"ring_passes\":[",
+        running ? "true" : "false",
+        running ? (int)s_live_plan_zone : -1,
+        running ? (int)s_live_plan_mode : 0,
+        running ? (unsigned)s_live_plan_depth8 : 0u,
+        s_water_est_min, running ? mx : 0);
+    if (running)
+        for (int i = 0; i < np && n < (int)sizeof(buf) - 260; i++)
+            n += snprintf(buf + n, sizeof(buf) - n, "%s%u",
+                          i ? "," : "", (unsigned)s_live_plan_passes[i]);
+    n += snprintf(buf + n, sizeof(buf) - n, "],\"ring_mm\":[");
+    if (running)
+        for (int i = 0; i < np && n < (int)sizeof(buf) - 10; i++)
+            n += snprintf(buf + n, sizeof(buf) - n, "%s%u",
+                          i ? "," : "", (unsigned)s_live_plan_mm[i]);
+    n += snprintf(buf + n, sizeof(buf) - n, "]}");
+    if (n >= (int)sizeof(buf)) n = (int)sizeof(buf) - 1;
     httpd_resp_send(req, buf, n);
     return ESP_OK;
 }
@@ -19491,7 +19701,7 @@ static void zone_web_start(void)
     httpd_config_t cfg   = HTTPD_DEFAULT_CONFIG();
     cfg.server_port      = ZONE_WEB_PORT;
     cfg.ctrl_port        = ZONE_WEB_CTRL_PORT;
-    cfg.max_uri_handlers  = 78;  // watering path: 76 -> 78 (/path.js GET, /api/run_plan GET); b525: 74 -> 76 (/api/winter GET+POST); b522: 72 -> 74 (/api/fault_hold GET+POST); b512: 70 -> 72 (/api/uart_log GET+POST); b489: 68 -> 70, keeping the 2-slot margin over
+    cfg.max_uri_handlers  = 79;  // b587: 78 -> 79 (/api/live_plan GET); watering path: 76 -> 78 (/path.js GET, /api/run_plan GET); b525: 74 -> 76 (/api/winter GET+POST); b522: 72 -> 74 (/api/fault_hold GET+POST); b512: 70 -> 72 (/api/uart_log GET+POST); b489: 68 -> 70, keeping the 2-slot margin over
                                  // the _Static_assert below.
                                  // MUST be set before httpd_start (cfg is copied there);
                                  // headroom over uris[] count -- _Static_assert below guards it.
@@ -19522,6 +19732,7 @@ static void zone_web_start(void)
         {.uri="/zone/last_log",    .method=HTTP_GET,  .handler=zone_last_log_handler},   // b292
         {.uri="/api/all",         .method=HTTP_GET,  .handler=api_all_handler},
         {.uri="/api/run_plan",    .method=HTTP_GET,  .handler=api_run_plan_handler}, // b557
+        {.uri="/api/live_plan",   .method=HTTP_GET,  .handler=api_live_plan_handler}, // b587
         {.uri="/api/auto_sleep",  .method=HTTP_GET,  .handler=api_auto_sleep_handler},  // b447
         {.uri="/api/auto_sleep",  .method=HTTP_POST, .handler=api_auto_sleep_handler},  // b447
         {.uri="/path.js",         .method=HTTP_GET,  .handler=path_js_handler},   // b535 shared browser code
@@ -19588,7 +19799,7 @@ static void zone_web_start(void)
         {.uri="/fs/upload",             .method=HTTP_POST, .handler=fs_upload_handler},
         {.uri="/fs/delete",             .method=HTTP_POST, .handler=fs_delete_handler},
     };
-    _Static_assert(sizeof(uris)/sizeof(uris[0]) <= 76,   // watering path: 74 -> 76 (/path.js GET, /api/run_plan GET); b525: 72 -> 74 (/api/winter GET+POST); b522: 70 -> 72 (/api/fault_hold GET+POST); b512: 68 -> 70 (/api/uart_log GET+POST); b489: 66 -> 68
+    _Static_assert(sizeof(uris)/sizeof(uris[0]) <= 77,   // b587: 76 -> 77 (/api/live_plan GET); watering path: 74 -> 76 (/path.js GET, /api/run_plan GET); b525: 72 -> 74 (/api/winter GET+POST); b522: 70 -> 72 (/api/fault_hold GET+POST); b512: 68 -> 70 (/api/uart_log GET+POST); b489: 66 -> 68
                    "uris[] exceeds cfg.max_uri_handlers -- raise it before httpd_start");
     for (size_t i = 0; i < sizeof(uris)/sizeof(uris[0]); i++)
         httpd_register_uri_handler(s_zone_server, &uris[i]);

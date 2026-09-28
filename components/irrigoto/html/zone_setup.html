@@ -804,12 +804,13 @@ function drawPath(W, H, cx, cy, maxR) {
     act_max_throw: ST.act_max_throw || 10058,
     act_min_throw: ST.act_min_throw || 0,
     coverage: ST.coverage | 0,     // b561: ring pitch follows the zone setting
+    ringsOnly: true,               // b587: don't build a move list we discard
   });
   IrrigotoPath.draw(ctx, geom,
                     {cx: cx, cy: cy, maxR: maxR, scale_mm: _edScale(), ringsOnly: true});
   const lbl = document.getElementById('zs-at');
-  if (lbl) lbl.textContent = geom && geom.rings
-    ? geom.rings.length + ' rings \u00b7 ' + COV_NAME[ST.coverage | 0] : '';
+  if (lbl) lbl.textContent = geom && geom.ringCount
+    ? geom.ringCount + ' rings \u00b7 ' + COV_NAME[ST.coverage | 0] : '';
 }
 const COV_NAME = ['Standard', 'Fine', 'Finest'];
 
@@ -976,8 +977,9 @@ function applyState(s){
     if (waterTrail.length > 0) waterTrail = [];
     lastWaterBearing = null;
   }
-  if (s.act_max_throw !== undefined) s.act_max_throw = s.act_max_throw;
-  if (s.act_min_throw !== undefined) s.act_min_throw = s.act_min_throw;
+  // b587: two lines here assigned s.act_max_throw and s.act_min_throw to
+  // themselves. ST=s below copies the whole object, so they were no-ops --
+  // removed rather than "fixed", because the values already arrive.
   ST=s;
   // Populate name field on first load (don't overwrite while user is typing)
   const nameEl=document.getElementById('zone-name');

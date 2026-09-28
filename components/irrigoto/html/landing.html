@@ -548,13 +548,18 @@ function refreshRunPlan(){
       _lastPlan = p;
       renderPathThumb();   // the thumbnail is the whole run, so it moves too
       const mins = p.est_min >= 1 ? Math.round(p.est_min) + ' min' : '< 1 min';
+      // b587: say where the number came from. The ring model over-predicts
+      // this hardware by about 2x, so once a zone has actually run, the
+      // measured duration is used instead -- and a number sourced from a
+      // real run deserves to be labelled as one.
+      const src = p.est_from_history ? ' (from the last run)' : ' (estimated)';
       if (p.clamp === 'none') {
         el.className = 'plan-ok';
-        el.textContent = 'One pass \u00b7 about ' + mins + ' \u00b7 sweep ' +
+        el.textContent = 'One pass \u00b7 about ' + mins + src + ' \u00b7 sweep ' +
                          p.dps_min.toFixed(0) + '\u2013' + p.dps_max.toFixed(0) + '\u00b0/s';
       } else {
         el.className = 'plan-warn';
-        el.textContent = p.advice + ' About ' + mins + ' total.';
+        el.textContent = p.advice + ' About ' + mins + src + ' total.';
       }
     })
     .catch(() => { el.textContent = ''; el.className = ''; });
@@ -654,14 +659,15 @@ function renderPathThumb(){
   if (!pts || pts.length < 2) { row.style.display = 'none'; return; }
   row.style.display = 'flex';
   const o = zonePathOpts(0); o.thumb = true;
-  IrrigotoPath.thumb(document.getElementById('path-thumb'), pts, o);
-  const g = IrrigotoPath.build(pts, o);
+  // b587: one build, not two -- thumb() hands back what it drew, so the
+  // caption cannot end up describing a different geometry than the picture.
+  const g = IrrigotoPath.thumb(document.getElementById('path-thumb'), pts, o);
   const m = IrrigotoPath.MODES[selModeDat];
   // b539: never invent a description. If the geometry didn't resolve, say so
   // rather than falling back to Pulse's text for every mode -- which made all
   // the modes look identical. An unknown mode means a stale cached path.js.
   document.getElementById('path-mode').textContent = m
-    ? m.label + ' path' + (g && g.rings.length ? ' \u00b7 ' + g.rings.length + ' rings' : '')
+    ? m.label + ' path' + (g && g.ringCount ? ' \u00b7 ' + g.ringCount + ' rings' : '')
     : 'Path preview unavailable';
   document.getElementById('path-desc').textContent = !m
     ? 'This page is running an old cached script. Reload to update.'
@@ -800,11 +806,21 @@ let lastWaterMode = 0;
 // dot -- so this pulls the much smaller /api/status instead, and only while
 // something is running. It stops itself the moment the run ends.
 let _liveTimer = null;
+// b587: a generation counter, so only the newest poll loop survives.
+//
+// The loop rescheduled itself on `if (_liveTimer)`, which is truthy for the
+// timer that just fired as well as for a fresh one. openLiveView() restarts
+// the poll to get an immediate frame, and if it did that while a fetch was
+// in flight, the in-flight tick woke up, saw a (new) timer, and scheduled a
+// SECOND loop. Every reopen doubled the poll rate for the rest of the run.
+let _liveGen = 0;
 function startLivePoll(){
   if (_liveTimer) return;
+  const gen = ++_liveGen;
   const tick = async () => {
     try {
       const st = await fetch('/api/status', {cache:'no-store'}).then(r => r.json());
+      if (gen !== _liveGen) return;          // superseded while awaiting
       if (!st.watering) { stopLivePoll(); return; }
       _live = { deg: st.live_deg, throw_mm: st.live_throw_mm,
                 throw_act: st.live_throw_act, ring: st.live_ring,
@@ -816,12 +832,13 @@ function startLivePoll(){
       if (typeof IrrigotoPath !== 'undefined' && IrrigotoPath.isOpen())
         IrrigotoPath.updateLive(_live);
     } catch(e) { /* a dropped poll is not worth a visible error */ }
+    if (gen !== _liveGen) return;
     // b582: 0.5 s while the live view is open -- the device samples about
     // every 140 ms at these sweep speeds, so half a second actually shows
     // movement. When the overlay is closed only the watering-bar label needs
     // refreshing, so back off rather than poll at 2 Hz for a line of text.
     const open = (typeof IrrigotoPath !== 'undefined') && IrrigotoPath.isOpen();
-    if (_liveTimer) _liveTimer = setTimeout(tick, open ? 500 : 2000);
+    _liveTimer = setTimeout(tick, open ? 500 : 2000);
   };
   _liveTimer = setTimeout(tick, 0);
 }
@@ -831,21 +848,50 @@ function startLivePoll(){
 // run. b581 moved it onto the zone card radar, which works but paints over
 // the zone outline for the whole run. This opens the big shared overlay on
 // demand instead, and the card stays as it was.
-function openLiveView(id){
+// b587: draw the plan the RUN is executing, fetched from the device.
+//
+// This used to reach for _lastPlan -- /api/run_plan's answer for whichever
+// zone and depth the Water modal happened to be showing. For a scheduled run
+// that is the wrong zone or the wrong depth, and if the modal was never
+// opened it is null, so the overlay drew ONE lap over a multi-pass run and
+// the live dot wandered off the path it was supposedly following. The device
+// now publishes its own fixed schedule; that is what gets drawn.
+let _livePlan = null;
+async function openLiveView(id){
   const z = _zoneCache && _zoneCache[id];
   if (!z || !z.points || z.points.length < 2 || typeof IrrigotoPath === 'undefined') return;
-  IrrigotoPath.openPreview({
+
+  // Open immediately on whatever we have -- a tap should not wait on a fetch.
+  const show = (plan) => IrrigotoPath.openPreview({
     points: z.points,
     act_max_throw: z.act_max_throw, act_min_throw: z.act_min_throw,
     coverage: z.coverage | 0,
-    mode: String(lastWaterMode || 9), lockMode: true, depth8: selDepth,
-    ringPasses: _lastPlan && _lastPlan.ring_passes,
-    ringMm:     _lastPlan && _lastPlan.ring_mm,
+    // The running mode, not a guess. lastWaterMode comes from /api/all; the
+    // plan carries it too and is the more direct source when present.
+    mode: String((plan && plan.mode) || lastWaterMode || 9),
+    lockMode: true,
+    depth8: (plan && plan.depth8) || selDepth,
+    ringPasses: plan && plan.ring_passes,
+    ringMm:     plan && plan.ring_mm,
     live: _live,
     title: (z.name || ('Zone ' + id)) + ' \u00b7 live'
   });
+  show(_livePlan);
   // Don't make the user wait out the slow tick for the first frame.
   if (_liveTimer) { clearTimeout(_liveTimer); _liveTimer = null; startLivePoll(); }
+
+  // Then upgrade to the real plan. It is fixed at run start, so once is
+  // enough -- only the position needs polling.
+  if (_livePlan) return;
+  try {
+    const p = await fetch('/api/live_plan', {cache:'no-store'}).then(r => r.json());
+    // running:false means an adaptive mode with no up-front schedule; leave
+    // the single-lap drawing rather than claiming passes nobody planned.
+    if (p && p.ok && p.running && p.ring_passes && p.ring_passes.length) {
+      _livePlan = p;
+      if (IrrigotoPath.isOpen()) show(p);
+    }
+  } catch(e) { /* the overlay is already up on the fallback */ }
 }
 
 // b583: no per-update annotations on the card. They rewrote the watering bar
@@ -857,6 +903,8 @@ function openLiveView(id){
 function stopLivePoll(){
   if (_liveTimer) clearTimeout(_liveTimer);
   _liveTimer = null;
+  _liveGen++;                 // b587: orphan any tick still awaiting its fetch
+  _livePlan = null;
   if (_live) { _live = null; renderPathThumb(); }
 }
 
