@@ -117,6 +117,25 @@ section{margin-bottom:18px;}
 .run-vol{font-family:'Courier New',monospace;color:var(--green);text-align:right;
   white-space:nowrap;flex-shrink:0;}
 .run-vol.bad{color:var(--orange);}
+/* b587: Upcoming runs. Deliberately the same row geometry as the history
+   above it -- the two are read together ("it watered at 6, it waters again
+   at 6"), and a different layout for each would make that comparison work. */
+.up-row{display:flex;gap:8px;padding:7px 0;border-bottom:1px solid var(--border);
+  align-items:baseline;font-size:12px;}
+.up-row:last-child{border-bottom:none;}
+.up-row.next .up-when{color:var(--green);}
+/* Wider than .run-when and nowrap: history rows are fixed-width dates, but
+   these say "Tomorrow 06:00", which wrapped onto a second line at 86px and
+   made that one row twice as tall as its neighbours. */
+.up-when{color:var(--text-mid);font-family:'Courier New',monospace;font-size:11px;
+  width:98px;flex-shrink:0;white-space:nowrap;}
+.up-what{flex:1;min-width:0;}
+.up-what small{display:block;color:var(--text-mid);font-size:11px;}
+.up-in{font-family:'Courier New',monospace;color:var(--text-mid);text-align:right;
+  white-space:nowrap;flex-shrink:0;font-size:11px;}
+.up-sol{color:var(--green);}
+.up-nosol{color:var(--text-dim);}
+.up-delay{color:var(--orange);font-size:11px;margin-bottom:6px;}
 /* Water modal */
 #modal-bg{display:none;position:fixed;inset:0;background:rgba(0,0,0,.7);
   z-index:100;align-items:flex-end;justify-content:center;}
@@ -196,6 +215,13 @@ section{margin-bottom:18px;}
       <a class="sec-btn" href="/schedule">Edit</a>
     </div>
     <div id="sched-summary" class="card"><div class="empty">No schedules configured.</div></div>
+  </section>
+  <section>
+    <div class="sec-hdr">
+      <span class="sec-title">Upcoming</span>
+      <a class="sec-btn" href="/schedule">Edit</a>
+    </div>
+    <div class="card" id="upcoming-card"><div class="empty">Loading&hellip;</div></div>
   </section>
   <section>
     <div class="sec-hdr">
@@ -528,6 +554,101 @@ async function loadRuns(){
     '</div>';
   }).join('');
 }
+
+// ── Upcoming runs (b587) ────────────────────────────────────────────────────
+//
+// The Schedule card says what is configured and History says what happened;
+// neither answers "what is about to run", which is the question asked before
+// going away for a weekend or after setting a rain delay. next_run gives one
+// answer and not the shape of the week.
+//
+// The list comes from /api/upcoming rather than being expanded here, because
+// three of the four rules it has to get right already live on the device and
+// nowhere else: the day-mask walk across a DST boundary, the rain delay that
+// suppresses everything before it, and the per-entry solution rotation
+// counters (which the page cannot see at all). A second implementation in
+// JavaScript would be a second set of answers.
+const SCHED_MODE_LABELS = ['Pulse','Gentle','Smooth','Serpentine','Sections'];
+
+// Day name when it is further out than "tomorrow" -- "Wed 06:00" reads
+// better than a bare date for anything inside the coming week.
+const UP_DAY = ['Sun','Mon','Tue','Wed','Thu','Fri','Sat'];
+function fmtUpcomingWhen(epoch, tz, now){
+  const loc  = new Date((epoch + tz*60) * 1000);
+  const hm   = String(loc.getUTCHours()).padStart(2,'0') + ':' +
+               String(loc.getUTCMinutes()).padStart(2,'0');
+  // Midnight-to-midnight in the device's zone, so "today" means its today.
+  const day  = d => Math.floor((d + tz*60) / 86400);
+  const dd   = day(epoch) - day(now);
+  if (dd <= 0) return 'Today ' + hm;
+  if (dd === 1) return 'Tomorrow ' + hm;
+  if (dd < 7)  return UP_DAY[loc.getUTCDay()] + ' ' + hm;
+  return (loc.getUTCMonth()+1) + '/' + loc.getUTCDate() + ' ' + hm;
+}
+
+// How far off, as a plain duration.
+//
+// NOT relTimeFromSec: that buckets 24-48 h as "tomorrow", which is elapsed
+// hours and not the calendar. At 17:14 a Tuesday 06:00 run is 37 h out, so
+// the row read "Tue 06:00 ... tomorrow" -- the two columns contradicting
+// each other about the same run. The left column already names the day, so
+// this one only has to say how long.
+function fmtUpcomingIn(sec){
+  if (sec < 60)    return 'now';
+  if (sec < 3600)  return Math.round(sec/60) + ' min';
+  if (sec < 86400) return Math.round(sec/3600) + ' h';
+  const d = sec / 86400;
+  return (d < 10 ? d.toFixed(d < 2 ? 1 : 0) : Math.round(d)) + ' d';
+}
+
+async function loadUpcoming(){
+  const el = document.getElementById('upcoming-card');
+  if (!el) return;
+  let d;
+  try { d = await fetch('/api/upcoming?n=5', {cache:'no-store'}).then(r => r.json()); }
+  catch(e){ return; }                 // leave the last good list up
+  if (!d || !d.ok) return;
+  const tz = d.tz_offset_min || 0, now = d.now || 0;
+  const runs = d.runs || [];
+
+  let head = '';
+  if (d.delay_until && d.delay_until > now)
+    head = '<div class="up-delay">\u23f8 Watering delayed until ' +
+           esc(fmtLocalEpoch(d.delay_until, tz)) + '</div>';
+
+  if (!runs.length){
+    // Three different reasons for an empty list, and they need different
+    // words. "Nothing scheduled" when the device simply has no clock yet
+    // would be a wrong answer confidently given.
+    const why = (d.clock === false)
+      ? 'Waiting for the clock to sync \u2014 no run times yet.'
+      : head ? 'Nothing scheduled after the delay.'
+      : d.entries ? 'No enabled schedule entries.'
+      : 'Nothing scheduled. <a href="/schedule" style="color:var(--green)">Add a schedule &rarr;</a>';
+    el.innerHTML = head + '<div class="empty">' + why + '</div>';
+    return;
+  }
+
+  el.innerHTML = head + runs.map((r, i) => {
+    const mode  = SCHED_MODE_LABELS[r.mode] || '';
+    const depth = DEPTH_TXT[r.depth] || '';
+    const est   = r.est_min > 0 ? ' \u00b7 ~' + r.est_min + ' min' : '';
+    // bottle 0 = this occurrence does not dose. Say so rather than leaving a
+    // blank that reads the same as "bottles are switched off entirely".
+    const sol = r.bottle
+      ? ' \u00b7 <span class="up-sol" title="Solution from bottle ' + r.bottle + '">\u2697 B'
+        + r.bottle + '</span>'
+      : '';
+    return '<div class="up-row' + (i === 0 ? ' next' : '') + '">' +
+      '<span class="up-when">' + esc(fmtUpcomingWhen(r.epoch, tz, now)) + '</span>' +
+      '<span class="up-what">' + esc(r.name || ('Zone ' + r.zone)) +
+        '<small>' + esc(mode) + (depth ? ' ' + depth : '') + est + sol + '</small>' +
+      '</span>' +
+      '<span class="up-in">' + esc(fmtUpcomingIn(r.epoch - now)) + '</span>' +
+    '</div>';
+  }).join('');
+}
+
 function esc(t){ const d=document.createElement('div'); d.textContent=t==null?'':t; return d.innerHTML; }
 
 async function toggleDetailLog(){
@@ -587,7 +708,8 @@ async function reconnectNet(){
 }
 updateWifiButtons();
 
-loadRuns();   // b535: History card, once at load
+loadRuns();       // b535: History card, once at load
+loadUpcoming();   // b587: Upcoming card, same
 async function refresh(){
   try{
     const d=await fetch('/api/all').then(r=>r.json());
@@ -646,6 +768,10 @@ let activeWaterZoneId = -1;
 let lastWaterMode = 0;
 
 function updateWateringState(watering, mode, estMin, waterZoneId, cleanupPass) {
+  // b587: a run that just ended changes both cards below -- History gains a
+  // row, and Upcoming moves on (the next estimate is now seeded from a real
+  // measured duration). Refresh on the edge, not on the 30 s tick.
+  if (lastWateringState && !watering) { loadRuns(); loadUpcoming(); }
   lastWateringState = !!watering;
   lastCleanupPass   = cleanupPass || 0;
   lastWaterMode     = watering ? (mode || 0) : 0;
@@ -900,7 +1026,11 @@ async function refreshSchedule(){
     // Silent — leave whatever was there. The /schedule page surfaces the real error.
   }
 }
-refreshSchedule(); setInterval(refreshSchedule, 30000);
+// b587: the upcoming list is schedule-derived, so it refreshes on the same
+// cadence. It also moves when a run finishes, which updateWateringState
+// picks up.
+refreshSchedule(); loadUpcoming();
+setInterval(() => { refreshSchedule(); loadUpcoming(); }, 30000);
 </script>
 </body>
 </html>

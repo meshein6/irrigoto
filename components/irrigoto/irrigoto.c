@@ -16359,6 +16359,189 @@ static esp_err_t api_time_handler(httpd_req_t *req)
 // the HA switch; this lets the OTA flow re-enable it without HA. Wake-safe
 // (HTTP handler -- doesn't touch the boot/wake path the regression lives in).
 // GET /api/auto_sleep -> {"auto_sleep":bool}; POST on=0|1 sets it.
+// Forward decls — the implementations live next to s_schedule so the static
+// is in scope. Keeps the schedule data hidden from this section while still
+// letting the web handlers read a consistent snapshot.
+// b587: moved up from below the cal page, where it sat when /api/schedule was
+// the only handler that needed it; /api/upcoming is earlier in the file.
+static void   schedule_snapshot(schedule_t *out);
+static int    schedule_estimate_duration_min(uint8_t zone, uint8_t mode, uint8_t depth);
+static time_t sched_entry_next_fire(const schedule_entry_t *e, time_t after);
+static time_t sched_earliest_fire_from(time_t now);
+
+// b587: local-time offset in minutes, by decomposing the same epoch with
+// localtime_r and gmtime_r and subtracting the wall-clock fields. This honors
+// libc's POSIX TZ DST rules (selected from the date) unlike a bare mktime,
+// which has to be told the isdst flag externally. Day-of-year wrap is the
+// only edge case.
+//
+// Lifted out of api_schedule_handler, which had it inline; /api/upcoming
+// needs the same number, and two copies of a DST calculation is how they
+// come to disagree. (fix/timezone replaces this with tz_offset_min_now(),
+// which solves the offset through mktime for the same reason.)
+static int sched_tz_offset_min(time_t now, int *out_isdst)
+{
+    if (out_isdst) *out_isdst = -2;
+    if (now <= 1700000000) return 0;
+    struct tm lt, gt;
+    localtime_r(&now, &lt);
+    gmtime_r(&now, &gt);
+    if (out_isdst) *out_isdst = lt.tm_isdst;
+    int diff_sec = (lt.tm_hour - gt.tm_hour) * 3600
+                 + (lt.tm_min  - gt.tm_min)  * 60
+                 + (lt.tm_sec  - gt.tm_sec);
+    int diff_days = lt.tm_yday - gt.tm_yday;
+    if (lt.tm_year != gt.tm_year) diff_days = (lt.tm_year > gt.tm_year) ? 1 : -1;
+    diff_sec += diff_days * 86400;
+    return diff_sec / 60;
+}
+
+// b587: the next few scheduled runs, as a list.
+//
+// The Schedule card says WHAT is configured -- 06:00, every day -- and the
+// History card says what happened. Neither answers "what is about to run",
+// which is the question asked before going out for the evening or after
+// setting a rain delay. next_run alone gives one answer and not the shape of
+// the week.
+//
+// It is computed here rather than in the page because three of the four
+// things it has to get right already live here and nowhere else: the
+// day-mask walk across a DST boundary, the rain delay that suppresses
+// everything before it, and the solution rotation's per-entry counters.
+// Re-deriving those in JavaScript would be a fourth copy of rules that have
+// already drifted once.
+//
+// GET /api/upcoming?n=5  ->
+//   {"ok":true,"now":<epoch>,"tz_offset_min":<m>,"delay_until":<epoch>,
+//    "runs":[{"epoch":..,"zone":1,"name":"..","mode":4,"depth":1,
+//             "est_min":7,"bottle":2},...]}
+// bottle 0 = that run does not dose (always 0 until solution-dosing
+// merges -- see below). An empty runs[] means nothing is scheduled, or a
+// delay covers the whole horizon.
+#define UPCOMING_MAX 10
+static esp_err_t api_upcoming_handler(httpd_req_t *req)
+{
+    WEB_TOUCH();
+    HTTP_CONN_CLOSE(req);
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
+
+    int want = 5;
+    {
+        char q[48] = "", v[8] = "";
+        if (httpd_req_get_url_query_str(req, q, sizeof(q)) == ESP_OK
+                && httpd_query_key_value(q, "n", v, sizeof(v)) == ESP_OK)
+            want = atoi(v);
+    }
+    if (want < 1) want = 1;
+    if (want > UPCOMING_MAX) want = UPCOMING_MAX;
+
+    time_t now = time(NULL);
+
+    // Everything big goes on the heap. This handler needs a schedule
+    // snapshot (1028 B), a scratch zone (728 B) and a response buffer
+    // (1600 B), and it calls schedule_estimate_duration_min(), which puts a
+    // 1768-byte water_run_t on the stack of its own. Together that is about
+    // 5.5 KB against the 8 KB httpd task stack, with the request machinery
+    // already on it -- b587 shipped it on the stack and the first request
+    // took the device down hard enough that the bootloader rolled back.
+    struct up_scratch {
+        schedule_t       snap;
+        zone_perimeter_t zp;
+        time_t           cursor[SCHEDULE_MAX_ENTRIES];
+        uint8_t          seen[SCHEDULE_MAX_ENTRIES];
+        char             buf[1600];
+    } *W = calloc(1, sizeof(*W));
+    if (!W) {
+        httpd_resp_send(req, "{\"ok\":false,\"error\":\"no memory\"}", -1);
+        return ESP_OK;
+    }
+    schedule_snapshot(&W->snap);
+    schedule_t *snapp = &W->snap;
+    char *buf = W->buf;
+    const size_t bufsz = sizeof(W->buf);
+
+    // Without a clock there is no "next", and the stored delay_until cannot be
+    // compared against anything -- reporting it would render as a rain-delay
+    // banner dated in the past. Say the clock is unset instead and let the
+    // page say so; an empty list on its own reads as "nothing scheduled",
+    // which is a different and wrong answer.
+    bool have_clock = (now > 1700000000);
+    int n = snprintf(buf, bufsz,
+        "{\"ok\":true,\"clock\":%s,\"now\":%ld,\"tz_offset_min\":%d,"
+        "\"entries\":%u,\"delay_until\":%ld,\"runs\":[",
+        have_clock ? "true" : "false", (long)now, sched_tz_offset_min(now, NULL),
+        (unsigned)snapp->count,
+        have_clock ? (long)irrigoto_schedule_get_delay_until() : 0L);
+
+    if (have_clock && snapp->count > 0) {
+        // Per-entry cursor: the time each entry last fired in this walk, and
+        // how many of its own occurrences we have already emitted (which is
+        // what the solution forecast counts in).
+        time_t earliest = sched_earliest_fire_from(now);
+        for (uint8_t i = 0; i < snapp->count; i++) {
+            W->cursor[i] = earliest;
+            W->seen[i]   = 0;
+        }
+
+        for (int out = 0; out < want; out++) {
+            // Earliest next fire across all entries; ties go to the lower
+            // index, which is how the firing logic breaks them too.
+            int best = -1; time_t best_t = 0;
+            for (uint8_t i = 0; i < snapp->count; i++) {
+                time_t f = sched_entry_next_fire(&snapp->entries[i], W->cursor[i]);
+                if (f && (best_t == 0 || f < best_t)) { best_t = f; best = i; }
+            }
+            if (best < 0) break;                 // nothing left in the horizon
+
+            const schedule_entry_t *e = &snapp->entries[best];
+            // b587: the bottle a future run will use comes from the per-entry
+            // rotation counters, which live in solution.c -- not on this
+            // branch. The field is emitted as 0 so the wire format and the
+            // page are already final; feature/solution-dosing fills it in
+            // with solution_forecast_bottle(e, W->seen[best]).
+            uint8_t bottle = 0;
+
+            char zname[32];
+            {
+                uint16_t zid = (e->zone >= 1) ? (uint16_t)(e->zone - 1) : 0;
+                char zn[32] = {0}, zdef[16];
+                snprintf(zdef, sizeof(zdef), "Zone #%u", zid);
+                memset(&W->zp, 0, sizeof(W->zp));
+                if (!storage_ready()
+                        || storage_zone_load(zid, zn, sizeof(zn), &W->zp) != ESP_OK)
+                    zn[0] = '\0';
+                zone_name_resolve(zid, zn, zdef, zname, sizeof(zname));
+            }
+
+            // Leave room for this record plus the "]}" tail before writing.
+            if (n > (int)bufsz - 220) break;
+            n += snprintf(buf + n, bufsz - n,
+                "%s{\"epoch\":%ld,\"zone\":%u,\"name\":\"",
+                out ? "," : "", (long)best_t, e->zone);
+            for (const char *p2 = zname; *p2 && n < (int)bufsz - 130; p2++) {
+                unsigned char c = (unsigned char)*p2;
+                if (c == '"' || c == '\\') { buf[n++] = '\\'; buf[n++] = c; }
+                else if (c >= 0x20)          { buf[n++] = c; }
+            }
+            n += snprintf(buf + n, bufsz - n,
+                "\",\"mode\":%u,\"depth\":%u,\"est_min\":%d,\"bottle\":%u}",
+                e->mode, e->depth,
+                schedule_estimate_duration_min(e->zone, e->mode, e->depth),
+                bottle);
+
+            W->cursor[best] = best_t;
+            if (W->seen[best] < 255) W->seen[best]++;
+        }
+    }
+
+    n += snprintf(buf + n, bufsz - n, "]}");
+    if (n >= (int)bufsz) n = (int)bufsz - 1;
+    httpd_resp_send(req, buf, n);
+    free(W);
+    return ESP_OK;
+}
+
 static esp_err_t api_auto_sleep_handler(httpd_req_t *req)
 {
     HTTP_CONN_CLOSE(req);
@@ -18007,11 +18190,6 @@ static esp_err_t cal_page_handler(httpd_req_t *req)
     return ESP_OK;
 }
 
-// Forward decl — the implementation lives next to s_schedule so the static
-// is in scope. Keeps the schedule data hidden from this section while still
-// letting the web handler read a consistent snapshot.
-static void schedule_snapshot(schedule_t *out);
-
 // GET /schedule -> the standalone schedule editor page (embedded HTML).
 static esp_err_t schedule_page_handler(httpd_req_t *req)
 {
@@ -18107,26 +18285,9 @@ static esp_err_t api_schedule_handler(httpd_req_t *req)
     // DST rules (selected by localtime_r based on the date), unlike a
     // bare mktime call which has to be told the isdst flag externally.
     // Day-of-year wrap is the only edge case — handle it explicitly.
-    int tz_off_min = 0;
+    // b587: one derivation, shared with /api/upcoming.
     int diag_isdst = -2;
-    if (now > 1700000000) {
-        struct tm lt, gt;
-        localtime_r(&now, &lt);
-        gmtime_r(&now, &gt);
-        diag_isdst = lt.tm_isdst;
-        int diff_sec = (lt.tm_hour - gt.tm_hour) * 3600
-                     + (lt.tm_min  - gt.tm_min)  * 60
-                     + (lt.tm_sec  - gt.tm_sec);
-        // tm_yday wraps at year boundary; clamp to ±1 day delta which is
-        // the only physically possible difference between local and UTC
-        // decompositions of the same instant.
-        int diff_days = lt.tm_yday - gt.tm_yday;
-        if (lt.tm_year != gt.tm_year) {
-            diff_days = (lt.tm_year > gt.tm_year) ? 1 : -1;
-        }
-        diff_sec += diff_days * 86400;
-        tz_off_min = diff_sec / 60;
-    }
+    int tz_off_min = sched_tz_offset_min(now, &diag_isdst);
     // One-line diagnostic so we can verify libc TZ is honoring the
     // POSIX DST rules. Logged at INFO so it shows up in standard logs
     // — only fires on schedule-page loads, so it's not spammy.
@@ -18639,7 +18800,7 @@ static void zone_web_start(void)
     httpd_config_t cfg   = HTTPD_DEFAULT_CONFIG();
     cfg.server_port      = ZONE_WEB_PORT;
     cfg.ctrl_port        = ZONE_WEB_CTRL_PORT;
-    cfg.max_uri_handlers  = 77;  // b535: 76 -> 77 (/api/runs GET); b525: 74 -> 76 (/api/winter GET+POST); b522: 72 -> 74 (/api/fault_hold GET+POST); b512: 70 -> 72 (/api/uart_log GET+POST); b489: 68 -> 70, keeping the 2-slot margin over
+    cfg.max_uri_handlers  = 78;  // b587: 77 -> 78 (/api/upcoming GET); b535: 76 -> 77 (/api/runs GET); b525: 74 -> 76 (/api/winter GET+POST); b522: 72 -> 74 (/api/fault_hold GET+POST); b512: 70 -> 72 (/api/uart_log GET+POST); b489: 68 -> 70, keeping the 2-slot margin over
                                  // the _Static_assert below.
                                  // MUST be set before httpd_start (cfg is copied there);
                                  // headroom over uris[] count -- _Static_assert below guards it.
@@ -18673,6 +18834,7 @@ static void zone_web_start(void)
         {.uri="/api/auto_sleep",  .method=HTTP_POST, .handler=api_auto_sleep_handler},  // b447
         {.uri="/api/detail_log",  .method=HTTP_GET,  .handler=api_detail_log_handler},
         {.uri="/api/runs",        .method=HTTP_GET,  .handler=api_runs_handler},   // b535
+        {.uri="/api/upcoming",    .method=HTTP_GET,  .handler=api_upcoming_handler}, // b587
         {.uri="/api/uart_log",    .method=HTTP_GET,  .handler=api_uart_log_handler},   // b512
         {.uri="/api/uart_log",    .method=HTTP_POST, .handler=api_uart_log_handler},   // b512
         {.uri="/api/winter",      .method=HTTP_GET,  .handler=api_winter_handler},     // b525
@@ -18735,7 +18897,7 @@ static void zone_web_start(void)
         {.uri="/fs/upload",             .method=HTTP_POST, .handler=fs_upload_handler},
         {.uri="/fs/delete",             .method=HTTP_POST, .handler=fs_delete_handler},
     };
-    _Static_assert(sizeof(uris)/sizeof(uris[0]) <= 75,   // b535: 74 -> 75 (/api/runs GET); b525: 72 -> 74 (/api/winter GET+POST); b522: 70 -> 72 (/api/fault_hold GET+POST); b512: 68 -> 70 (/api/uart_log GET+POST); b489: 66 -> 68
+    _Static_assert(sizeof(uris)/sizeof(uris[0]) <= 76,   // b587: 75 -> 76 (/api/upcoming GET); b535: 74 -> 75 (/api/runs GET); b525: 72 -> 74 (/api/winter GET+POST); b522: 70 -> 72 (/api/fault_hold GET+POST); b512: 68 -> 70 (/api/uart_log GET+POST); b489: 66 -> 68
                    "uris[] exceeds cfg.max_uri_handlers -- raise it before httpd_start");
     for (size_t i = 0; i < sizeof(uris)/sizeof(uris[0]); i++)
         httpd_register_uri_handler(s_zone_server, &uris[i]);
@@ -20736,41 +20898,65 @@ int irrigoto_schedule_count(void)
     return (int)s_schedule.count;
 }
 
+// b587: the first time ONE entry fires strictly after `after`, or 0 if it
+// does not within the horizon.
+//
+// This walk existed twice (next_run and the sleep-arming variant) and
+// /api/upcoming needed it a third time. Three copies of a day-mask walk that
+// has to agree with itself about DST is three chances to disagree, so it is
+// one function now and the callers differ only in what they keep.
+//
+// Walks forward up to 14 days -- it must outrun the maximum rain-delay window
+// (also 14 d), or a long delay hides every entry in the first week and the
+// schedule reads as empty.
+//
+// Uses libc localtime_r, as the rest of the schedule code on this branch
+// does. fix/timezone replaces those calls with irrigoto_localtime_r, because
+// libc applies a stale numeric zone while labelling it correctly; until that
+// branch merges, the times here are wrong by the same amount as every other
+// schedule timestamp on this branch, which is at least consistent.
+static time_t sched_entry_next_fire(const schedule_entry_t *e, time_t after)
+{
+    if (!e || !e->enabled || e->days_mask == 0) return 0;
+    for (int d = 0; d < 15; d++) {
+        time_t t = after + d * 86400;
+        struct tm lt;
+        localtime_r(&t, &lt);
+        lt.tm_hour = e->hour; lt.tm_min = e->minute; lt.tm_sec = 0;
+        time_t fire_t = mktime(&lt);
+        if (fire_t <= after) continue;      // already past, or inside a delay
+        // Re-check day-of-week against fire_t itself: a DST shift can move it.
+        struct tm flt; localtime_r(&fire_t, &flt);
+        if (!(e->days_mask & (1u << flt.tm_wday))) continue;
+        return fire_t;                      // earliest matching day wins
+    }
+    return 0;
+}
+
+// The floor every schedule question is asked from: now, or the end of an
+// active rain delay. Entries that would fire inside the suspension window are
+// skipped, so the next_run sensor, the sleep-shortening logic and the
+// upcoming-runs list all see the same effective "next fire".
+static time_t sched_earliest_fire_from(time_t now)
+{
+    time_t delay_until = irrigoto_schedule_get_delay_until();  // self-clears
+    return (delay_until > now) ? delay_until : now;
+}
+
 // Compute the next firing time across the whole table. Returns true and
 // fills *out_t (unix epoch) plus *out_zone if any entry will fire within
-// the next 7 days. Returns false if schedule is empty / all disabled.
+// the horizon. Returns false if the schedule is empty / all disabled.
 bool irrigoto_schedule_next_run(time_t now, time_t *out_t, int *out_zone)
 {
     if (s_schedule.count == 0 || now < 1700000000) return false;
-    // Honor an active delay — entries that would fire during the
-    // suspension window are skipped so callers (next_run sensor,
-    // sleep-shortening logic) all see the same effective "next fire".
-    // Self-clears on expiry via the getter.
-    time_t delay_until = irrigoto_schedule_get_delay_until();
-    time_t earliest = (delay_until > now) ? delay_until : now;
+    time_t earliest = sched_earliest_fire_from(now);
     time_t best_t = 0;
     int    best_zone = 0;
     for (uint8_t i = 0; i < s_schedule.count; i++) {
-        const schedule_entry_t *e = &s_schedule.entries[i];
-        if (!e->enabled || e->days_mask == 0) continue;
-        // Walk forward up to 14 days — needs to outrun the max delay
-        // window (also 14d) so an entry isn't missed when a long delay
-        // hides everything in the first week.
-        for (int d = 0; d < 15; d++) {
-            time_t t = earliest + d * 86400;
-            struct tm lt;
-            localtime_r(&t, &lt);
-            lt.tm_hour = e->hour; lt.tm_min = e->minute; lt.tm_sec = 0;
-            time_t fire_t = mktime(&lt);
-            if (fire_t <= earliest) continue;  // already past or in delay
-            // Re-check day-of-week of fire_t (DST shifts can reorder)
-            struct tm flt; localtime_r(&fire_t, &flt);
-            if (!(e->days_mask & (1u << flt.tm_wday))) continue;
-            if (best_t == 0 || fire_t < best_t) {
-                best_t = fire_t;
-                best_zone = e->zone;
-            }
-            break;  // earliest day-of-week match wins for this entry
+        time_t fire_t = sched_entry_next_fire(&s_schedule.entries[i], earliest);
+        if (fire_t && (best_t == 0 || fire_t < best_t)) {
+            best_t = fire_t;
+            best_zone = s_schedule.entries[i].zone;
         }
     }
     if (best_t == 0) return false;
@@ -20787,23 +20973,13 @@ static bool schedule_next_run_full(time_t now, time_t *out_t,
                                    uint8_t *out_depth)
 {
     if (s_schedule.count == 0 || now < 1700000000) return false;
-    time_t delay_until = irrigoto_schedule_get_delay_until();
-    time_t earliest = (delay_until > now) ? delay_until : now;
+    time_t earliest = sched_earliest_fire_from(now);
     time_t best_t = 0;
     const schedule_entry_t *best = NULL;
     for (uint8_t i = 0; i < s_schedule.count; i++) {
-        const schedule_entry_t *e = &s_schedule.entries[i];
-        if (!e->enabled || e->days_mask == 0) continue;
-        for (int d = 0; d < 15; d++) {
-            time_t t = earliest + d * 86400;
-            struct tm lt; localtime_r(&t, &lt);
-            lt.tm_hour = e->hour; lt.tm_min = e->minute; lt.tm_sec = 0;
-            time_t fire_t = mktime(&lt);
-            if (fire_t <= earliest) continue;
-            struct tm flt; localtime_r(&fire_t, &flt);
-            if (!(e->days_mask & (1u << flt.tm_wday))) continue;
-            if (best_t == 0 || fire_t < best_t) { best_t = fire_t; best = e; }
-            break;
+        time_t fire_t = sched_entry_next_fire(&s_schedule.entries[i], earliest);
+        if (fire_t && (best_t == 0 || fire_t < best_t)) {
+            best_t = fire_t; best = &s_schedule.entries[i];
         }
     }
     if (best_t == 0 || best == NULL) return false;
