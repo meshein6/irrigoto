@@ -245,6 +245,18 @@ section{margin-bottom:18px;}
 .up-nosol{color:var(--text-dim);}
 .up-delay{color:var(--orange);font-size:11px;margin-bottom:6px;}
 
+/* b600: one expander, used by both cards. Collapsed each shows a single row
+   -- the next run, the last run -- because that is the question being asked
+   nine times out of ten. */
+.more-btn{display:block;width:100%;margin-top:8px;padding:5px 0;
+  background:none;border:none;border-top:1px solid var(--border);
+  color:var(--text-mid);font-size:11px;letter-spacing:.04em;cursor:pointer;
+  font-family:inherit;}
+.more-btn:hover{color:var(--green);}
+.sched-sep{border-top:1px solid var(--border);margin:8px 0 6px;padding-top:8px;}
+.sched-sep-lbl{color:var(--text-dim);font-size:10px;letter-spacing:.08em;
+  text-transform:uppercase;margin-bottom:4px;}
+
 /* Path preview (b535) */
 #path-row{display:flex;gap:12px;align-items:center;margin:0 0 14px;}
 #path-thumb{flex-shrink:0;cursor:pointer;border-radius:50%;}
@@ -313,13 +325,6 @@ section{margin-bottom:18px;}
       <a class="sec-btn" href="/schedule">Edit</a>
     </div>
     <div id="sched-summary" class="card"><div class="empty">No schedules configured.</div></div>
-  </section>
-  <section>
-    <div class="sec-hdr">
-      <span class="sec-title">Upcoming</span>
-      <a class="sec-btn" href="/schedule">Edit</a>
-    </div>
-    <div class="card" id="upcoming-card"><div class="empty">Loading&hellip;</div></div>
   </section>
   <section>
     <div class="sec-hdr">
@@ -1185,15 +1190,41 @@ const RUN_COL = {start:0,end:1,uptime:2,dur:3,zone_id:4,zone:5,trigger:6,mode:7,
                  cov:14,score:15,psi_min:16,psi_avg:17,psi_max:18,fw:19,
                  bottle:20,sol_ml:21};   // b568
 function escHtml(t){ const d=document.createElement('div'); d.textContent=t==null?'':t; return d.innerHTML; }
+// b600: collapsed to the last run, expandable to RUNS_MAX.
+//
+// The Schedule card used to carry its own "Last: ... 3 h ago" line as well,
+// from last_run.epoch -- the run's FINISH time, while these rows show its
+// START. The same run at two different times, neither labelled. That line is
+// gone; this row is the one answer.
+const RUNS_MAX = 20;
+let _runsExpanded = (function(){
+  try { return localStorage.getItem('irrigoto_runs_exp') === '1'; } catch(_){ return false; }
+})();
+let _runsCache = null;
+
+function toggleRuns(){
+  _runsExpanded = !_runsExpanded;
+  try { localStorage.setItem('irrigoto_runs_exp', _runsExpanded ? '1' : '0'); } catch(_){}
+  renderRuns();
+}
+
 async function loadRuns(){
+  try {
+    const txt = await fetch('/api/runs?limit=' + RUNS_MAX, {cache:'no-store'})
+                        .then(r => r.text());
+    _runsCache = txt.split('\n').map(l => l.trim()).filter(Boolean);
+  } catch(e){ return; }            // leave the last good list up
+  renderRuns();
+}
+
+function renderRuns(){
   const el = document.getElementById('runs-card');
   if (!el) return;
-  let txt = '';
-  try { txt = await fetch('/api/runs?limit=8', {cache:'no-store'}).then(r => r.text()); }
-  catch(e){ return; }
-  const rows = txt.split('\n').map(l => l.trim()).filter(Boolean);
+  const rows = _runsCache;
+  if (!rows) return;
   if (!rows.length) { el.innerHTML = '<div class="empty">No runs recorded yet.</div>'; return; }
-  el.innerHTML = rows.map(line => {
+  const shown = _runsExpanded ? rows : rows.slice(0, 1);
+  el.innerHTML = shown.map(line => {
     const c = line.split(',');
     const st = c[RUN_COL.status] || '', ok = (st === 'completed');
     // No clock when the run started -> show uptime instead of a fake date.
@@ -1221,7 +1252,12 @@ async function loadRuns(){
       '<span class="run-vol' + (ok ? '' : ' bad') + '">' +
         (isFinite(vol) ? vol.toFixed(1) + ' L' : '\u2014') + '</span>' +
     '</div>';
-  }).join('');
+  }).join('')
+  + (rows.length > 1
+      ? '<button class="more-btn" onclick="toggleRuns()">' +
+        (_runsExpanded ? '\u25b4 Show less'
+                       : '\u25be Last ' + rows.length + ' runs') + '</button>'
+      : '');
 }
 
 // ── Upcoming runs (b587) ────────────────────────────────────────────────────
@@ -1270,13 +1306,26 @@ function fmtUpcomingIn(sec){
   return (d < 10 ? d.toFixed(d < 2 ? 1 : 0) : Math.round(d)) + ' d';
 }
 
-async function loadUpcoming(){
-  const el = document.getElementById('upcoming-card');
-  if (!el) return;
-  let d;
-  try { d = await fetch('/api/upcoming?n=5', {cache:'no-store'}).then(r => r.json()); }
-  catch(e){ return; }                 // leave the last good list up
-  if (!d || !d.ok) return;
+// b600: the upcoming list is HTML now, not a card of its own -- it is built
+// here and handed to refreshSchedule() to place inside the Schedule card.
+// "Next: ..." used to sit above it saying the same thing in different words.
+//
+// Collapsed shows one row, because "when does it next water" is the question
+// nine times out of ten. Expanded shows up to UPCOMING_MAX.
+const UPCOMING_MAX = 20;
+let _upExpanded = (function(){
+  try { return localStorage.getItem('irrigoto_up_exp') === '1'; } catch(_){ return false; }
+})();
+let _upCache = null;
+
+function toggleUpcoming(){
+  _upExpanded = !_upExpanded;
+  try { localStorage.setItem('irrigoto_up_exp', _upExpanded ? '1' : '0'); } catch(_){}
+  refreshSchedule(false);       // re-render from cache, no refetch
+}
+
+function upcomingHtml(d){
+  if (!d || !d.ok) return '';
   const tz = d.tz_offset_min || 0, now = d.now || 0;
   const runs = d.runs || [];
 
@@ -1294,11 +1343,11 @@ async function loadUpcoming(){
       : head ? 'Nothing scheduled after the delay.'
       : d.entries ? 'No enabled schedule entries.'
       : 'Nothing scheduled. <a href="/schedule" style="color:var(--green)">Add a schedule &rarr;</a>';
-    el.innerHTML = head + '<div class="empty">' + why + '</div>';
-    return;
+    return head + '<div class="empty">' + why + '</div>';
   }
 
-  el.innerHTML = head + runs.map((r, i) => {
+  const shown = _upExpanded ? runs : runs.slice(0, 1);
+  let html = head + shown.map((r, i) => {
     const mode  = SCHED_MODE_LABELS[r.mode] || '';
     const depth = DEPTH_LABELS[r.depth] || '';
     const est   = r.est_min > 0 ? ' \u00b7 ~' + r.est_min + ' min' : '';
@@ -1316,6 +1365,20 @@ async function loadUpcoming(){
       '<span class="up-in">' + escHtml(fmtUpcomingIn(r.epoch - now)) + '</span>' +
     '</div>';
   }).join('');
+
+  if (runs.length > 1)
+    html += '<button class="more-btn" onclick="toggleUpcoming()">' +
+            (_upExpanded ? '\u25b4 Show less'
+                         : '\u25be Next ' + runs.length + ' runs') + '</button>';
+  return html;
+}
+
+async function loadUpcoming(){
+  try {
+    const d = await fetch('/api/upcoming?n=' + UPCOMING_MAX, {cache:'no-store'})
+                      .then(r => r.json());
+    if (d && d.ok) { _upCache = d; refreshSchedule(false); }
+  } catch(e){ /* leave the last good list up */ }
 }
 
 // ── Path preview (b535) ─────────────────────────────────────────────────────
@@ -1823,44 +1886,46 @@ function relTimeFromSec(deltaSec, future){
   return Math.round(abs/86400) + ' d' + suffix;
 }
 
-async function refreshSchedule(){
+// b600: one Schedule card -- the next run(s) on top, the configured entries
+// below. Two things went away as redundant:
+//
+//   "Next: Zone #0 at 2026-09-29 15:00" -- the first upcoming row says the
+//   same thing, with the duration and the depth as well.
+//
+//   "Last: Zone #0 (completed) · 3 h ago" -- the History card's first row
+//   says it, and says it better: that line was showing the run's FINISH
+//   epoch while History shows its START, so the same run appeared at two
+//   different times with neither labelled.
+//
+// _schedCache lets toggleUpcoming() re-render without refetching.
+let _schedCache = null;
+
+async function refreshSchedule(fetchNew){
   try{
-    const d = await fetch('/api/schedule',{cache:'no-store'}).then(r=>r.json());
-    const el = document.getElementById('sched-summary');
-    const entries = d.entries || [];
-    const tz = d.tz_offset_min || 0;
-    const now = d.now || 0;
-    // Render the "last completed" line whether or not there are
-    // entries — it's history, not schedule state.
-    let lastHtml = '';
-    if (d.last_run && d.last_run.epoch > 1700000000){
-      const zn = d.last_run.name || ('Zone #'+(d.last_run.zone-1));
-      const ago = now ? relTimeFromSec(now - d.last_run.epoch, false) : '';
-      const stat = d.last_run.status || '';
-      const statCol = stat === 'completed' ? 'var(--green)'
-                    : stat === 'cancelled' ? 'var(--text-mid)'
-                    : 'var(--orange)';
-      lastHtml = '<div style="font-size:12px;color:var(--text-mid);margin-bottom:4px;">'+
-                 'Last: <span style="color:var(--text)">'+zn+'</span> '+
-                 '<span style="color:'+statCol+'">('+stat+')</span> '+
-                 (ago ? '&middot; '+ago : '')+
-                 '</div>';
+    if (fetchNew !== false) {
+      _schedCache = await fetch('/api/schedule',{cache:'no-store'}).then(r=>r.json());
     }
+    const d = _schedCache;
+    const el = document.getElementById('sched-summary');
+    if (!el || !d) return;
+    const entries = d.entries || [];
+
+    // The upcoming occurrences, from /api/upcoming (cached separately).
+    const upHtml = _upCache ? upcomingHtml(_upCache) : '';
+
     if (!entries.length){
-      el.innerHTML = lastHtml +
+      el.innerHTML = upHtml ||
         '<div class="empty">No schedules configured. <a href="/schedule" style="color:var(--green)">Add one &rarr;</a></div>';
       return;
     }
-    // Build a zone-id -> name map for nicer labels.
+
     const zoneMap = {};
     (d.zones||[]).forEach(z => { zoneMap[z.id+1] = z.name; });
-    let html = lastHtml;
-    if (d.next_run && d.next_run.epoch > 1700000000){
-      const zn = zoneMap[d.next_run.zone] || ('Zone #'+(d.next_run.zone-1));
-      html += '<div style="font-size:12px;color:var(--text-mid);margin-bottom:6px;">'+
-              'Next: <span style="color:var(--green)">'+zn+'</span> at '+
-              fmtLocalEpoch(d.next_run.epoch, tz)+'</div>';
-    }
+
+    let html = upHtml;
+    // The entries themselves: the recurrence rule, which the occurrence list
+    // above does not state ("every day" vs "Mon Wed Fri").
+    html += '<div class="sched-sep"><div class="sched-sep-lbl">Repeats</div>';
     html += '<div style="display:flex;flex-direction:column;gap:4px;">';
     entries.forEach(e => {
       const zn = zoneMap[e.zone] || ('Zone #'+(e.zone-1));
@@ -1869,17 +1934,18 @@ async function refreshSchedule(){
               'style="display:flex;justify-content:space-between;align-items:center;'+
               'font-size:12px;">'+
               '<span style="color:var(--text)"><span class="sched-dot">&#9679;</span> '+
-              t+' &middot; '+zn+'</span>'+
+              t+' &middot; '+escHtml(zn)+'</span>'+
               '<span style="color:var(--text-mid);font-size:11px;">'+daysShort(e.days_mask)+'</span>'+
               '</div>';
     });
-    html += '</div>';
+    html += '</div></div>';
     el.innerHTML = html;
     paintSchedDots();
   }catch(e){
     // Silent — leave whatever was there. The /schedule page surfaces the real error.
   }
 }
+
 // b587: the upcoming list is schedule-derived, so it refreshes on the same
 // cadence. It also moves when a run finishes -- the solution rotation
 // advances -- which updateWateringState picks up.
