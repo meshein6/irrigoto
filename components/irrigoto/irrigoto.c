@@ -18503,7 +18503,11 @@ static esp_err_t api_live_plan_handler(httpd_req_t *req)
 //             "est_min":7,"bottle":2},...]}
 // bottle 0 = that run does not dose. An empty runs[] means nothing is
 // scheduled, or a delay covers the whole horizon.
-#define UPCOMING_MAX 10
+// b600: 20, because that is what the Schedule card's expander offers. The
+// response buffer is sized to hold them: ~110 bytes a record, and the
+// per-record headroom check below would otherwise stop at about 12 and
+// silently return a short list that looked like the whole answer.
+#define UPCOMING_MAX 20
 static esp_err_t api_upcoming_handler(httpd_req_t *req)
 {
     WEB_TOUCH();
@@ -18535,7 +18539,7 @@ static esp_err_t api_upcoming_handler(httpd_req_t *req)
         zone_perimeter_t zp;
         time_t           cursor[SCHEDULE_MAX_ENTRIES];
         uint8_t          seen[SCHEDULE_MAX_ENTRIES];
-        char             buf[1600];
+        char             buf[2800];   // b600: 20 records, not 10
     } *W = calloc(1, sizeof(*W));
     if (!W) {
         httpd_resp_send(req, "{\"ok\":false,\"error\":\"no memory\"}", -1);
