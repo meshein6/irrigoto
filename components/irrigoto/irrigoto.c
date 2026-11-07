@@ -6545,11 +6545,14 @@ static inline void water_set_status(int code)
     s_water_abort = true;
 }
 
+static void lowbatt_note_at_sleep(void);   // low-battery mode, defined below
+
 // Safe pre-sleep prep: close valve, blank LED, power down rails. Used by
 // every sleep path so the device always sleeps in a known-safe state.
 static void prepare_for_sleep(void)
 {
     solution_on_run_end();   // pump off + counters committed before rails drop
+    lowbatt_note_at_sleep();   // low pack now -> next wake takes the low-battery boot
     motor_rail_on();
     sensor_rail_on();
     valve_goto(VALVE_CLOSED_DEG, 2.0f, 10000, false);
@@ -6963,15 +6966,20 @@ static void sleep_forever_quiet(const char *reason)
 // unit that dipped low on short October days stayed dark for weeks with a full
 // battery until someone swiped the magnet.
 //
-// Now, on a SETTLED reading:
-//   >= 3.6 V        boot normally
-//   3.3 .. 3.6 V    sleep LOWBATT_RECHECK_S (6 h) on the RTC timer, then re-check
+// Now there is a LOW-BATTERY MODE, held in a persisted flag (NVS "OtO" /
+// "pm_lowbatt"). It is entered whenever a reading falls below 3.6 V:
+//   - at sleep time (prepare_for_sleep reads the pack on every sleep), or
+//   - at boot (check_battery_on_boot), as a backstop.
+// A wake with the flag set does NOT run the normal boot. It runs
+// lowbatt_mode_boot() instead -- under ESPHome from IrrigotoBatteryGate at
+// HARDWARE priority, ahead of the WiFi component, so the radio never starts:
+// GPIO + ADC, settle, then decide on the SETTLED reading:
+//   >= 3.6 V        clear the flag, continue into the normal boot
+//   3.3 .. 3.6 V    sleep LOWBATT_RECHECK_S (6 h) on the RTC timer, stay in mode
 //   <  3.3 V        sleep forever (the pack isn't being charged; protect the LiPo)
 // Winter sleep wins: a winterized unit on a low pack still sleeps forever.
-//
-// Under ESPHome the check runs from IrrigotoBatteryGate at HARDWARE priority,
-// ahead of the WiFi component, so a low-battery wake never starts the radio:
-// it's GPIO + ADC + a short settle, then straight back to sleep.
+// A wake WITHOUT the flag skips all of this and boots exactly as before.
+// The flag is written only on entry and exit, never on the 6 h re-checks.
 
 #ifdef ESPHOME_COMPONENT
 // irrigoto.cpp: clears ESPHome's safe_mode boot counter. Every quick
@@ -6983,6 +6991,30 @@ extern void irrigoto_before_lowbatt_sleep(void);
 #else
 static void irrigoto_before_lowbatt_sleep(void) {}
 #endif
+
+// Low-battery mode flag. Read straight from NVS: the gate runs before
+// pm_nvs_load(). Cached so repeated sets don't rewrite flash.
+static int8_t s_lowbatt_flag = -1;   // -1 = not read yet
+static bool lowbatt_flag_get(void)
+{
+    if (s_lowbatt_flag < 0) {
+        s_lowbatt_flag = 0;
+        nvs_handle_t h;
+        if (nvs_open(CAL_NVS_NAMESPACE, NVS_READONLY, &h) == ESP_OK) {
+            uint8_t v = 0;
+            if (nvs_get_u8(h, "pm_lowbatt", &v) == ESP_OK) s_lowbatt_flag = (v != 0);
+            nvs_close(h);
+        }
+    }
+    return s_lowbatt_flag > 0;
+}
+static void lowbatt_flag_set(bool on)
+{
+    if (lowbatt_flag_get() == on) return;
+    s_lowbatt_flag = on ? 1 : 0;
+    pm_nvs_save_u8("pm_lowbatt", on ? 1 : 0);
+    ESP_LOGW(TAG, "Low-battery mode %s", on ? "ENTERED" : "cleared");
+}
 
 static bool winter_flag_from_nvs(void)
 {
@@ -7033,6 +7065,7 @@ static void sleep_quiet_timer(const char *reason, uint32_t secs)
 // Never returns. batt_v must be a settled reading below BATT_MIN_VOLTAGE_V.
 static void lowbatt_sleep(float batt_v)
 {
+    lowbatt_flag_set(true);   // next wake takes the low-battery boot, not the normal one
     irrigoto_before_lowbatt_sleep();
     if (batt_v < BATT_SHUTDOWN_V) {
         ESP_LOGW(TAG, "Battery %.2fV below %.1fV -- shutting down until power-cycled",
@@ -7045,6 +7078,60 @@ static void lowbatt_sleep(float batt_v)
     ESP_LOGW(TAG, "Battery %.2fV below %.1fV -- no WiFi, re-checking in %u h",
              batt_v, BATT_MIN_VOLTAGE_V, (unsigned)(LOWBATT_RECHECK_S / 3600u));
     sleep_quiet_timer("low battery (6h recheck)", LOWBATT_RECHECK_S);
+}
+
+// Called from prepare_for_sleep(), i.e. on every sleep path while the unit is
+// still up. A pack under 3.6 V now means the next wake should be the quiet
+// low-battery boot rather than a full one with WiFi. The reading is taken
+// under load (radio still on), so it can read a little low; the flagged wake
+// settles and re-measures, and clears the flag if the pack is actually fine.
+static void lowbatt_note_at_sleep(void)
+{
+    sensor_rail_on();
+    adc_setup();
+    float v = batt_now_v();
+    if (v > 0.5f && v < BATT_MIN_VOLTAGE_V) {
+        ESP_LOGW(TAG, "Battery %.2fV at sleep -- next wake is a low-battery check "
+                      "(no WiFi)", v);
+        lowbatt_flag_set(true);
+    }
+}
+
+// The low-battery boot sequence. No-op unless the flag is set. Never returns
+// while the pack is still low; returns (flag cleared) once it has recovered,
+// and the normal boot continues from there.
+static void lowbatt_mode_boot(void)
+{
+    if (!lowbatt_flag_get()) return;
+    ESP_LOGW(TAG, "Low-battery mode wake: checking battery, WiFi not started");
+    gpio_setup();                     // rails + motor pins to a known-off state
+    sensor_rail_on();
+    adc_setup();
+    float v = batt_settled_v();
+    if (v <= 0.5f) {
+        // ADC unreadable: don't strand the unit in the mode on a bad read.
+        ESP_LOGW(TAG, "Battery unreadable in low-battery mode -- booting normally");
+        lowbatt_flag_set(false);
+        sensor_rail_off();            // normal boot powers it again when needed
+        return;
+    }
+    if (v >= BATT_MIN_VOLTAGE_V) {
+        ESP_LOGW(TAG, "Battery recovered to %.2fV -- leaving low-battery mode", v);
+        lowbatt_flag_set(false);
+        sensor_rail_off();            // normal boot powers it again when needed
+        return;
+    }
+    boot_diag_t diag = {0};
+    diag.boot_seq              = boot_diag_next_seq();
+    diag.fw_build              = (uint16_t)FW_BUILD;
+    diag.reset_reason          = (int8_t)esp_reset_reason();
+    diag.batt_v_at_boot        = v;
+    diag.valve_deg_at_boot     = -1.0f;
+    diag.valve_deg_after_close = -1.0f;
+    diag.boot_epoch            = (int64_t)time(NULL);
+    diag.flags                |= BOOT_DIAG_FLAG_BATT_TOO_LOW;
+    boot_diag_append_and_save(&diag);
+    lowbatt_sleep(v);                 // never returns
 }
 
 // b327: On a healthy-battery wake, verify the valve is closed. Catches
@@ -7158,6 +7245,10 @@ static void check_valve_closed_on_boot(boot_diag_t *diag)
 
 static void check_battery_on_boot(void)
 {
+    // Low-battery mode wake: separate sequence (no-op when the flag is clear;
+    // under ESPHome the gate has already run it before WiFi).
+    lowbatt_mode_boot();
+
     sensor_rail_on();
     adc_setup();
     vTaskDelay(pdMS_TO_TICKS(100));  // let rail settle
@@ -7228,40 +7319,17 @@ static void check_battery_on_boot(void)
 
 #ifdef ESPHOME_COMPONENT
 // Called by IrrigotoBatteryGate (irrigoto.cpp) at setup_priority::HARDWARE,
-// i.e. BEFORE the WiFi component brings the radio up. Returns only when the
-// battery is fine; irrigoto_init()'s check_battery_on_boot() then does the
-// full boot check (boot_diag, leak check, valve close) exactly as before.
-// The pressure-based leak check is deliberately NOT run here: valve frame and
-// fault state aren't loaded from NVS yet this early, and a quiet low-battery
-// wake can't act on a leak anyway (the valve was closed and verified by
-// prepare_for_sleep() before the unit last slept).
+// i.e. BEFORE the WiFi component brings the radio up. Without the low-battery
+// flag it returns immediately and the boot is exactly as before. With it, the
+// unit runs the low-battery sequence and only continues into the normal boot
+// once the pack has recovered.
+// The pressure-based leak check is deliberately NOT run in that sequence:
+// valve frame and fault state aren't loaded from NVS yet this early, and a
+// quiet low-battery wake can't act on a leak anyway (the valve was closed and
+// verified by prepare_for_sleep() before the unit last slept).
 void irrigoto_early_battery_gate(void)
 {
-    gpio_setup();                     // rails + motor pins to a known-off state
-    sensor_rail_on();
-    adc_setup();
-    vTaskDelay(pdMS_TO_TICKS(100));   // let rail settle
-    float v = batt_now_v();
-    if (v < BATT_MIN_VOLTAGE_V && v > 0.5f) {
-        ESP_LOGW(TAG, "Battery %.2fV at early gate -- settling before deciding "
-                      "(WiFi not started)", v);
-        v = batt_settled_v();
-        if (v < BATT_MIN_VOLTAGE_V && v > 0.5f) {
-            boot_diag_t diag = {0};
-            diag.boot_seq              = boot_diag_next_seq();
-            diag.fw_build              = (uint16_t)FW_BUILD;
-            diag.reset_reason          = (int8_t)esp_reset_reason();
-            diag.batt_v_at_boot        = v;
-            diag.valve_deg_at_boot     = -1.0f;
-            diag.valve_deg_after_close = -1.0f;
-            diag.boot_epoch            = (int64_t)time(NULL);
-            diag.flags                |= BOOT_DIAG_FLAG_BATT_TOO_LOW;
-            boot_diag_append_and_save(&diag);
-            lowbatt_sleep(v);         // never returns
-        }
-        ESP_LOGI(TAG, "Battery settled at %.2fV -- booting normally", v);
-    }
-    sensor_rail_off();                // irrigoto_init() powers it again
+    lowbatt_mode_boot();
 }
 #endif
 

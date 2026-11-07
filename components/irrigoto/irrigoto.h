@@ -50,9 +50,10 @@ class IrrigotoModeSelect : public select::Select, public Component {
 
 // ─── Low-battery gate ────────────────────────────────────────────────────────
 // Runs irrigoto_early_battery_gate() at HARDWARE priority -- ahead of the
-// WiFi component (WIFI = 250) -- so a wake on a low battery checks the pack
-// and goes back to sleep without ever starting the radio. IrrigotoComponent
-// itself has to stay at AFTER_WIFI (it needs lwIP for its HTTP servers).
+// WiFi component (WIFI = 250). With the low-battery mode flag set, the wake
+// checks the pack and goes back to sleep without ever starting the radio;
+// without it, it returns at once. IrrigotoComponent itself has to stay at
+// AFTER_WIFI (it needs lwIP for its HTTP servers).
 
 class IrrigotoBatteryGate : public Component {
  public:

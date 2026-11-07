@@ -407,9 +407,10 @@ void irrigoto_sleep_now_with_reason(uint32_t duration_s, const char *reason);
 
 /**
  * Low-battery gate, run before WiFi starts (ESPHome: IrrigotoBatteryGate at
- * setup_priority::HARDWARE). Returns only if the settled battery reading is
- * >= 3.6 V. 3.3-3.6 V: quiet deep sleep for 6 h, then re-check. < 3.3 V (or
- * winterized): quiet deep sleep with no wake source.
+ * setup_priority::HARDWARE). Returns at once unless the low-battery mode flag
+ * is set. In that mode: settled reading >= 3.6 V clears the flag and returns
+ * (normal boot follows); 3.3-3.6 V quiet deep sleep for 6 h; < 3.3 V (or
+ * winterized) quiet deep sleep with no wake source.
  */
 void irrigoto_early_battery_gate(void);
 

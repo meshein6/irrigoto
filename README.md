@@ -318,28 +318,33 @@ To cancel, use either:
 
 ## Low battery
 
-Every wake checks the battery before WiFi starts. If the first reading is
-below 3.6 V the unit waits a couple of seconds for the pack to recover, reads
-it again, and decides on that settled value:
+When the battery reads below **3.6 V**, the unit enters **low-battery mode**.
+That's a flag saved on the device, set either when the unit goes to sleep (it
+reads the battery on every sleep) or, as a backstop, during boot.
+
+A wake with the flag set skips the normal boot. Before WiFi starts, it waits a
+couple of seconds for the pack to recover, reads it, and decides:
 
 | Settled battery | What the unit does |
 |---|---|
-| 3.6 V or more | Boots normally |
+| 3.6 V or more | Clears the flag and boots normally |
 | 3.3 – 3.6 V | Goes straight back to sleep without starting WiFi or moving a motor, and checks again in **6 hours** |
 | Below 3.3 V | Shuts down until power-cycled (magnet swipe) — nothing is charging it, so this protects the LiPo |
 
-So a unit with solar or wired power comes back by itself once the battery has
-recovered, at most 6 hours later, instead of staying dark until someone swipes
-the magnet. A low-battery wake costs about two seconds of ADC reads with no
-radio. Winter sleep wins: a winterized unit on a low battery still sleeps until
-power-cycled. The last sleep reason (`/api/all` → `last_sleep_reason`) reads
+A wake without the flag boots exactly as before. So a unit with solar or wired
+power comes back by itself once the battery has recovered, at most 6 hours
+later, instead of staying dark until someone swipes the magnet. A low-battery
+wake costs about two seconds of ADC reads with no radio, and the flag is only
+written to flash when the unit enters or leaves the mode. Winter sleep wins: a
+winterized unit on a low battery still sleeps until power-cycled. The last
+sleep reason (`/api/all` → `last_sleep_reason`) reads
 `low battery (6h recheck)`, `battery below 3.3V` or `low battery (winter)`.
 
-Under ESPHome the check runs in a small `IrrigotoBatteryGate` component at
-`setup_priority::HARDWARE`, ahead of the WiFi component. It also clears
-ESPHome's safe_mode boot counter before sleeping, because otherwise ten quick
-low-battery wakes in a row would bring the next boot up in safe mode with WiFi
-on.
+Under ESPHome the low-battery boot runs in a small `IrrigotoBatteryGate`
+component at `setup_priority::HARDWARE`, ahead of the WiFi component. It also
+clears ESPHome's safe_mode boot counter before sleeping, because otherwise ten
+quick low-battery wakes in a row would bring the next boot up in safe mode with
+WiFi on.
 
 ## Home Assistant integration
 
