@@ -6968,8 +6968,10 @@ static void sleep_forever_quiet(const char *reason)
 //
 // Now there is a LOW-BATTERY MODE, held in a persisted flag (NVS "OtO" /
 // "pm_lowbatt"). It is entered whenever a reading falls below 3.6 V:
-//   - at sleep time (prepare_for_sleep reads the pack on every sleep), or
+//   - at sleep time (prepare_for_sleep reads the pack on every sleep),
+//   - while awake, for always-on units (lowbatt_runtime_check, once a minute),
 //   - at boot (check_battery_on_boot), as a backstop.
+// A brownout reset runs the low-battery boot too, flag or not.
 // A wake with the flag set does NOT run the normal boot. It runs
 // lowbatt_mode_boot() instead -- under ESPHome from IrrigotoBatteryGate at
 // HARDWARE priority, ahead of the WiFi component, so the radio never starts:
@@ -7102,8 +7104,15 @@ static void lowbatt_note_at_sleep(void)
 // and the normal boot continues from there.
 static void lowbatt_mode_boot(void)
 {
-    if (!lowbatt_flag_get()) return;
-    ESP_LOGW(TAG, "Low-battery mode wake: checking battery, WiFi not started");
+    // A brownout reset gets the same treatment even without the flag: on an
+    // always-on unit whose power has dropped out, the pack can run down
+    // unwatched until WiFi start-up or a motor pull browns the chip out. A
+    // normal boot would start WiFi again and could brown out again, in a
+    // loop, before check_battery_on_boot ever ran.
+    bool brownout = (esp_reset_reason() == ESP_RST_BROWNOUT);
+    if (!lowbatt_flag_get() && !brownout) return;
+    ESP_LOGW(TAG, "%s: checking battery, WiFi not started",
+             brownout ? "Brownout reset" : "Low-battery mode wake");
     gpio_setup();                     // rails + motor pins to a known-off state
     sensor_rail_on();
     adc_setup();
@@ -7376,6 +7385,46 @@ static void cal_watchdog_check(void)
     s_cal_state_since = 0;
 }
 
+// Always-on units (auto-sleep off) never reach prepare_for_sleep(), so the
+// sleep-time battery read never happens and a dropped-out supply would run the
+// pack down unwatched. While awake, read the pack once a minute; three low
+// readings in a row (3 min, ignoring motor/pump work, which sags it) put the
+// unit into low-battery mode. It sets the flag and takes a short quiet sleep,
+// so the very next wake is the low-battery boot: that one settles, re-reads
+// without WiFi, and makes the real call (back to normal, 6 h, or off below
+// 3.3 V). The radio is on during these reads, so this path never decides the
+// < 3.3 V shutdown by itself.
+#define LOWBATT_RUNTIME_PERIOD_MS 60000u
+#define LOWBATT_RUNTIME_STRIKES   3u
+#define LOWBATT_HANDOFF_S         10u
+static void lowbatt_runtime_check(void)
+{
+    static TickType_t last = 0;
+    static uint8_t strikes = 0;
+    TickType_t now = xTaskGetTickCount();
+    if (last != 0 && (now - last) < pdMS_TO_TICKS(LOWBATT_RUNTIME_PERIOD_MS)) return;
+    last = now;
+    bool busy = (s_web_water_mode != 0) || s_frame_sweep_active ||
+                s_wcal.state == WCAL_PRESSURE_SCANNING        ||
+                s_wcal.state == WCAL_PRESSURE_AWAIT_THROW     ||
+                s_wcal.state == WCAL_PRESSURE_AWAIT_THROW_LOW ||
+                s_wcal.state == WCAL_NOZZLE_RUNNING           ||
+                s_wcal.state == WCAL_JOG_RUNNING;
+    if (busy) { strikes = 0; return; }
+    float v = batt_now_v();
+    if (v <= 0.5f || v >= BATT_MIN_VOLTAGE_V) { strikes = 0; return; }
+    if (++strikes < LOWBATT_RUNTIME_STRIKES) {
+        ESP_LOGW(TAG, "Battery %.2fV below %.1fV while awake (%u/%u)",
+                 v, BATT_MIN_VOLTAGE_V, (unsigned)strikes, (unsigned)LOWBATT_RUNTIME_STRIKES);
+        return;
+    }
+    ESP_LOGW(TAG, "Battery %.2fV below %.1fV for %u min while awake -- entering "
+                  "low-battery mode", v, BATT_MIN_VOLTAGE_V, (unsigned)LOWBATT_RUNTIME_STRIKES);
+    lowbatt_flag_set(true);
+    irrigoto_before_lowbatt_sleep();
+    sleep_quiet_timer("low battery (awake)", LOWBATT_HANDOFF_S);   // never returns
+}
+
 static void check_inactivity(void)
 {
     if (s_last_activity == 0) return;  // not yet initialised
@@ -7406,6 +7455,7 @@ static void check_inactivity(void)
 #endif
         return;
     }
+    if (!s_ota_in_progress) lowbatt_runtime_check();   // also covers always-on
     if (s_sleep_disabled)  return;  // user disabled auto-sleep
     // b490: NEVER sleep mid-calibration. A cal holds the valve OPEN while the
     // operator measures, the cal task has already exited at the await steps, and

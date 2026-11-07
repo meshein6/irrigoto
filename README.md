@@ -319,8 +319,11 @@ To cancel, use either:
 ## Low battery
 
 When the battery reads below **3.6 V**, the unit enters **low-battery mode**.
-That's a flag saved on the device, set either when the unit goes to sleep (it
-reads the battery on every sleep) or, as a backstop, during boot.
+That's a flag saved on the device. It's set when the unit goes to sleep (it
+reads the battery on every sleep), while it's awake (a check once a minute, so
+**Always on** units are covered too: three low readings in a row, outside
+watering and calibration), or, as a backstop, during boot. A brownout reset is
+handled like a low-battery wake even without the flag.
 
 A wake with the flag set skips the normal boot. Before WiFi starts, it waits a
 couple of seconds for the pack to recover, reads it, and decides:
