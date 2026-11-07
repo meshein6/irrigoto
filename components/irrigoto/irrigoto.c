@@ -644,7 +644,6 @@ static void fault_hold_arm(void)
 #define INACTIVITY_SLEEP_MS   (5 * 60 * 1000)  // 5 minutes
 #define BATT_MIN_VOLTAGE_V        3.6f         // sleep forever below this (no motor activity)
 #define LOWBATT_RETRY_S           1800u        // b602: ext-power units re-check a low battery this often instead of sleeping forever
-#define BATT_EXT_FLOOR_V          3.3f         // b603: ext-power units still sleep forever below this -- the pack isn't being charged, stop waking it
 #define BATT_VALVE_SAFE_VOLTAGE_V 3.8f         // require this much margin to attempt the wake-time valve-close check. Lowered from 3.9V (b347) -- water safety > controller safety, and a single ADC sample at boot can read lower than steady-state if the battery hasn't recovered from prior watering load.
 
 // Zone perimeter
@@ -6962,15 +6961,8 @@ static void sleep_forever_quiet(const char *reason)
 // forever-slept, and stayed dark for weeks with a full pack and power applied,
 // because nothing ever woke it to measure again. With this set, the low-battery
 // boot gate arms an RTC timer and re-checks every LOWBATT_RETRY_S instead. The
-// retry wake skips the motors, but it is NOT radio-free: the component sets up
-// AFTER_WIFI, so WiFi has already started by the time this gate runs. Each
-// retry is a 1-2 s boot with the radio coming up.
-//
-// b603: the retry only covers BATT_EXT_FLOOR_V..BATT_MIN_VOLTAGE_V. Below the
-// floor the external power is evidently gone, so the unit falls back to the
-// permanent quiet sleep: that stops the retry boots from running a LiPo into
-// deep discharge, and avoids a brownout-reset loop when WiFi start-up sags a
-// nearly flat pack.
+// retry wake is the same quiet path (sensor read only, no motors, no WiFi), so
+// on a pack that really is flat it costs a few hundred ms of ADC every 30 min.
 //
 // Read straight from NVS rather than from pm_nvs_load(): check_battery_on_boot
 // runs before pm_nvs_load on the standalone (app_main) path. Winter sleep wins:
@@ -6995,7 +6987,7 @@ static void ext_power_set(bool on)
     pm_nvs_save_u8("pm_ext_pwr", on ? 1 : 0);
     INFO("Connected-to-power %s (persisted): low battery %s",
          on ? "ON" : "OFF",
-         on ? "re-checks every 30 min down to 3.3 V instead of shutting off for good"
+         on ? "re-checks every 30 min instead of shutting off for good"
             : "shuts the unit off until a power cycle / magnet swipe");
 }
 static bool winter_flag_from_nvs(void)
@@ -7173,8 +7165,8 @@ static void check_battery_on_boot(void)
         // fault log scream about it instead of the yard silently flooding.
         valve_verify_closed_dry("boot batt-too-low", false);
         boot_diag_append_and_save(&diag);
-        if (ext_power_get() && !winter_flag_from_nvs() && batt_v >= BATT_EXT_FLOOR_V)
-            sleep_quiet_retry("low battery (retrying)", LOWBATT_RETRY_S);  // b602/b603
+        if (ext_power_get() && !winter_flag_from_nvs())
+            sleep_quiet_retry("low battery (retrying)", LOWBATT_RETRY_S);  // b602
         sleep_forever_quiet("low battery");
     }
 
@@ -17985,12 +17977,10 @@ static bool tz_set(const char *posix, const char *name)
 //   GET  /api/system -> {"ssid","password","connected","rssi",
 //                        "always_on","awake_s","sleep_s",
 //                        "tz","tz_name","tz_default","tz_saved",
-//                        "now","tz_offset_min","ext_power","lowbatt_retry_s",
-//                        "lowbatt_floor_v"}
+//                        "now","tz_offset_min","ext_power","lowbatt_retry_s"}
 //   POST always_on=0|1&awake_s=30..3600&sleep_s=30..3600   (any subset)
 //   POST ext_power=0|1   b602: unit is connected to power -- a low battery at
-//        boot re-checks every lowbatt_retry_s instead of shutting off for good,
-//        down to lowbatt_floor_v (below that it still shuts off for good)
+//        boot re-checks every lowbatt_retry_s instead of shutting off for good
 //   POST tz=<POSIX TZ>&tz_name=<label>   saves a zone (tz= empty -> back to
 //        the compiled default). Applies immediately, no reboot.
 //   POST ssid=..&password=..   saves the network through ESPHome's
@@ -18123,7 +18113,7 @@ static esp_err_t api_system_handler(httpd_req_t *req)
     int n = snprintf(buf, sizeof(buf),
         "{\"ssid\":\"%s\",\"password\":\"%s\",\"connected\":%s,\"rssi\":%d,"
         "\"always_on\":%s,\"awake_s\":%lu,\"sleep_s\":%lu,"
-        "\"ext_power\":%s,\"lowbatt_retry_s\":%lu,\"lowbatt_floor_v\":%.2f,"
+        "\"ext_power\":%s,\"lowbatt_retry_s\":%lu,"
         "\"tz\":\"%s\",\"tz_name\":\"%s\",\"tz_default\":\"%s\",\"tz_saved\":%s,"
         "\"tz_env\":\"%s\",\"tz_abbr\":\"%s\",\"tz_isdst\":%d,"
         "\"tz_offset_lt_min\":%ld,"
@@ -18132,7 +18122,7 @@ static esp_err_t api_system_handler(httpd_req_t *req)
         irrigoto_get_auto_sleep_enabled() ? "false" : "true",
         (unsigned long)irrigoto_get_inactivity_s(),
         (unsigned long)irrigoto_get_sleep_duration_s(),
-        ext_power_get() ? "true" : "false", (unsigned long)LOWBATT_RETRY_S, (double)BATT_EXT_FLOOR_V,
+        ext_power_get() ? "true" : "false", (unsigned long)LOWBATT_RETRY_S,
         tz_js, tzn_js, tzd_js, s_tz_posix[0] ? "true" : "false",
         tze_js, abbr_js, lt_isdst, off_lt,
         (long)now, off);
