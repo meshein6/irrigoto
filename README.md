@@ -316,6 +316,23 @@ To cancel, use either:
   Both its buttons need the device awake; press one while it's asleep and you
   get a notification saying so rather than a silent no-op.
 
+## Low battery and "Connected to power"
+
+If the battery reads below **3.6 V** when the unit wakes, it shuts down
+quietly without touching the motors. By default that shutdown is permanent: no
+wake timer is armed, so only a power cycle or a magnet swipe brings it back,
+even after a solar panel or wired supply has recharged the battery. A unit
+that dips low on short autumn days can stay dark for weeks with a full pack.
+
+For units with solar or wired power, turn on **Connected to power** (device
+web UI → System settings → Power, or `POST /api/system` with `ext_power=1`).
+The unit then sleeps on a 30-minute timer instead, re-checks the battery
+each time (sensor read only, no motors or WiFi), and comes back by itself
+once the battery is above 3.6 V. `GET /api/system` reports `ext_power` and
+`lowbatt_retry_s`. The setting is stored in NVS (`OtO`/`pm_ext_pwr`) and is
+off by default. Winter sleep still wins: a winterized unit stays down until
+it is power-cycled.
+
 ## Home Assistant integration
 
 The HA-side config — template sensors, automations, schedule and rain-delay
