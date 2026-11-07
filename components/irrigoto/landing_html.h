@@ -454,15 +454,6 @@ section{margin-bottom:18px;}
     <div class="sys-status" id="sys-pow-status"></div>
 
     <div class="sys-div"></div>
-    <div class="sys-sec">Power</div>
-    <label class="sys-field" style="flex-direction:row;align-items:center;gap:8px;cursor:pointer">
-      <input type="checkbox" id="sys-ext" onchange="sysSaveExt()">
-      <span style="font-size:13px">Connected to power &mdash; don&rsquo;t shut off for good on low battery</span>
-    </label>
-    <div class="sys-hint" id="sys-ext-hint">&mdash;</div>
-    <div class="sys-status" id="sys-ext-status"></div>
-
-    <div class="sys-div"></div>
     <div class="sys-sec">Timezone</div>
     <div class="sys-field"><label for="sys-tz">Schedule times are in</label>
       <div class="sys-in"><select id="sys-tz" onchange="sysTzChanged()"></select></div></div>
@@ -733,7 +724,6 @@ const sysEl=id=>document.getElementById(id);
 function sysClampS(v){ v=Math.round(+v); return isFinite(v)?Math.min(3600,Math.max(30,v)):300; }
 async function openSys(){
   sysEl('sys-net-status').textContent=''; sysEl('sys-pow-status').textContent='';
-  sysEl('sys-ext-status').textContent='';
   sysEl('sys-bg').classList.add('open');
   try{
     const d=await fetch('/api/system',{cache:'no-store'}).then(r=>r.json());
@@ -747,34 +737,10 @@ async function openSys(){
     sysEl('sys-awake').value=d.awake_s; sysEl('sys-sleep').value=d.sleep_s;
     sysAlwaysOn=!!d.always_on;
     sysMarkPreset();
-    sysEl('sys-ext').checked=!!d.ext_power; sysExtHint(d.lowbatt_retry_s);
     sysTzLoad(d);
   }catch(e){ sysEl('sys-net-hint').textContent='Could not read settings: '+e.message; }
 }
 function closeSys(){ sysEl('sys-bg').classList.remove('open'); }
-// b602: low-battery behaviour. Off (default): below 3.6 V at a wake the unit
-// shuts off until a power cycle or magnet swipe. On: it re-checks on a timer,
-// so it comes back by itself once the charger has topped the battery up.
-let sysRetryS=1800;
-function sysExtHint(r){
-  if(r) sysRetryS=r;
-  const m=Math.round(sysRetryS/60);
-  sysEl('sys-ext-hint').textContent = sysEl('sys-ext').checked
-    ? 'On a low battery the unit sleeps and checks again every '+m+' min, so it comes back by itself once the battery has charged.'
-    : 'On a low battery the unit shuts off until it is power-cycled or you swipe the magnet. Turn this on if the unit has solar or wired power.';
-}
-async function sysSaveExt(){
-  const st=sysEl('sys-ext-status'), cb=sysEl('sys-ext');
-  cb.disabled=true; st.style.color=''; st.textContent='Saving…';
-  try{
-    const d=await fetch('/api/system',{method:'POST',
-      headers:{'Content-Type':'application/x-www-form-urlencoded'},
-      body:'ext_power='+(cb.checked?1:0)}).then(r=>r.json());
-    cb.checked=!!d.ext_power; sysExtHint(d.lowbatt_retry_s);
-    st.style.color='var(--green)'; st.textContent='Saved.';
-  }catch(e){ cb.checked=!cb.checked; sysExtHint(); st.style.color='#f87171'; st.textContent='Save failed: '+e.message; }
-  cb.disabled=false;
-}
 function sysEye(){
   const p=sysEl('sys-pass'), show=p.type==='password';
   p.type=show?'text':'password'; sysEl('sys-eye').textContent=show?'hide':'show';
