@@ -349,6 +349,40 @@ clears ESPHome's safe_mode boot counter before sleeping, because otherwise ten
 quick low-battery wakes in a row would bring the next boot up in safe mode with
 WiFi on.
 
+## Events log
+
+The run history only gets a row when a run actually runs, so a day with no
+watering leaves no trace there. The events log fills that gap:
+`/lfs/logs/events.csv`, one row per event, kept across reboots and rotated at
+about 64 KB (the previous file is kept as `events.1.csv`).
+
+```
+GET /api/events           # download the CSV, oldest row first
+GET /api/events?clear=1   # empty it
+```
+
+Columns: `time,uptime_s,event,detail,batt_v,fw_build`. `time` is blank when
+the clock wasn't set, and `uptime_s` is filled only for events logged as they
+happened.
+
+| event | When it's logged | `detail` says |
+|---|---|---|
+| `run_skipped` | A scheduled run's 30 min window closed while something held it back | rain delay; winter sleep; or valve frame suspect (water seen with the valve closed) |
+| `run_missed` | The window closed and the run never started | unit was off, asleep or rebooting at the time (with this boot's reset reason and boot time); or it was awake and the run still didn't start |
+| `run_interrupted` | A reset cut off a scheduled run after water started | the zone, the scheduled time and the reset reason |
+| `reset` | Any boot that isn't a normal wake from sleep | power-on (power restored, battery reconnected or magnet swipe); brownout; firmware crash; watchdog; software restart |
+| `lowbatt_enter` | The unit went into low-battery mode | what triggered it: a low reading at sleep, while awake, at boot or after a brownout |
+| `lowbatt_shutdown` | It dropped below 3.3 V and shut off until power-cycled | the voltage |
+| `lowbatt_exit` | It came back out | how long it was down, how many 6 h checks found it low, the lowest voltage |
+
+A missed run is logged when the unit is next up after the window closes, as
+long as that is within 6 hours. Runs that came due during a low-battery
+episode aren't listed one by one; the `lowbatt_exit` row covers them. The
+low-battery rows and the reset row are written by the first normal boot
+afterwards, once storage is mounted and the clock is set (or after 10 minutes
+without a clock), because the low-battery boot itself runs before storage is
+up.
+
 ## Home Assistant integration
 
 The HA-side config — template sensors, automations, schedule and rain-delay

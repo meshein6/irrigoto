@@ -967,3 +967,77 @@ esp_err_t storage_schedule_save(const storage_schedule_t *sched)
     }
     return ESP_OK;
 }
+
+/* ── Events log ─────────────────────────────────────────────────────── */
+
+#define EVENTS_CSV       LOGS_DIR "/events.csv"
+#define EVENTS_CSV_OLD   LOGS_DIR "/events.1.csv"
+#define EVENTS_MAX_BYTES (64 * 1024)
+#define EVENTS_LINE_MAX  256
+
+esp_err_t storage_events_append(const char *header, const char *row)
+{
+    if (!s_ready) return ESP_ERR_INVALID_STATE;
+    if (!row) return ESP_ERR_INVALID_ARG;
+
+    struct stat st;
+    if (stat(EVENTS_CSV, &st) == 0 && st.st_size >= EVENTS_MAX_BYTES) {
+        remove(EVENTS_CSV_OLD);
+        if (rename(EVENTS_CSV, EVENTS_CSV_OLD) != 0) remove(EVENTS_CSV);
+        ESP_LOGI(TAG, "events.csv rotated at %u bytes", (unsigned)st.st_size);
+    }
+    bool fresh = (stat(EVENTS_CSV, &st) != 0 || st.st_size == 0);
+    if (fresh) {
+        size_t need = (header ? strlen(header) : 0) + strlen(row) + 2;
+        size_t used = 0, total = 0;
+        if (storage_usage(&used, &total) == ESP_OK && total > used
+                && (total - used) < need + 4096) {
+            storage_make_room(need + 4096, 0xFFFF);
+        }
+    }
+    FILE *f = fopen(EVENTS_CSV, "ab");
+    if (!f) return ESP_FAIL;
+    if (fresh && header) fprintf(f, "%s\n", header);
+    fprintf(f, "%s\n", row);
+    fclose(f);
+    return ESP_OK;
+}
+
+static int events_stream_file(const char *path, bool skip_header,
+                              storage_events_line_cb cb, void *ctx)
+{
+    FILE *f = fopen(path, "rb");
+    if (!f) return 0;
+    char line[EVENTS_LINE_MAX];
+    int n = 0;
+    bool first = true;
+    while (fgets(line, sizeof(line), f)) {
+        size_t len = strlen(line);
+        while (len && (line[len-1] == '\n' || line[len-1] == '\r')) line[--len] = '\0';
+        if (len == 0) continue;
+        if (first && skip_header) { first = false; continue; }
+        first = false;
+        cb(line, ctx);
+        n++;
+    }
+    fclose(f);
+    return n;
+}
+
+int storage_events_stream(storage_events_line_cb cb, void *ctx)
+{
+    if (!s_ready || !cb) return 0;
+    struct stat st;
+    bool have_cur = (stat(EVENTS_CSV, &st) == 0 && st.st_size > 0);
+    int n = events_stream_file(EVENTS_CSV_OLD, false, cb, ctx);
+    if (have_cur) n += events_stream_file(EVENTS_CSV, n > 0, cb, ctx);
+    return n;
+}
+
+esp_err_t storage_events_clear(void)
+{
+    if (!s_ready) return ESP_ERR_INVALID_STATE;
+    remove(EVENTS_CSV_OLD);
+    remove(EVENTS_CSV);
+    return ESP_OK;
+}

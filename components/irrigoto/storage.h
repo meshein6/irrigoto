@@ -100,3 +100,16 @@ typedef struct __attribute__((packed)) {
 
 esp_err_t storage_schedule_load(storage_schedule_t *out);
 esp_err_t storage_schedule_save(const storage_schedule_t *sched);
+
+/* Events log: /lfs/logs/events.csv -- scheduled runs that did not start (and
+ * why) plus power events (resets, low-battery mode). One row per event; the
+ * header is written when the file is created. Rotates to events.1.csv at
+ * ~64 KB, so the two files hold several hundred rows between them. */
+esp_err_t storage_events_append(const char *header, const char *row);
+/* Streams events.1.csv then events.csv, oldest row first, one line per cb()
+ * call (the line has no trailing newline). The header line of the current
+ * file is passed through once; the rotated file's header is skipped when both
+ * exist. Returns the number of lines streamed. */
+typedef void (*storage_events_line_cb)(const char *line, void *ctx);
+int       storage_events_stream(storage_events_line_cb cb, void *ctx);
+esp_err_t storage_events_clear(void);

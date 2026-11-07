@@ -7018,6 +7018,103 @@ static void lowbatt_flag_set(bool on)
     ESP_LOGW(TAG, "Low-battery mode %s", on ? "ENTERED" : "cleared");
 }
 
+// Low-battery episode record (NVS "OtO"/"lb_episode"), for the events log.
+// The LittleFS log isn't mounted during the low-battery boot, so the episode
+// is accumulated here -- entry, each 6 h check, shutdown, recovery -- and
+// written out as events.csv rows by the next normal boot (events_boot_flush).
+// One NVS write per state change / check (at most ~4 a day).
+#define LB_EP_MAGIC      0x4C424550u   // "LBEP"
+#define LB_SRC_SLEEP     0
+#define LB_SRC_AWAKE     1
+#define LB_SRC_BOOT      2
+#define LB_SRC_BROWNOUT  3
+#define LB_EP_SHUTDOWN   0x01
+#define LB_EP_EXITED     0x02
+typedef struct {
+    uint32_t magic;
+    uint32_t enter_epoch, shutdown_epoch, exit_epoch;   // 0 = clock not set
+    float    enter_v, min_v, shutdown_v, exit_v;
+    uint16_t checks;      // low-battery boots that found the pack still low
+    uint8_t  src;         // LB_SRC_*
+    uint8_t  flags;       // LB_EP_*
+} lb_episode_t;
+
+static bool lb_episode_load(lb_episode_t *ep)
+{
+    memset(ep, 0, sizeof(*ep));
+    nvs_handle_t h;
+    if (nvs_open(CAL_NVS_NAMESPACE, NVS_READONLY, &h) != ESP_OK) return false;
+    size_t sz = sizeof(*ep);
+    esp_err_t r = nvs_get_blob(h, "lb_episode", ep, &sz);
+    nvs_close(h);
+    if (r != ESP_OK || sz != sizeof(*ep) || ep->magic != LB_EP_MAGIC) {
+        memset(ep, 0, sizeof(*ep));
+        return false;
+    }
+    return true;
+}
+static void lb_episode_save(const lb_episode_t *ep)
+{
+    nvs_handle_t h;
+    if (nvs_open(CAL_NVS_NAMESPACE, NVS_READWRITE, &h) != ESP_OK) return;
+    nvs_set_blob(h, "lb_episode", ep, sizeof(*ep));
+    nvs_commit(h); nvs_close(h);
+}
+static void lb_episode_erase(void)
+{
+    nvs_handle_t h;
+    if (nvs_open(CAL_NVS_NAMESPACE, NVS_READWRITE, &h) != ESP_OK) return;
+    nvs_erase_key(h, "lb_episode");
+    nvs_commit(h); nvs_close(h);
+}
+static uint32_t epoch_or_zero(void)
+{
+    time_t t = time(NULL);
+    return (t > 1700000000) ? (uint32_t)t : 0;
+}
+
+// Enter low-battery mode (no-op if already in it): flag + new episode record.
+// If an earlier episode was never flushed (no normal boot since), it is kept
+// and this one merges into it rather than losing its history.
+static void lowbatt_enter(uint8_t src, float v)
+{
+    if (lowbatt_flag_get()) return;
+    lowbatt_flag_set(true);
+    lb_episode_t ep;
+    if (!lb_episode_load(&ep) || (ep.flags & LB_EP_EXITED)) {
+        memset(&ep, 0, sizeof(ep));
+        ep.magic       = LB_EP_MAGIC;
+        ep.enter_epoch = epoch_or_zero();
+        ep.enter_v     = v;
+        ep.min_v       = v;
+        ep.src         = src;
+    }
+    ep.flags &= (uint8_t)~LB_EP_EXITED;
+    lb_episode_save(&ep);
+}
+static void lb_episode_note(float v, bool shutdown, bool exited)
+{
+    lb_episode_t ep;
+    if (!lb_episode_load(&ep)) {               // record lost: start one now
+        memset(&ep, 0, sizeof(ep));
+        ep.magic = LB_EP_MAGIC; ep.enter_v = v; ep.min_v = v; ep.src = LB_SRC_BOOT;
+    }
+    if (v > 0.5f && (ep.min_v <= 0.0f || v < ep.min_v)) ep.min_v = v;
+    if (exited) {
+        ep.flags |= LB_EP_EXITED;
+        ep.exit_epoch = epoch_or_zero();
+        ep.exit_v = v;
+    } else {
+        ep.checks++;
+        if (shutdown) {
+            ep.flags |= LB_EP_SHUTDOWN;
+            ep.shutdown_epoch = epoch_or_zero();
+            ep.shutdown_v = v;
+        }
+    }
+    lb_episode_save(&ep);
+}
+
 static bool winter_flag_from_nvs(void)
 {
     // Read straight from NVS: the early gate runs before pm_nvs_load().
@@ -7065,9 +7162,11 @@ static void sleep_quiet_timer(const char *reason, uint32_t secs)
 }
 
 // Never returns. batt_v must be a settled reading below BATT_MIN_VOLTAGE_V.
-static void lowbatt_sleep(float batt_v)
+// src says how low-battery mode was reached if it isn't active yet.
+static void lowbatt_sleep(float batt_v, uint8_t src)
 {
-    lowbatt_flag_set(true);   // next wake takes the low-battery boot, not the normal one
+    lowbatt_enter(src, batt_v);   // next wake takes the low-battery boot, not the normal one
+    lb_episode_note(batt_v, batt_v < BATT_SHUTDOWN_V, false);   // events log
     irrigoto_before_lowbatt_sleep();
     if (batt_v < BATT_SHUTDOWN_V) {
         ESP_LOGW(TAG, "Battery %.2fV below %.1fV -- shutting down until power-cycled",
@@ -7095,7 +7194,7 @@ static void lowbatt_note_at_sleep(void)
     if (v > 0.5f && v < BATT_MIN_VOLTAGE_V) {
         ESP_LOGW(TAG, "Battery %.2fV at sleep -- next wake is a low-battery check "
                       "(no WiFi)", v);
-        lowbatt_flag_set(true);
+        lowbatt_enter(LB_SRC_SLEEP, v);
     }
 }
 
@@ -7120,12 +7219,14 @@ static void lowbatt_mode_boot(void)
     if (v <= 0.5f) {
         // ADC unreadable: don't strand the unit in the mode on a bad read.
         ESP_LOGW(TAG, "Battery unreadable in low-battery mode -- booting normally");
+        if (lowbatt_flag_get()) lb_episode_note(0.0f, false, true);
         lowbatt_flag_set(false);
         sensor_rail_off();            // normal boot powers it again when needed
         return;
     }
     if (v >= BATT_MIN_VOLTAGE_V) {
         ESP_LOGW(TAG, "Battery recovered to %.2fV -- leaving low-battery mode", v);
+        if (lowbatt_flag_get()) lb_episode_note(v, false, true);
         lowbatt_flag_set(false);
         sensor_rail_off();            // normal boot powers it again when needed
         return;
@@ -7140,7 +7241,7 @@ static void lowbatt_mode_boot(void)
     diag.boot_epoch            = (int64_t)time(NULL);
     diag.flags                |= BOOT_DIAG_FLAG_BATT_TOO_LOW;
     boot_diag_append_and_save(&diag);
-    lowbatt_sleep(v);                 // never returns
+    lowbatt_sleep(v, brownout ? LB_SRC_BROWNOUT : LB_SRC_BOOT);   // never returns
 }
 
 // b327: On a healthy-battery wake, verify the valve is closed. Catches
@@ -7282,6 +7383,7 @@ static void check_battery_on_boot(void)
     // and falls back to boot_seq ordering.
     diag.boot_epoch            = (int64_t)time(NULL);
 
+    s_boot_batt_v = batt_v;   // events log: battery at this boot
     if (batt_v < BATT_MIN_VOLTAGE_V && batt_v > 0.5f) {
         // Settle and re-read before deciding: a single sample taken right
         // after boot load can read low on a pack that's actually fine.
@@ -7289,6 +7391,7 @@ static void check_battery_on_boot(void)
         ESP_LOGI(TAG, "Battery settled: %.2fV", settled);
         diag.batt_v_at_boot = settled;
         batt_v = settled;
+        s_boot_batt_v = settled;
     }
     if (batt_v < BATT_MIN_VOLTAGE_V && batt_v > 0.5f) {
         // > 0.5V check avoids false trigger if ADC not ready.
@@ -7303,7 +7406,7 @@ static void check_battery_on_boot(void)
         // fault log scream about it instead of the yard silently flooding.
         valve_verify_closed_dry("boot batt-too-low", false);
         boot_diag_append_and_save(&diag);
-        lowbatt_sleep(batt_v);   // 6 h re-check, or forever below 3.3 V
+        lowbatt_sleep(batt_v, LB_SRC_BOOT);   // 6 h re-check, or forever below 3.3 V
     }
 
     // Battery is at least marginal. If we have enough headroom for a motor
@@ -7385,6 +7488,241 @@ static void cal_watchdog_check(void)
     s_cal_state_since = 0;
 }
 
+// ── Events log (/lfs/logs/events.csv) ───────────────────────────────────────
+// One row per scheduled run that did not start (and why) and per power event:
+// abnormal resets, a run cut off by a reset, low-battery mode episodes. It is
+// the "why was there no watering that day" record that the run history can't
+// give, because the run history only gets a row when a run actually ran.
+// Download: GET /api/events (CSV, oldest first). GET /api/events?clear=1.
+//
+// Rows are written only from check_inactivity's context (the 4 KB idle task):
+// the schedule task (3 KB stack) just queues skips, and boot-time events wait
+// until LittleFS is mounted and, ideally, the clock is set.
+#define EVENTS_CSV_HEADER "time,uptime_s,event,detail,batt_v,fw_build"
+
+static float    s_boot_batt_v  = 0.0f;   // check_battery_on_boot's reading
+static uint32_t s_ev_int_epoch = 0;      // scheduled run cut off by a reset
+static uint16_t s_ev_int_zone  = 0;      //   (set by sched_fire_load)
+
+#define SKIP_R_RAIN    0
+#define SKIP_R_WINTER  1
+#define SKIP_R_FRAME   2
+#define SKIP_R_OFFLINE 3
+#define SKIP_R_NOSTART 4
+typedef struct { uint32_t fire_t; uint16_t zone; uint8_t reason; } skip_ev_t;
+#define SKIP_Q_N 4
+static skip_ev_t     s_skip_q[SKIP_Q_N];
+static uint8_t       s_skip_q_head = 0, s_skip_q_count = 0;
+static portMUX_TYPE  s_skip_q_mux = portMUX_INITIALIZER_UNLOCKED;
+
+static uint32_t uptime_s_now(void)
+{
+    return (uint32_t)(esp_timer_get_time() / 1000000ULL);
+}
+
+static void ev_localtime(time_t t, struct tm *out)
+{
+    irrigoto_localtime_r(&t, out);   // the device's saved timezone
+}
+
+// Queue a skipped/missed run (schedule task). Deduped by scheduled epoch
+// across reboots (NVS "ev_skip"), so a sleeping unit that wakes several times
+// after the window logs each slot once.
+static void skip_event_push(uint32_t fire_t, uint16_t zone, uint8_t reason)
+{
+    static struct { uint32_t epoch[4]; uint32_t idx; } ring;
+    static bool loaded = false;
+    if (!loaded) {
+        loaded = true;
+        nvs_handle_t h;
+        if (nvs_open(CAL_NVS_NAMESPACE, NVS_READONLY, &h) == ESP_OK) {
+            size_t sz = sizeof(ring);
+            if (nvs_get_blob(h, "ev_skip", &ring, &sz) != ESP_OK || sz != sizeof(ring))
+                memset(&ring, 0, sizeof(ring));
+            nvs_close(h);
+        }
+    }
+    for (int i = 0; i < 4; i++) if (ring.epoch[i] == fire_t) return;
+    ring.epoch[ring.idx % 4] = fire_t;
+    ring.idx = (ring.idx + 1) % 4;
+    nvs_handle_t h;
+    if (nvs_open(CAL_NVS_NAMESPACE, NVS_READWRITE, &h) == ESP_OK) {
+        nvs_set_blob(h, "ev_skip", &ring, sizeof(ring));
+        nvs_commit(h); nvs_close(h);
+    }
+    portENTER_CRITICAL(&s_skip_q_mux);
+    if (s_skip_q_count < SKIP_Q_N) {
+        skip_ev_t *e = &s_skip_q[(s_skip_q_head + s_skip_q_count) % SKIP_Q_N];
+        e->fire_t = fire_t; e->zone = zone; e->reason = reason;
+        s_skip_q_count++;
+    }
+    portEXIT_CRITICAL(&s_skip_q_mux);
+}
+
+static bool skip_event_pop(skip_ev_t *out)
+{
+    bool got = false;
+    portENTER_CRITICAL(&s_skip_q_mux);
+    if (s_skip_q_count > 0) {
+        *out = s_skip_q[s_skip_q_head];
+        s_skip_q_head = (uint8_t)((s_skip_q_head + 1) % SKIP_Q_N);
+        s_skip_q_count--;
+        got = true;
+    }
+    portEXIT_CRITICAL(&s_skip_q_mux);
+    return got;
+}
+
+// epoch 0 = clock unknown (time column left blank). with_uptime: the event is
+// happening now, so the uptime column is meaningful.
+static void events_write(uint32_t epoch, bool with_uptime, const char *event,
+                         const char *detail, float batt_v)
+{
+    static char row[256];
+    static char det[160];
+    size_t j = 0;
+    for (const char *p = detail ? detail : ""; *p && j + 1 < sizeof(det); p++)
+        det[j++] = (*p == ',') ? ';' : (*p == '"') ? '\'' : *p;
+    det[j] = '\0';
+    char t[24] = "";
+    if (epoch > 1700000000u) {
+        struct tm lt; ev_localtime((time_t)epoch, &lt);
+        strftime(t, sizeof(t), "%Y-%m-%dT%H:%M:%S", &lt);
+    }
+    char up[12] = "", vb[12] = "";
+    if (with_uptime) snprintf(up, sizeof(up), "%lu", (unsigned long)uptime_s_now());
+    if (batt_v > 0.5f) snprintf(vb, sizeof(vb), "%.2f", (double)batt_v);
+    snprintf(row, sizeof(row), "%s,%s,%s,%s,%s,%u", t, up, event, det, vb,
+             (unsigned)FW_BUILD);
+    if (storage_events_append(EVENTS_CSV_HEADER, row) == ESP_OK)
+        INFO("Event logged: %s -- %s", event, det);
+}
+
+static void fmt_slot(uint32_t epoch, char *out, size_t len)
+{
+    struct tm lt; ev_localtime((time_t)epoch, &lt);
+    strftime(out, len, "%m-%d %H:%M", &lt);
+}
+
+static const char *reset_reason_explained(int r)
+{
+    switch ((esp_reset_reason_t)r) {
+        case ESP_RST_POWERON:  return "power-on (power restored; battery reconnected; or magnet swipe)";
+        case ESP_RST_BROWNOUT: return "brownout (supply/battery voltage dipped)";
+        case ESP_RST_PANIC:    return "firmware crash";
+        case ESP_RST_INT_WDT:
+        case ESP_RST_TASK_WDT:
+        case ESP_RST_WDT:      return "watchdog (firmware hung)";
+        case ESP_RST_SW:       return "software restart (OTA; settings change; or remote reboot)";
+        case ESP_RST_EXT:      return "reset pin";
+        default:               return boot_diag_reset_reason_str(r);
+    }
+}
+
+static void fmt_duration(uint32_t secs, char *out, size_t len)
+{
+    if (secs >= 2u * 86400u) snprintf(out, len, "%.1f days", secs / 86400.0);
+    else if (secs >= 3600u)  snprintf(out, len, "%.1f h", secs / 3600.0);
+    else                     snprintf(out, len, "%lu min", (unsigned long)(secs / 60u));
+}
+
+// Rows that describe what happened BEFORE this boot: the reset that started
+// it, a run it cut off, a low-battery episode it ended. Written once, as soon
+// as LittleFS is up and the clock is set (or after 10 min without a clock).
+static void events_boot_rows(uint32_t boot_epoch)
+{
+    char d[160], a[24], b[24];
+    int rr = (int)esp_reset_reason();
+    const char *rr_txt = reset_reason_explained(rr);
+
+    lb_episode_t ep;
+    if (lb_episode_load(&ep) && !lowbatt_flag_get()) {
+        static const char *SRC[] = { "low reading at sleep",
+                                     "low for 3 min while awake",
+                                     "low reading at boot",
+                                     "low after a brownout reset" };
+        snprintf(d, sizeof(d), "entered low-battery mode: %s; WiFi off and re-checking every 6 h",
+                 SRC[ep.src < 4 ? ep.src : 2]);
+        events_write(ep.enter_epoch, false, "lowbatt_enter", d, ep.enter_v);
+        if (ep.flags & LB_EP_SHUTDOWN)
+            events_write(ep.shutdown_epoch, false, "lowbatt_shutdown",
+                         "below 3.3 V - off until power-cycled (magnet swipe)", ep.shutdown_v);
+        uint32_t end_t = ep.exit_epoch ? ep.exit_epoch : boot_epoch;
+        char dur[24] = "unknown time";
+        if (ep.enter_epoch && end_t > ep.enter_epoch)
+            fmt_duration(end_t - ep.enter_epoch, dur, sizeof(dur));
+        snprintf(d, sizeof(d), "%s after %s (%u low checks; lowest %.2f V); "
+                 "scheduled runs in between did not run",
+                 (ep.flags & LB_EP_EXITED) ? "battery recovered" : "low-battery mode ended",
+                 dur, (unsigned)ep.checks, (double)ep.min_v);
+        events_write(end_t, false, "lowbatt_exit", d, ep.exit_v);
+        lb_episode_erase();
+    }
+
+    if (s_ev_int_epoch) {
+        fmt_slot(s_ev_int_epoch, a, sizeof(a));
+        snprintf(d, sizeof(d), "Zone #%u run at %s stopped mid-watering by a reset (%s)",
+                 (unsigned)(s_ev_int_zone ? s_ev_int_zone - 1 : 0), a, rr_txt);
+        events_write(boot_epoch, false, "run_interrupted", d, s_boot_batt_v);
+        s_ev_int_epoch = 0;
+    }
+
+    if (rr != ESP_RST_DEEPSLEEP) {
+        (void)b;
+        events_write(boot_epoch, false, "reset", rr_txt, s_boot_batt_v);
+    }
+}
+
+// Called every second from check_inactivity (idle task / standalone loop).
+static void events_flush(void)
+{
+    if (!storage_ready()) return;
+    time_t   now = time(NULL);
+    uint32_t up  = uptime_s_now();
+    uint32_t now_e = (now > 1700000000) ? (uint32_t)now : 0;
+
+    static bool boot_done = false;
+    if (!boot_done && (now_e || up >= 600u)) {
+        boot_done = true;
+        events_boot_rows(now_e ? now_e - up : 0);
+    }
+
+    skip_ev_t e;
+    while (skip_event_pop(&e)) {
+        char d[160], a[24], since[24] = "?";
+        fmt_slot(e.fire_t, a, sizeof(a));
+        const char *ev = "run_skipped";
+        switch (e.reason) {
+            case SKIP_R_RAIN:
+                snprintf(d, sizeof(d), "Zone #%u run at %s: rain delay active",
+                         (unsigned)(e.zone ? e.zone - 1 : 0), a);
+                break;
+            case SKIP_R_WINTER:
+                snprintf(d, sizeof(d), "Zone #%u run at %s: winter sleep", (unsigned)(e.zone ? e.zone - 1 : 0), a);
+                break;
+            case SKIP_R_FRAME:
+                snprintf(d, sizeof(d), "Zone #%u run at %s: valve frame suspect (water seen "
+                         "with the valve closed) - unattended runs refused until a dry "
+                         "close is read or the valve is recalibrated", (unsigned)(e.zone ? e.zone - 1 : 0), a);
+                break;
+            case SKIP_R_OFFLINE:
+                ev = "run_missed";
+                if (now_e) fmt_slot(now_e - up, since, sizeof(since));
+                snprintf(d, sizeof(d), "Zone #%u run at %s: unit was off; asleep or rebooting "
+                         "at the scheduled time (this boot: %s; up since %s)",
+                         (unsigned)(e.zone ? e.zone - 1 : 0), a, boot_diag_reset_reason_str((int)esp_reset_reason()),
+                         since);
+                break;
+            default:
+                ev = "run_missed";
+                snprintf(d, sizeof(d), "Zone #%u run at %s: unit was awake but the run did not "
+                         "start within the 30 min window", (unsigned)(e.zone ? e.zone - 1 : 0), a);
+                break;
+        }
+        events_write(now_e, true, ev, d, batt_now_v());
+    }
+}
+
 // Always-on units (auto-sleep off) never reach prepare_for_sleep(), so the
 // sleep-time battery read never happens and a dropped-out supply would run the
 // pack down unwatched. While awake, read the pack once a minute; three low
@@ -7420,13 +7758,14 @@ static void lowbatt_runtime_check(void)
     }
     ESP_LOGW(TAG, "Battery %.2fV below %.1fV for %u min while awake -- entering "
                   "low-battery mode", v, BATT_MIN_VOLTAGE_V, (unsigned)LOWBATT_RUNTIME_STRIKES);
-    lowbatt_flag_set(true);
+    lowbatt_enter(LB_SRC_AWAKE, v);
     irrigoto_before_lowbatt_sleep();
     sleep_quiet_timer("low battery (awake)", LOWBATT_HANDOFF_S);   // never returns
 }
 
 static void check_inactivity(void)
 {
+    events_flush();                    // events.csv: queued skips + boot rows
     if (s_last_activity == 0) return;  // not yet initialised
     if (s_ota_in_progress) return;  // never sleep during OTA
     // b525: winter mode owns the sleep decision -- the unit holds awake for
@@ -17791,6 +18130,35 @@ static esp_err_t api_uart_log_handler(httpd_req_t *req)
 //   on the device web UI too (landing page, Device card).
 // Refuses to winterize mid-run: stop the watering first, otherwise the
 // caller can't tell the "valve closed cleanly" ack from a cut-short run.
+// GET /api/events -> events.csv (skipped/missed runs, resets, low-battery
+// episodes), oldest row first, streamed as chunked text/csv so no response
+// buffer is held. GET /api/events?clear=1 empties it.
+static void events_send_line(const char *line, void *ctx)
+{
+    httpd_req_t *req = (httpd_req_t *)ctx;
+    httpd_resp_send_chunk(req, line, HTTPD_RESP_USE_STRLEN);
+    httpd_resp_send_chunk(req, "\n", 1);
+}
+static esp_err_t api_events_handler(httpd_req_t *req)
+{
+    HTTP_CONN_CLOSE(req);
+    char qs[32] = {0}, v[8] = {0};
+    httpd_req_get_url_query_str(req, qs, sizeof(qs));
+    if (httpd_query_key_value(qs, "clear", v, sizeof(v)) == ESP_OK && v[0] == '1') {
+        storage_events_clear();
+        httpd_resp_set_type(req, "application/json");
+        httpd_resp_sendstr(req, "{\"ok\":true}");
+        return ESP_OK;
+    }
+    httpd_resp_set_type(req, "text/csv");
+    httpd_resp_set_hdr(req, "Cache-Control", "no-cache, no-store");
+    httpd_resp_set_hdr(req, "Content-Disposition", "attachment; filename=\"events.csv\"");
+    if (storage_events_stream(events_send_line, req) == 0)
+        httpd_resp_send_chunk(req, EVENTS_CSV_HEADER "\n", HTTPD_RESP_USE_STRLEN);
+    httpd_resp_send_chunk(req, NULL, 0);
+    return ESP_OK;
+}
+
 static esp_err_t api_winter_handler(httpd_req_t *req)
 {
     if (req->method == HTTP_POST) {
@@ -21309,7 +21677,7 @@ static void zone_web_start(void)
     httpd_config_t cfg   = HTTPD_DEFAULT_CONFIG();
     cfg.server_port      = ZONE_WEB_PORT;
     cfg.ctrl_port        = ZONE_WEB_CTRL_PORT;
-    cfg.max_uri_handlers  = 91;  // b587: 89 -> 91 (/api/upcoming + /api/live_plan GET); b557: 88 -> 89 (/api/run_plan GET); b535: 87 -> 88 (/path.js GET); 86 -> 87 (/api/runs GET); 84 -> 86 (/api/supply_regulated GET+POST); system settings modal: 82 -> 84 (/api/system GET+POST, was /api/wifi_power); solution dosing: 76 -> 82 (/bottle_cal, /api/solution_cal x2, /api/pump_jog x2, /api/solution_est); b525: 74 -> 76 (/api/winter GET+POST); b522: 72 -> 74 (/api/fault_hold GET+POST); b512: 70 -> 72 (/api/uart_log GET+POST); b489: 68 -> 70, keeping the 2-slot margin over
+    cfg.max_uri_handlers  = 92;  // events log: 91 -> 92 (/api/events GET); b587: 89 -> 91 (/api/upcoming + /api/live_plan GET); b557: 88 -> 89 (/api/run_plan GET); b535: 87 -> 88 (/path.js GET); 86 -> 87 (/api/runs GET); 84 -> 86 (/api/supply_regulated GET+POST); system settings modal: 82 -> 84 (/api/system GET+POST, was /api/wifi_power); solution dosing: 76 -> 82 (/bottle_cal, /api/solution_cal x2, /api/pump_jog x2, /api/solution_est); b525: 74 -> 76 (/api/winter GET+POST); b522: 72 -> 74 (/api/fault_hold GET+POST); b512: 70 -> 72 (/api/uart_log GET+POST); b489: 68 -> 70, keeping the 2-slot margin over
                                  // the _Static_assert below.
                                  // MUST be set before httpd_start (cfg is copied there);
                                  // headroom over uris[] count -- _Static_assert below guards it.
@@ -21360,6 +21728,7 @@ static void zone_web_start(void)
         {.uri="/api/pump_jog",    .method=HTTP_GET,  .handler=api_pump_jog_handler},
         {.uri="/api/pump_jog",    .method=HTTP_POST, .handler=api_pump_jog_handler},
         {.uri="/api/solution_est",.method=HTTP_GET,  .handler=api_solution_est_handler},
+        {.uri="/api/events",      .method=HTTP_GET,  .handler=api_events_handler},     // events.csv
         {.uri="/api/fault_hold",  .method=HTTP_GET,  .handler=api_fault_hold_handler}, // b522
         {.uri="/api/fault_hold",  .method=HTTP_POST, .handler=api_fault_hold_handler}, // b522
         {.uri="/api/cal",         .method=HTTP_GET,  .handler=api_cal_handler},
@@ -21418,7 +21787,7 @@ static void zone_web_start(void)
         {.uri="/fs/upload",             .method=HTTP_POST, .handler=fs_upload_handler},
         {.uri="/fs/delete",             .method=HTTP_POST, .handler=fs_delete_handler},
     };
-    _Static_assert(sizeof(uris)/sizeof(uris[0]) <= 89,   // b587: 87 -> 89 (/api/upcoming + /api/live_plan GET); b557: 86 -> 87 (/api/run_plan GET); b535: 85 -> 86 (/path.js GET); 84 -> 85 (/api/runs GET); 82 -> 84 (/api/supply_regulated GET+POST); system settings modal: 80 -> 82 (/api/system GET+POST, was /api/wifi_power); solution dosing: 74 -> 80 (see max_uri_handlers); b525: 72 -> 74 (/api/winter GET+POST); b522: 70 -> 72 (/api/fault_hold GET+POST); b512: 68 -> 70 (/api/uart_log GET+POST); b489: 66 -> 68
+    _Static_assert(sizeof(uris)/sizeof(uris[0]) <= 90,   // events log: 89 -> 90 (/api/events GET); b587: 87 -> 89 (/api/upcoming + /api/live_plan GET); b557: 86 -> 87 (/api/run_plan GET); b535: 85 -> 86 (/path.js GET); 84 -> 85 (/api/runs GET); 82 -> 84 (/api/supply_regulated GET+POST); system settings modal: 80 -> 82 (/api/system GET+POST, was /api/wifi_power); solution dosing: 74 -> 80 (see max_uri_handlers); b525: 72 -> 74 (/api/winter GET+POST); b522: 70 -> 72 (/api/fault_hold GET+POST); b512: 68 -> 70 (/api/uart_log GET+POST); b489: 66 -> 68
                    "uris[] exceeds cfg.max_uri_handlers -- raise it before httpd_start");
     for (size_t i = 0; i < sizeof(uris)/sizeof(uris[0]); i++)
         httpd_register_uri_handler(s_zone_server, &uris[i]);
@@ -22507,6 +22876,8 @@ static void sched_fire_load(void)
     // mid-watering (water_task never reached its completion clear). Promote it to
     // last_missed (incomplete) so HA sees the under-watered run, then clear it.
     if (s_sched_fire.inprogress_epoch) {
+        s_ev_int_epoch = s_sched_fire.inprogress_epoch;   // events log: run_interrupted
+        s_ev_int_zone  = s_sched_fire.inprogress_zone;
         s_sched_fire.last_missed_epoch = s_sched_fire.inprogress_epoch;
         s_sched_fire.last_missed_zone  = s_sched_fire.inprogress_zone;
         s_sched_fire.inprogress_epoch  = 0;
@@ -23716,6 +24087,33 @@ static void schedule_fire_check_on_wake(void)
                                      // it expired within the last 6 h (ignore
                                      // ancient/yesterday occurrences).
 
+// events log: runs held back by a rain delay or winter sleep never reach the
+// missed-window path above (the task skips the whole table while either is
+// active), so log those here once their window has closed unwatered.
+static void sched_skip_scan_blocked(time_t now)
+{
+    uint8_t why;
+    if (s_winter_sleep)                                 why = SKIP_R_WINTER;
+    else if (irrigoto_schedule_get_delay_until() > now) why = SKIP_R_RAIN;
+    else return;
+    for (uint8_t i = 0; i < s_schedule.count; i++) {
+        const schedule_entry_t *e = &s_schedule.entries[i];
+        if (!e->enabled || e->days_mask == 0) continue;
+        for (int doff = 0; doff >= -1; doff--) {
+            time_t base = now + doff * 86400;
+            struct tm lt; ev_localtime(base, &lt);
+            lt.tm_hour = e->hour; lt.tm_min = e->minute; lt.tm_sec = 0;
+            time_t fire_t = mktime(&lt);
+            struct tm flt; ev_localtime(fire_t, &flt);
+            if (!(e->days_mask & (1u << flt.tm_wday))) continue;
+            time_t age = now - fire_t;
+            if (age < (time_t)SCHED_CATCHUP_S || age >= (time_t)SCHED_MISS_HORIZON_S) continue;
+            if (sched_fire_already((uint32_t)fire_t)) continue;
+            skip_event_push((uint32_t)fire_t, e->zone, why);
+        }
+    }
+}
+
 static void schedule_task(void *arg)
 {
     (void)arg;
@@ -23727,6 +24125,7 @@ static void schedule_task(void *arg)
 
     while (true) {
         time_t now = time(NULL);
+        if (now > 1700000000) sched_skip_scan_blocked(now);   // events log
         if (s_winter_sleep) goto sleep_poll;    // b525: no unattended watering
         if (now < 1700000000) goto sleep_poll;  // clock-based path needs time
         time_t delay_until = irrigoto_schedule_get_delay_until();
@@ -23755,6 +24154,17 @@ static void schedule_task(void *arg)
                         s_sched_fire.last_missed_zone  = e->zone;
                         sched_fire_mark((uint32_t)fire_t);
                         sched_fire_save();
+                        // events log: why it never started. A suspect frame
+                        // refuses the run; otherwise the unit either wasn't up
+                        // at the slot (booted after it) or was up and the run
+                        // still didn't start (e.g. clock not set in time).
+                        {
+                            uint32_t boot_t = (uint32_t)now - (uint32_t)(esp_timer_get_time() / 1000000ULL);
+                            uint8_t why = g_frame_suspect ? SKIP_R_FRAME
+                                        : (boot_t > (uint32_t)fire_t) ? SKIP_R_OFFLINE
+                                        : SKIP_R_NOSTART;
+                            skip_event_push((uint32_t)fire_t, e->zone, why);
+                        }
                         ESP_LOGW(TAG, "Schedule: zone %u %02u:%02u MISSED -- window "
                                  "closed unwatered (HA may reschedule)",
                                  e->zone, e->hour, e->minute);

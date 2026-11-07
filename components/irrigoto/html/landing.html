@@ -326,7 +326,10 @@ section{margin-bottom:18px;}
   <section>
     <div class="sec-hdr">
       <span class="sec-title">History</span>
-      <a class="sec-btn" href="/api/runs" download="runs.csv">&#11015; CSV</a>
+      <span style="display:flex;gap:6px">
+        <a class="sec-btn" href="/api/events" download="events.csv" title="Skipped or missed runs and power events, with the reason">&#11015; Events</a>
+        <a class="sec-btn" href="/api/runs" download="runs.csv">&#11015; CSV</a>
+      </span>
     </div>
     <div class="card" id="runs-card"><div class="empty">No runs recorded yet.</div></div>
   </section>
