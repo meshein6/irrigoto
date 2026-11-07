@@ -747,7 +747,7 @@ async function openSys(){
     sysEl('sys-awake').value=d.awake_s; sysEl('sys-sleep').value=d.sleep_s;
     sysAlwaysOn=!!d.always_on;
     sysMarkPreset();
-    sysEl('sys-ext').checked=!!d.ext_power; sysExtHint(d.lowbatt_retry_s);
+    sysEl('sys-ext').checked=!!d.ext_power; sysExtHint(d.lowbatt_retry_s,d.lowbatt_floor_v);
     sysTzLoad(d);
   }catch(e){ sysEl('sys-net-hint').textContent='Could not read settings: '+e.message; }
 }
@@ -755,12 +755,13 @@ function closeSys(){ sysEl('sys-bg').classList.remove('open'); }
 // b602: low-battery behaviour. Off (default): below 3.6 V at a wake the unit
 // shuts off until a power cycle or magnet swipe. On: it re-checks on a timer,
 // so it comes back by itself once the charger has topped the battery up.
-let sysRetryS=1800;
-function sysExtHint(r){
+let sysRetryS=1800, sysFloorV=3.3;
+function sysExtHint(r,f){
   if(r) sysRetryS=r;
+  if(f) sysFloorV=+f;
   const m=Math.round(sysRetryS/60);
   sysEl('sys-ext-hint').textContent = sysEl('sys-ext').checked
-    ? 'On a low battery the unit sleeps and checks again every '+m+' min, so it comes back by itself once the battery has charged.'
+    ? 'On a low battery the unit sleeps and checks again every '+m+' min, so it comes back by itself once the battery has charged. Below '+sysFloorV.toFixed(1)+' V it still shuts off until power-cycled, to protect a battery that is not being charged.'
     : 'On a low battery the unit shuts off until it is power-cycled or you swipe the magnet. Turn this on if the unit has solar or wired power.';
 }
 async function sysSaveExt(){
@@ -770,7 +771,7 @@ async function sysSaveExt(){
     const d=await fetch('/api/system',{method:'POST',
       headers:{'Content-Type':'application/x-www-form-urlencoded'},
       body:'ext_power='+(cb.checked?1:0)}).then(r=>r.json());
-    cb.checked=!!d.ext_power; sysExtHint(d.lowbatt_retry_s);
+    cb.checked=!!d.ext_power; sysExtHint(d.lowbatt_retry_s,d.lowbatt_floor_v);
     st.style.color='var(--green)'; st.textContent='Saved.';
   }catch(e){ cb.checked=!cb.checked; sysExtHint(); st.style.color='#f87171'; st.textContent='Save failed: '+e.message; }
   cb.disabled=false;

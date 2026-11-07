@@ -326,10 +326,13 @@ that dips low on short autumn days can stay dark for weeks with a full pack.
 
 For units with solar or wired power, turn on **Connected to power** (device
 web UI → System settings → Power, or `POST /api/system` with `ext_power=1`).
-The unit then sleeps on a 30-minute timer instead, re-checks the battery
-each time (sensor read only, no motors or WiFi), and comes back by itself
-once the battery is above 3.6 V. `GET /api/system` reports `ext_power` and
-`lowbatt_retry_s`. The setting is stored in NVS (`OtO`/`pm_ext_pwr`) and is
+Between **3.3 V and 3.6 V** the unit then sleeps on a 30-minute timer
+instead, re-checks the battery each time (a 1–2 s boot with no motor
+movement; WiFi does start), and comes back by itself once the battery is
+above 3.6 V. Below 3.3 V the battery clearly isn't being charged, so the unit
+still shuts off for good: that keeps the retries from running the LiPo into
+deep discharge. `GET /api/system` reports `ext_power`, `lowbatt_retry_s` and
+`lowbatt_floor_v`. The setting is stored in NVS (`OtO`/`pm_ext_pwr`) and is
 off by default. Winter sleep still wins: a winterized unit stays down until
 it is power-cycled.
 
