@@ -642,7 +642,10 @@ static void fault_hold_arm(void)
 
 // Power management
 #define INACTIVITY_SLEEP_MS   (5 * 60 * 1000)  // 5 minutes
-#define BATT_MIN_VOLTAGE_V        3.6f         // sleep forever below this (no motor activity)
+#define BATT_MIN_VOLTAGE_V        3.6f         // below this (settled) a wake goes straight back to sleep, no motors, no WiFi
+#define BATT_SHUTDOWN_V           3.3f         // below this (settled) the unit sleeps forever -- nothing is charging it
+#define LOWBATT_RECHECK_S         (6u * 3600u) // 3.3-3.6 V: timer wake to re-check the battery this often
+#define LOWBATT_SETTLE_MS         2000u        // let the pack recover from boot load before the deciding read
 #define BATT_VALVE_SAFE_VOLTAGE_V 3.8f         // require this much margin to attempt the wake-time valve-close check. Lowered from 3.9V (b347) -- water safety > controller safety, and a single ADC sample at boot can read lower than steady-state if the battery hasn't recovered from prior watering load.
 
 // Zone perimeter
@@ -6946,10 +6949,102 @@ static void sleep_forever_quiet(const char *reason)
     sensor_rail_off();
     motor_rail_off();
     vTaskDelay(pdMS_TO_TICKS(100));
-    // No wakeup source -- physical reset required to revive. Matches
-    // sleep_forever()'s rationale: waking again under the same low battery
-    // would just measure low and sleep again, burning the dregs.
+    // No wakeup source -- physical reset required to revive. Below
+    // BATT_SHUTDOWN_V (or while winterized) nothing is going to recharge the
+    // pack, so waking again would only burn the dregs.
     esp_deep_sleep_start();
+}
+
+// ── Low-battery handling ────────────────────────────────────────────────────
+//
+// History: below BATT_MIN_VOLTAGE_V every wake went to sleep_forever_quiet().
+// On a unit with solar or wired power that was a trap -- the charger refilled
+// the pack, but with no wake source armed nothing ever measured it again. A
+// unit that dipped low on short October days stayed dark for weeks with a full
+// battery until someone swiped the magnet.
+//
+// Now, on a SETTLED reading:
+//   >= 3.6 V        boot normally
+//   3.3 .. 3.6 V    sleep LOWBATT_RECHECK_S (6 h) on the RTC timer, then re-check
+//   <  3.3 V        sleep forever (the pack isn't being charged; protect the LiPo)
+// Winter sleep wins: a winterized unit on a low pack still sleeps forever.
+//
+// Under ESPHome the check runs from IrrigotoBatteryGate at HARDWARE priority,
+// ahead of the WiFi component, so a low-battery wake never starts the radio:
+// it's GPIO + ADC + a short settle, then straight back to sleep.
+
+#ifdef ESPHOME_COMPONENT
+// irrigoto.cpp: clears ESPHome's safe_mode boot counter. Every quick
+// low-battery wake otherwise counts as an unsuccessful boot (the counter is
+// incremented before setup and only cleared after boot_is_good_after), and
+// after num_attempts of them the next wake would come up in safe mode with
+// WiFi on.
+extern void irrigoto_before_lowbatt_sleep(void);
+#else
+static void irrigoto_before_lowbatt_sleep(void) {}
+#endif
+
+static bool winter_flag_from_nvs(void)
+{
+    // Read straight from NVS: the early gate runs before pm_nvs_load().
+    bool win = false;
+    nvs_handle_t h;
+    if (nvs_open(CAL_NVS_NAMESPACE, NVS_READONLY, &h) == ESP_OK) {
+        uint8_t v = 0;
+        if (nvs_get_u8(h, "pm_winter", &v) == ESP_OK) win = (v != 0);
+        nvs_close(h);
+    }
+    return win;
+}
+
+static float batt_now_v(void)
+{
+    return (adc_mv(ADC_CH_VBATT) * VBATT_DIVIDER_RATIO) / 1000.0f;
+}
+
+// Deciding read: wait for the pack to recover from whatever load preceded the
+// first read, then average a run of samples. Sensor rail must be on.
+static float batt_settled_v(void)
+{
+    vTaskDelay(pdMS_TO_TICKS(LOWBATT_SETTLE_MS));
+    float sum = 0.0f;
+    for (int i = 0; i < 8; i++) {
+        sum += batt_now_v();
+        vTaskDelay(pdMS_TO_TICKS(20));
+    }
+    return sum / 8.0f;
+}
+
+// Same quiet teardown as sleep_forever_quiet(), with an RTC timer armed.
+static void sleep_quiet_timer(const char *reason, uint32_t secs)
+{
+    ESP_LOGW(TAG, "Sleeping (quiet, no motors): %s -- re-checking in %lu s",
+             reason, (unsigned long)secs);
+    pm_record_reason(reason);
+    tca_led_set(LED_OFF);
+    sensor_rail_off();
+    motor_rail_off();
+    vTaskDelay(pdMS_TO_TICKS(100));
+    esp_sleep_disable_wakeup_source(ESP_SLEEP_WAKEUP_ALL);
+    esp_sleep_enable_timer_wakeup((uint64_t)secs * 1000000ULL);
+    esp_deep_sleep_start();
+}
+
+// Never returns. batt_v must be a settled reading below BATT_MIN_VOLTAGE_V.
+static void lowbatt_sleep(float batt_v)
+{
+    irrigoto_before_lowbatt_sleep();
+    if (batt_v < BATT_SHUTDOWN_V) {
+        ESP_LOGW(TAG, "Battery %.2fV below %.1fV -- shutting down until power-cycled",
+                 batt_v, BATT_SHUTDOWN_V);
+        sleep_forever_quiet("battery below 3.3V");
+    }
+    if (winter_flag_from_nvs()) {
+        sleep_forever_quiet("low battery (winter)");
+    }
+    ESP_LOGW(TAG, "Battery %.2fV below %.1fV -- no WiFi, re-checking in %u h",
+             batt_v, BATT_MIN_VOLTAGE_V, (unsigned)(LOWBATT_RECHECK_S / 3600u));
+    sleep_quiet_timer("low battery (6h recheck)", LOWBATT_RECHECK_S);
 }
 
 // b327: On a healthy-battery wake, verify the valve is closed. Catches
@@ -7088,6 +7183,14 @@ static void check_battery_on_boot(void)
     diag.boot_epoch            = (int64_t)time(NULL);
 
     if (batt_v < BATT_MIN_VOLTAGE_V && batt_v > 0.5f) {
+        // Settle and re-read before deciding: a single sample taken right
+        // after boot load can read low on a pack that's actually fine.
+        float settled = batt_settled_v();
+        ESP_LOGI(TAG, "Battery settled: %.2fV", settled);
+        diag.batt_v_at_boot = settled;
+        batt_v = settled;
+    }
+    if (batt_v < BATT_MIN_VOLTAGE_V && batt_v > 0.5f) {
         // > 0.5V check avoids false trigger if ADC not ready.
         // Quiet sleep -- do NOT try to close the valve. Motor draw under
         // low battery can brown out the regulator; valve stays where it is.
@@ -7100,7 +7203,7 @@ static void check_battery_on_boot(void)
         // fault log scream about it instead of the yard silently flooding.
         valve_verify_closed_dry("boot batt-too-low", false);
         boot_diag_append_and_save(&diag);
-        sleep_forever_quiet("low battery");
+        lowbatt_sleep(batt_v);   // 6 h re-check, or forever below 3.3 V
     }
 
     // Battery is at least marginal. If we have enough headroom for a motor
@@ -7122,6 +7225,45 @@ static void check_battery_on_boot(void)
 
     boot_diag_append_and_save(&diag);
 }
+
+#ifdef ESPHOME_COMPONENT
+// Called by IrrigotoBatteryGate (irrigoto.cpp) at setup_priority::HARDWARE,
+// i.e. BEFORE the WiFi component brings the radio up. Returns only when the
+// battery is fine; irrigoto_init()'s check_battery_on_boot() then does the
+// full boot check (boot_diag, leak check, valve close) exactly as before.
+// The pressure-based leak check is deliberately NOT run here: valve frame and
+// fault state aren't loaded from NVS yet this early, and a quiet low-battery
+// wake can't act on a leak anyway (the valve was closed and verified by
+// prepare_for_sleep() before the unit last slept).
+void irrigoto_early_battery_gate(void)
+{
+    gpio_setup();                     // rails + motor pins to a known-off state
+    sensor_rail_on();
+    adc_setup();
+    vTaskDelay(pdMS_TO_TICKS(100));   // let rail settle
+    float v = batt_now_v();
+    if (v < BATT_MIN_VOLTAGE_V && v > 0.5f) {
+        ESP_LOGW(TAG, "Battery %.2fV at early gate -- settling before deciding "
+                      "(WiFi not started)", v);
+        v = batt_settled_v();
+        if (v < BATT_MIN_VOLTAGE_V && v > 0.5f) {
+            boot_diag_t diag = {0};
+            diag.boot_seq              = boot_diag_next_seq();
+            diag.fw_build              = (uint16_t)FW_BUILD;
+            diag.reset_reason          = (int8_t)esp_reset_reason();
+            diag.batt_v_at_boot        = v;
+            diag.valve_deg_at_boot     = -1.0f;
+            diag.valve_deg_after_close = -1.0f;
+            diag.boot_epoch            = (int64_t)time(NULL);
+            diag.flags                |= BOOT_DIAG_FLAG_BATT_TOO_LOW;
+            boot_diag_append_and_save(&diag);
+            lowbatt_sleep(v);         // never returns
+        }
+        ESP_LOGI(TAG, "Battery settled at %.2fV -- booting normally", v);
+    }
+    sensor_rail_off();                // irrigoto_init() powers it again
+}
+#endif
 
 // b490: last-resort watchdog for a calibration stuck in a non-idle state.
 // The await steps have their own 5-minute operator timeout and the scan phases

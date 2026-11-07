@@ -316,6 +316,31 @@ To cancel, use either:
   Both its buttons need the device awake; press one while it's asleep and you
   get a notification saying so rather than a silent no-op.
 
+## Low battery
+
+Every wake checks the battery before WiFi starts. If the first reading is
+below 3.6 V the unit waits a couple of seconds for the pack to recover, reads
+it again, and decides on that settled value:
+
+| Settled battery | What the unit does |
+|---|---|
+| 3.6 V or more | Boots normally |
+| 3.3 – 3.6 V | Goes straight back to sleep without starting WiFi or moving a motor, and checks again in **6 hours** |
+| Below 3.3 V | Shuts down until power-cycled (magnet swipe) — nothing is charging it, so this protects the LiPo |
+
+So a unit with solar or wired power comes back by itself once the battery has
+recovered, at most 6 hours later, instead of staying dark until someone swipes
+the magnet. A low-battery wake costs about two seconds of ADC reads with no
+radio. Winter sleep wins: a winterized unit on a low battery still sleeps until
+power-cycled. The last sleep reason (`/api/all` → `last_sleep_reason`) reads
+`low battery (6h recheck)`, `battery below 3.3V` or `low battery (winter)`.
+
+Under ESPHome the check runs in a small `IrrigotoBatteryGate` component at
+`setup_priority::HARDWARE`, ahead of the WiFi component. It also clears
+ESPHome's safe_mode boot counter before sleeping, because otherwise ten quick
+low-battery wakes in a row would bring the next boot up in safe mode with WiFi
+on.
+
 ## Home Assistant integration
 
 The HA-side config — template sensors, automations, schedule and rain-delay

@@ -48,6 +48,21 @@ class IrrigotoModeSelect : public select::Select, public Component {
   void control(const std::string &value) override;
 };
 
+// ─── Low-battery gate ────────────────────────────────────────────────────────
+// Runs irrigoto_early_battery_gate() at HARDWARE priority -- ahead of the
+// WiFi component (WIFI = 250) -- so a wake on a low battery checks the pack
+// and goes back to sleep without ever starting the radio. IrrigotoComponent
+// itself has to stay at AFTER_WIFI (it needs lwIP for its HTTP servers).
+
+class IrrigotoBatteryGate : public Component {
+ public:
+  void setup() override;
+  float get_setup_priority() const override { return setup_priority::HARDWARE; }
+  // ESPHome's safe_mode component, if configured. Its boot counter is cleared
+  // before a low-battery sleep so those quick wakes don't add up to safe mode.
+  void set_safe_mode(Component *safe_mode);
+};
+
 // ─── Main component ──────────────────────────────────────────────────────────
 
 class IrrigotoComponent : public Component, public api::CustomAPIDevice {

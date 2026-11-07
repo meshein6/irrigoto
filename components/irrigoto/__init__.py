@@ -8,7 +8,8 @@ YAML key: irrigoto
 
 import esphome.codegen as cg
 import esphome.config_validation as cv
-from esphome.const import CONF_ID
+from esphome.const import CONF_ID, CONF_SAFE_MODE
+from esphome.core import CORE
 from esphome.components.esp32 import add_idf_component, include_builtin_idf_component
 from esphome.components.deep_sleep import DeepSleepComponent
 from esphome.components.logger import request_log_listener   # b512
@@ -42,11 +43,15 @@ irrigoto_ns = cg.esphome_ns.namespace("irrigoto")
 IrrigotoComponent = irrigoto_ns.class_(
     "IrrigotoComponent", cg.Component
 )
+# Low-battery gate: runs before WiFi so a low-battery wake never starts the radio.
+IrrigotoBatteryGate = irrigoto_ns.class_("IrrigotoBatteryGate", cg.Component)
+CONF_BATTERY_GATE_ID = "battery_gate_id"
 
 # Top-level YAML schema: just an optional id
 CONFIG_SCHEMA = cv.Schema(
     {
         cv.GenerateID(): cv.declare_id(IrrigotoComponent),
+        cv.GenerateID(CONF_BATTERY_GATE_ID): cv.declare_id(IrrigotoBatteryGate),
         # Optional link to ESPHome's deep_sleep component. If provided,
         # all sleep requests from irrigoto.c are routed through it so HA
         # gets a graceful "going to sleep" notification.
@@ -74,6 +79,13 @@ async def to_code(config):
     cg.add_build_flag("-Wno-deprecated-declarations")
     # NOTE: no -I flags here — see the *_html.h placement note at the
     # top of this file (ESPHome 2026.7+ drops -I from add_build_flag).
+
+    # Low-battery gate first: setup_priority HARDWARE, ahead of WiFi.
+    gate = cg.new_Pvariable(config[CONF_BATTERY_GATE_ID])
+    await cg.register_component(gate, {})
+    if CONF_SAFE_MODE in CORE.config and not CORE.config[CONF_SAFE_MODE].get("disabled", False):
+        safe_mode = await cg.get_variable(CORE.config[CONF_SAFE_MODE][CONF_ID])
+        cg.add(gate.set_safe_mode(safe_mode))
 
     var = cg.new_Pvariable(config[CONF_ID])
     await cg.register_component(var, config)

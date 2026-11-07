@@ -405,6 +405,14 @@ void     irrigoto_enter_winter_sleep(const char *reason);
 void irrigoto_sleep_now(uint32_t duration_s);
 void irrigoto_sleep_now_with_reason(uint32_t duration_s, const char *reason);
 
+/**
+ * Low-battery gate, run before WiFi starts (ESPHome: IrrigotoBatteryGate at
+ * setup_priority::HARDWARE). Returns only if the settled battery reading is
+ * >= 3.6 V. 3.3-3.6 V: quiet deep sleep for 6 h, then re-check. < 3.3 V (or
+ * winterized): quiet deep sleep with no wake source.
+ */
+void irrigoto_early_battery_gate(void);
+
 // ── Persistent power-management settings (NVS-backed) ───────────────────────
 
 /** Inactivity threshold before auto-sleep, minutes (1–60). */

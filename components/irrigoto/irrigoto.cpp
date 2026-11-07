@@ -2,6 +2,7 @@
 #include "fw_version.h"
 #include "esphome/core/log.h"
 #include "esphome/core/application.h"
+#include "esphome/core/preferences.h"           // low-battery gate: global_preferences->sync()
 #include "esphome/components/wifi/wifi_component.h"   // b293
 #include "esphome/components/logger/logger.h"          // b512: UART console hook
 #include <cstring>
@@ -14,6 +15,20 @@ namespace esphome {
 namespace irrigoto {
 
 static const char *TAG = "irrigoto";
+
+// ─────────────────────────────────────────────────────────────────────────────
+// IrrigotoBatteryGate — low-battery check before WiFi starts
+// ─────────────────────────────────────────────────────────────────────────────
+
+static Component *s_safe_mode = nullptr;
+
+void IrrigotoBatteryGate::set_safe_mode(Component *safe_mode) { s_safe_mode = safe_mode; }
+
+void IrrigotoBatteryGate::setup() {
+  // Never returns when the battery is low (deep sleep: 6 h re-check, or no
+  // wake source below 3.3 V). Returns on a healthy pack.
+  irrigoto_early_battery_gate();
+}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // IrrigotoComponent — lifecycle
@@ -786,4 +801,17 @@ extern "C" void irrigoto_wifi_ap_mode(void) {
         w->clear_sta();
         w->start();
     }
+}
+
+// Called from irrigoto.c right before a low-battery deep sleep. safe_mode
+// increments its boot counter before setup and only clears it once a boot has
+// run for boot_is_good_after, so every quick low-battery wake would otherwise
+// count as a failed boot -- and after num_attempts of them the next wake would
+// come up in safe mode with WiFi on, on a low battery. on_safe_shutdown() is
+// what ESPHome's own deep_sleep path uses to clear it (it leaves a manually
+// requested safe mode alone); sync() commits it before the chip powers down.
+extern "C" void irrigoto_before_lowbatt_sleep(void) {
+  if (esphome::irrigoto::s_safe_mode != nullptr)
+    esphome::irrigoto::s_safe_mode->on_safe_shutdown();
+  esphome::global_preferences->sync();
 }
