@@ -7353,6 +7353,11 @@ static void check_valve_closed_on_boot(boot_diag_t *diag)
     valve_verify_closed_dry("boot post-drive", true);
 }
 
+// Battery volts measured by check_battery_on_boot() below, read back by the
+// events log's boot rows (events_boot_rows). Defined here, ahead of its
+// writer, rather than down in the events-log block.
+static float s_boot_batt_v = 0.0f;
+
 static void check_battery_on_boot(void)
 {
     // Low-battery mode wake: separate sequence (no-op when the flag is clear;
@@ -7500,7 +7505,8 @@ static void cal_watchdog_check(void)
 // until LittleFS is mounted and, ideally, the clock is set.
 #define EVENTS_CSV_HEADER "time,uptime_s,event,detail,batt_v,fw_build"
 
-static float    s_boot_batt_v  = 0.0f;   // check_battery_on_boot's reading
+// s_boot_batt_v is defined above check_battery_on_boot (its writer), which
+// this file compiles before this point.
 static uint32_t s_ev_int_epoch = 0;      // scheduled run cut off by a reset
 static uint16_t s_ev_int_zone  = 0;      //   (set by sched_fire_load)
 
