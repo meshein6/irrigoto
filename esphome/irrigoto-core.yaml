@@ -219,6 +219,22 @@ api:
   # how we surface "watering complete" and "cal complete" notifications
   # to HA so automations can react with structured event.data fields.
   homeassistant_services: true
+  # b608: never reboot just because Home Assistant isn't connected.
+  #
+  # ESPHome's default is reboot_timeout: 15min -- with no API client attached
+  # api_server.cpp calls App.reboot() every 15 minutes. Sane for a sensor that
+  # only exists to feed HA; wrong for this unit, which waters a garden on its
+  # own schedule and is meant to run standalone (b594 removed the last HA
+  # clock dependency for the same reason).
+  #
+  # Measured 2026-11-08: 96 software resets at exactly 15m01s, and no
+  # completed scheduled run since 2026-10-16. The 06:00 run DID fire, then the
+  # reboot killed it ~4 min into a 12 min cycle -- and because
+  # sched_note_flow_started() marks the slot fired the instant water flows,
+  # the 30 min catch-up could never retry it. Attaching a single API client
+  # stopped the resets dead (uptime 426 -> 1507 s across 18 min, boot_seq
+  # frozen at #2048), which is what identified this.
+  reboot_timeout: 0s
   # b449: raise the API send-queue depth from the ESP32 default of 8. This is
   # the ROOT-CAUSE fix for the ~30% cold-wake TaskWDT/Panic. When HA reconnects
   # after a deep-sleep wake it re-requests all entities + initial states; if more
