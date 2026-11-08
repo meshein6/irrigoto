@@ -11,8 +11,8 @@
 # Before flashing it snapshots the device's calibration and zone state to
 # ./cal-backups/, so a bad build is recoverable without redoing the walk.
 #
-#   Usage:  ./push.sh                 # uses HOST below
-#           HOST=192.168.86.21 ./push.sh
+#   Usage:  ./push.sh                 # finds the unit over mDNS
+#           HOST=192.168.86.45 ./push.sh    # or an explicit ip/name
 #           YAML=esphome/irrigoto.yaml ./push.sh
 #
 # WHY THIS SCRIPT EXISTS RATHER THAN A BARE `esphome run`
@@ -35,7 +35,7 @@ set -euo pipefail
 
 VENV="${VENV:-$HOME/esphome-env}"
 YAML="${YAML:-esphome/irrigoto-4mb.yaml}"
-HOST="${HOST:-192.168.86.21}"
+HOST="${HOST:-}"          # empty = find the unit over mDNS (see below)
 BACKUP_DIR="${BACKUP_DIR:-cal-backups}"
 
 ESPHOME="$VENV/bin/esphome"
@@ -47,13 +47,69 @@ WAIT_SECS="${WAIT_SECS:-600}"     # how long to wait for a sleeping unit
 
 api() { curl -s -m 8 "http://$HOST/$1" 2>/dev/null; }
 
+# ── Finding the unit ─────────────────────────────────────────────────────────
+# HOST used to be a hardcoded IP, and DHCP moved the unit out from under it:
+# the script still said 192.168.86.21 long after the unit had become .45, and
+# by then another host held .21 -- it answered pings but not HTTP, so the
+# failure read as "the unit is ignoring its own API" rather than "wrong
+# address". An IP is the wrong thing to pin.
+#
+# So: discover it. ESPHome advertises _esphomelib._tcp over mDNS, and the
+# unit's name carries its MAC suffix (irrigoto4-1ca25c), which is why plain
+# "irrigoto4.local" does NOT resolve -- the instance name has to be browsed
+# for, not guessed. An explicit HOST=<ip-or-name> still wins and skips this.
+#
+# Discovery lives INSIDE the wait loop below, not ahead of it: a sleeping unit
+# advertises nothing at all, so browsing once up front would abort on exactly
+# the case this script was written to handle. Each pass browses afresh until
+# WAIT_SECS runs out.
+BROWSE_SECS="${BROWSE_SECS:-5}"
+
+responds() { curl -s -m 8 "http://$1/api/status" 2>/dev/null | grep -q fw_build; }
+
+# Instance names of irrigoto units currently advertising, as .local hostnames.
+discover_hosts() {
+  local out pid
+  out="$(mktemp -t irrigoto-mdns)"
+  # dns-sd never exits on its own; let it browse, then kill it.
+  dns-sd -B _esphomelib._tcp >"$out" 2>/dev/null &
+  pid=$!
+  sleep "$BROWSE_SECS"
+  kill "$pid" 2>/dev/null || true
+  wait "$pid" 2>/dev/null || true
+  awk '/ Add / && $NF ~ /^irrigoto/ { print $NF ".local" }' "$out" | sort -u
+  rm -f "$out"
+}
+
 # ── Wait for the unit ────────────────────────────────────────────────────────
-echo "==> Waiting for $HOST (up to ${WAIT_SECS}s — it may be asleep)"
+if [[ -n "$HOST" ]]; then
+  HOST_GIVEN=1
+  echo "==> Waiting for $HOST (up to ${WAIT_SECS}s — it may be asleep)"
+else
+  HOST_GIVEN=0
+  echo "==> Looking for an irrigoto unit (up to ${WAIT_SECS}s — it may be asleep)"
+fi
 deadline=$(( $(date +%s) + WAIT_SECS ))
-until api "api/status" | grep -q fw_build; do
-  (( $(date +%s) < deadline )) || { echo "    never woke; aborting" >&2; exit 1; }
-  sleep 10
+until [[ -n "$HOST" ]] && responds "$HOST"; do
+  (( $(date +%s) < deadline )) || {
+    echo "    ${HOST:-no unit} never came up; aborting" >&2
+    (( HOST_GIVEN )) || \
+      echo "    (mDNS doesn't cross subnets; if it's on another one, pass HOST=<ip>)" >&2
+    exit 1
+  }
+  if [[ -n "$HOST" ]]; then
+    sleep 10            # named unit, just not up yet
+  else
+    for cand in $(discover_hosts); do
+      echo "    found $cand"
+      HOST="$cand"
+      responds "$HOST" && break
+      HOST=""           # advertised but not answering: some other esphome node
+    done
+    [[ -n "$HOST" ]] || sleep 5
+  fi
 done
+echo "==> Unit: $HOST"
 echo "    up: $(api "api/status")"
 
 # ── Remember the power setting BEFORE we touch it ────────────────────────────
