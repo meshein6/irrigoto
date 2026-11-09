@@ -22053,13 +22053,26 @@ void irrigoto_init(void)
     INFO("irrigoto ready (ESPHome component, build %d, ip %s)", FW_BUILD, s_wifi_ip);
 
     s_last_activity = xTaskGetTickCount();
+    // b609: sched_fire_load() MUST come before the idle task is created.
+    //
+    // That task runs check_inactivity(), whose very first statement is
+    // events_flush(); its one-shot boot pass calls events_boot_rows(), which
+    // CONSUMES s_ev_int_epoch -- the b452 in-progress marker that
+    // sched_fire_load() is what promotes into it. Created first (as b607 left
+    // it), the idle task won that race on every boot: the `reset` row went out
+    // with s_ev_int_epoch still 0, boot_done latched true so events_boot_rows()
+    // never ran again, and sched_fire_load() then set the variable microseconds
+    // later with nothing left to read it. The run_interrupted row was
+    // unwritable. 96 consecutive boots on the reported unit logged a bare
+    // `reset` and never once said that a scheduled run had been cut off
+    // mid-water -- which is the one thing the b607 events log existed to say.
+    sched_fire_load();           // b437: armed run + fired-epoch ring (clock-free firing)
     xTaskCreate(esphome_idle_task, "oto_idle", 4096, NULL, 3, NULL);
     // Schedule executor — separate task so a slow watering loop can't
     // delay the next-minute check. Low priority; just polls every 15 s.
     schedule_load_nvs();
     schedule_delay_load_nvs();   // restore rain/wind delay across reboot/wake
     last_water_load_nvs();       // restore "last completed" tag across deep-sleep wake
-    sched_fire_load();           // b437: armed run + fired-epoch ring (clock-free firing)
     pump_and_solution_init();    // pump lines idle, solution cal + counters loaded
     xTaskCreate(schedule_task, "oto_sched", 3072, NULL, 2, NULL);
     INFO("Schedule loaded: %d entries", irrigoto_schedule_count());
